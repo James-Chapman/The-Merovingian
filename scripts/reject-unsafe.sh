@@ -45,18 +45,27 @@ fi
 #
 # 0.12.5 audit, finding 14: fourteen endpoints in client_server.cpp released the
 # runtime mutex by hand around a blocking outbound call and re-took it
-# afterwards. Every one is now a homeserver::ScopedGuardRelease scope, which
-# restores the guard on the exceptional path as well as the normal one. This
-# gate is what stops the pattern coming back: a reviewer has to look at each new
-# manual release and say why RAII does not fit.
+# afterwards. Every one is now a homeserver::RuntimeLockRelease scope, which
+# restores the guard on the exceptional path as well as the normal one, and
+# which drops every recursion level the thread holds rather than only the one
+# guard it was handed. This gate is what stops the pattern coming back: a
+# reviewer has to look at each new manual release and say why RAII does not fit.
+#
+# The pattern matches `->unlock()` as well as `.unlock()`. It did not before
+# 0.12.6, so a release through a pointer or an iterator slipped past unseen.
+#
+# The two files implementing the primitives are exempt by name: RuntimeMutex is
+# the mutex, and RuntimeLockRelease is the RAII scope every other site is being
+# pointed at. Neither can be written in terms of itself.
 #
 # Add "// LOCK_RELEASE: reviewed — <reason>" on the same line to exempt.
-LOCK_RELEASE_HITS=$(grep -Rn --perl-regexp "${CPP_INCLUDES[@]}" '\.unlock\s*\(\s*\)' include src \
+LOCK_RELEASE_HITS=$(grep -Rn --perl-regexp "${CPP_INCLUDES[@]}" '(\.|->)unlock\s*\(\s*\)' include src \
   | grep -v 'LOCK_RELEASE: reviewed' \
+  | grep -vE '^src/homeserver/(request_lock|runtime_mutex)\.cpp:' \
   | grep -vE '^[^:]*:[0-9]+:[[:space:]]*//' || true)
 if [ -n "$LOCK_RELEASE_HITS" ]; then
   printf '%s\n' "$LOCK_RELEASE_HITS"
-  echo "Rejected pattern detected: manual lock release requires explicit review (prefer homeserver::ScopedGuardRelease; otherwise add '// LOCK_RELEASE: reviewed — <reason>')"
+  echo "Rejected pattern detected: manual lock release requires explicit review (prefer homeserver::RuntimeLockRelease; otherwise add '// LOCK_RELEASE: reviewed — <reason>')"
   exit 1
 fi
 

@@ -1909,7 +1909,7 @@ namespace
     // outbound call and reacquired before touching the store again, per
     // src/homeserver/AGENTS.md "The runtime lock and blocking calls".
     [[nodiscard]] auto unbind_threepid_for_deactivation(ClientServerRuntime& rt,
-                                                        std::unique_lock<std::recursive_mutex>& guard,
+                                                        std::unique_lock<RuntimeMutex>& guard,
                                                         std::string_view user_id, std::string_view medium,
                                                         std::string_view address,
                                                         std::optional<std::string> const& requested_id_server) -> bool
@@ -1973,7 +1973,7 @@ namespace
         // serialises every client request and inbound federation transaction
         // behind a lock nobody holds.
         auto const is_result = [&] {
-            auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+            auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
             auto id_client = merovingian::identity::IdentityServerClient{
                 *rt.homeserver.outbound_client, *rt.homeserver.cached_discovery,
                 rt.homeserver.config.server().identity_server, &rt.homeserver.test_forced_identity_resolution};
@@ -8692,9 +8692,9 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         return dispatch_resp(req, rt, 200U, {});
     }
 
-    auto guard = std::unique_lock<std::recursive_mutex>{rt.homeserver.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{rt.homeserver.mutex};
     // Publish the guard so a blocking network call further down the stack can
-    // release it for the duration (see NetworkIoUnlock). Without this every
+    // release it for the duration (see RuntimeLockRelease). Without this every
     // outbound federation call made while serving a client request freezes all
     // other client and federation traffic until the remote answers or times out.
     auto const lock_scope = RequestLockScope{guard};
@@ -8715,7 +8715,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
     }
     auto call_local = [&](LocalHttpRequest const& inner) {
         auto response = [&] {
-            auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+            auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
             return handle_local_http_request(rt.homeserver, inner);
         }();
         return response;
@@ -8800,7 +8800,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                 // Re-acquire before returning: dispatch_resp/dispatch_err read
                 // reloadable runtime state (rt.cors), and every other return path
                 // from this handler leaves the guard held.
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 return perform_sync_outbound_call(rt.homeserver, {}, tx, key_id, secret, "public_rooms.proxy",
                                                   rt.homeserver.federation.config.remote_timeout_seconds);
             }();
@@ -8877,7 +8877,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                 // Re-acquire before returning: dispatch_resp/dispatch_err read
                 // reloadable runtime state (rt.cors), and every other return path
                 // from this handler leaves the guard held.
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 return perform_sync_outbound_call(rt.homeserver, {}, tx, key_id, secret, "public_rooms.proxy",
                                                   rt.homeserver.federation.config.remote_timeout_seconds);
             }();
@@ -8909,7 +8909,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                 // Re-acquire before returning: dispatch_resp/dispatch_err read
                 // reloadable runtime state (rt.cors), and every other return path
                 // from this handler leaves the guard held.
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 return perform_sync_outbound_call(rt.homeserver, {}, tx, key_id, secret, "directory.room.proxy",
                                                   rt.homeserver.federation.config.remote_timeout_seconds);
             }();
@@ -8943,7 +8943,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                     }
                     auto client = appservice::AppserviceClient{*alias_outbound, *alias_discovery};
                     auto const query = [&] {
-                        auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                        auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                         return client.query_room_alias(registration, room_alias);
                     }();
                     if (!query.ok || !query.exists)
@@ -9079,7 +9079,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // serialises every client request and inbound federation transaction
             // behind a lock nobody holds.
             auto const is_result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 auto id_client = merovingian::identity::IdentityServerClient{
                     *rt.homeserver.outbound_client, *rt.homeserver.cached_discovery,
                     rt.homeserver.config.server().identity_server, &rt.homeserver.test_forced_identity_resolution};
@@ -9181,7 +9181,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // serialises every client request and inbound federation transaction
             // behind a lock nobody holds.
             auto const is_result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 auto id_client = merovingian::identity::IdentityServerClient{
                     *rt.homeserver.outbound_client, *rt.homeserver.cached_discovery,
                     rt.homeserver.config.server().identity_server, &rt.homeserver.test_forced_identity_resolution};
@@ -9718,7 +9718,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                     }
                     auto client = appservice::AppserviceClient{*user_outbound, *user_discovery};
                     auto const query = [&] {
-                        auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                        auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                         return client.query_user(registration, target_user);
                     }();
                     if (!query.ok || !query.exists)
@@ -9818,7 +9818,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // serialises every client request and inbound federation transaction
             // behind a lock nobody holds.
             auto const is_result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 auto id_client = merovingian::identity::IdentityServerClient{
                     *rt.homeserver.outbound_client, *rt.homeserver.cached_discovery,
                     rt.homeserver.config.server().identity_server, &rt.homeserver.test_forced_identity_resolution};
@@ -9921,7 +9921,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // serialises every client request and inbound federation transaction
             // behind a lock nobody holds.
             auto const is_result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 auto id_client = merovingian::identity::IdentityServerClient{
                     *rt.homeserver.outbound_client, *rt.homeserver.cached_discovery,
                     rt.homeserver.config.server().identity_server, &rt.homeserver.test_forced_identity_resolution};
@@ -10408,7 +10408,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // serialises every client request and inbound federation transaction
             // behind a lock nobody holds.
             auto const is_result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 auto id_client = merovingian::identity::IdentityServerClient{
                     *rt.homeserver.outbound_client, *rt.homeserver.cached_discovery,
                     rt.homeserver.config.server().identity_server, &rt.homeserver.test_forced_identity_resolution};
@@ -10497,7 +10497,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // serialises every client request and inbound federation transaction
             // behind a lock nobody holds.
             auto const is_result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 auto id_client = merovingian::identity::IdentityServerClient{
                     *rt.homeserver.outbound_client, *rt.homeserver.cached_discovery,
                     rt.homeserver.config.server().identity_server, &rt.homeserver.test_forced_identity_resolution};
@@ -10585,7 +10585,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // serialises every client request and inbound federation transaction
             // behind a lock nobody holds.
             auto const is_result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 auto id_client = merovingian::identity::IdentityServerClient{
                     *rt.homeserver.outbound_client, *rt.homeserver.cached_discovery,
                     rt.homeserver.config.server().identity_server, &rt.homeserver.test_forced_identity_resolution};
@@ -10675,7 +10675,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // serialises every client request and inbound federation transaction
             // behind a lock nobody holds.
             auto const is_result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 auto id_client = merovingian::identity::IdentityServerClient{
                     *rt.homeserver.outbound_client, *rt.homeserver.cached_discovery,
                     rt.homeserver.config.server().identity_server, &rt.homeserver.test_forced_identity_resolution};
@@ -11005,7 +11005,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                     // runtime.mutex is released across these network calls via RAII
                     // (0.12.5 audit, finding 14): a manual unlock/lock pair left the
                     // mutex unlocked if a call threw between them.
-                    auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                    auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                     for (auto const& registration : registrations)
                     {
                         for (auto const& protocol_name : registration.protocols)
@@ -11052,7 +11052,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             auto client = appservice::AppserviceClient{*outbound_client, *cached_discovery};
             auto const* owner_ptr = owner;
             auto const result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 return client.query_thirdparty_protocol(*owner_ptr, protocol_name);
             }();
             if (!result.ok || !result.found)
@@ -11090,7 +11090,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                     // runtime.mutex is released across these network calls via RAII
                     // (0.12.5 audit, finding 14): a manual unlock/lock pair left the
                     // mutex unlocked if a call threw between them.
-                    auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                    auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                     for (auto const* owner : owners)
                     {
                         auto const result = client.query_thirdparty_location_by_protocol(*owner, protocol_name, fields);
@@ -11126,7 +11126,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                     // runtime.mutex is released across these network calls via RAII
                     // (0.12.5 audit, finding 14): a manual unlock/lock pair left the
                     // mutex unlocked if a call threw between them.
-                    auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                    auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                     for (auto const& registration : registrations)
                     {
                         auto const result = client.query_thirdparty_location_by_alias(registration, *alias);
@@ -11174,7 +11174,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                     // runtime.mutex is released across these network calls via RAII
                     // (0.12.5 audit, finding 14): a manual unlock/lock pair left the
                     // mutex unlocked if a call threw between them.
-                    auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                    auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                     for (auto const* owner : owners)
                     {
                         auto const result = client.query_thirdparty_user_by_protocol(*owner, protocol_name, fields);
@@ -11210,7 +11210,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                     // runtime.mutex is released across these network calls via RAII
                     // (0.12.5 audit, finding 14): a manual unlock/lock pair left the
                     // mutex unlocked if a call threw between them.
-                    auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                    auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                     for (auto const& registration : registrations)
                     {
                         auto const result = client.query_thirdparty_user_by_userid(registration, *userid);
@@ -11662,16 +11662,16 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         // create_room takes its own lock on rt.homeserver.mutex (it must
         // remain independently callable — see room_service.cpp), so calling
         // it while this handler's own guard is still held would recursively
-        // double-lock the mutex: NetworkIoUnlock inside
+        // double-lock the mutex: RuntimeLockRelease inside
         // resolve_policy_server_hook would then release only this outer
         // level, leaving create_room's own (inner) guard — the one actually
         // in scope at the point of the network call — still holding the
         // mutex. Release this guard first, exactly like call_local does for
         // the local-router delegation, so create_room's own guard is the
         // only one active and its own RequestLockScope publication is what
-        // NetworkIoUnlock sees.
+        // RuntimeLockRelease sees.
         auto const create_result = [&] {
-            auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+            auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
             return create_room(rt.homeserver, req.access_token, options);
         }();
         if (!create_result.ok)
@@ -12880,7 +12880,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // unlock/lock pair so it is restored on every exit, including a throw
             // out of the federation round trip.
             auto const result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 return merovingian::homeserver::leave_room(rt.homeserver, req.access_token, room_id);
             }();
             if (!result.ok)
@@ -13149,7 +13149,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // See the createRoom route above for why the outer guard must be
             // released before calling create_room (which self-locks).
             auto const create_result = [&] {
-                auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                 return create_room(rt.homeserver, req.access_token, upgrade_options);
             }();
             if (!create_result.ok)
@@ -13354,7 +13354,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
                 auto const tx =
                     federation::make_outbound_transaction(std::string{alias_server}, "GET", target, our_server, {});
                 auto const [ok, body] = [&] {
-                    auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+                    auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
                     return perform_sync_outbound_call(rt.homeserver, {}, tx, key_id, secret,
                                                       "room.join.alias_lookup_failed",
                                                       rt.homeserver.federation.config.remote_timeout_seconds);
@@ -13869,7 +13869,7 @@ auto ensure_sync_notifier(ClientServerRuntime& runtime) -> sync::SyncNotifier&
 
 auto push_to_device_message(ClientServerRuntime& runtime, database::PersistentToDeviceMessage message) -> bool
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.homeserver.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.homeserver.mutex};
     auto const stored =
         database::enqueue_to_device_message(runtime.homeserver.database.persistent_store, std::move(message));
     if (stored)
@@ -13881,7 +13881,7 @@ auto push_to_device_message(ClientServerRuntime& runtime, database::PersistentTo
 
 auto record_device_list_change(ClientServerRuntime& runtime, database::PersistentDeviceListChange change) -> bool
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.homeserver.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.homeserver.mutex};
     auto const stored =
         database::record_device_list_change(runtime.homeserver.database.persistent_store, std::move(change));
     if (stored)
@@ -13893,7 +13893,7 @@ auto record_device_list_change(ClientServerRuntime& runtime, database::Persisten
 
 auto set_presence(ClientServerRuntime& runtime, database::PersistentPresence state) -> bool
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.homeserver.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.homeserver.mutex};
     auto const stored = database::upsert_presence(runtime.homeserver.database.persistent_store, std::move(state));
     if (stored)
     {
@@ -13904,7 +13904,7 @@ auto set_presence(ClientServerRuntime& runtime, database::PersistentPresence sta
 
 auto set_account_data(ClientServerRuntime& runtime, database::PersistentAccountData data) -> bool
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.homeserver.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.homeserver.mutex};
     // store_account_data advances next_sync_stream_id before persisting,
     // so the ensure_sync_notifier publish below wakes any long-poll
     // /sync waiter that was parked at a since_token below the new row.

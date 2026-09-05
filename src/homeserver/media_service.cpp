@@ -556,7 +556,7 @@ namespace
         // accepts the connection and then stalls would otherwise freeze every
         // other client and federation request for up to total_timeout_seconds.
         auto const out_result = [&]() {
-            auto const unlocked = NetworkIoUnlock{};
+            auto const unlocked = RuntimeLockRelease{};
             return runtime.outbound_client->perform(request);
         }();
 
@@ -635,7 +635,7 @@ namespace
             }
             // DNS resolution of the redirect target is network-bound too.
             auto const redirect_resolution = [&]() {
-                auto const unlocked = NetworkIoUnlock{};
+                auto const unlocked = RuntimeLockRelease{};
                 return resolve_media_redirect_url(parsed.location, *runtime.discovery_network);
             }();
             if (!redirect_resolution.ok)
@@ -660,7 +660,7 @@ namespace
             redirect_req.max_response_body_bytes = static_cast<std::size_t>(max_bytes);
 
             auto const redirect_result = [&]() {
-                auto const unlocked = NetworkIoUnlock{};
+                auto const unlocked = RuntimeLockRelease{};
                 return runtime.outbound_client->perform(redirect_req);
             }();
             if (!redirect_result.ok || redirect_result.response.status < 200U ||
@@ -734,7 +734,7 @@ namespace
         else
         {
             auto constexpr discovery_timeout = std::uint32_t{30U};
-            auto const unlocked = NetworkIoUnlock{};
+            auto const unlocked = RuntimeLockRelease{};
             resolution = federation::discover_server(origin_server, *discovery_network, discovery_timeout);
         }
         if (!resolution.discovery_allowed)
@@ -784,7 +784,7 @@ namespace
         out_req.max_response_body_bytes = static_cast<std::size_t>(max_bytes);
 
         auto const out_result = [&]() {
-            auto const unlocked = NetworkIoUnlock{};
+            auto const unlocked = RuntimeLockRelease{};
             return outbound_client->perform(out_req);
         }();
         if (!out_result.ok || out_result.response.status < 200U || out_result.response.status >= 300U)

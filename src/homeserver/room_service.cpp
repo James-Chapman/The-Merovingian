@@ -1639,7 +1639,7 @@ namespace
         // Discovery is a DNS/well-known cascade that can burn the full timeout
         // against an unreachable peer, so it must not run under runtime.mutex.
         auto const resolution = [&]() {
-            auto const unlocked = NetworkIoUnlock{};
+            auto const unlocked = RuntimeLockRelease{};
             return federation::discover_server(transaction.destination, *discovery_network, timeout_seconds);
         }();
         if (!resolution.discovery_allowed)
@@ -1698,12 +1698,12 @@ namespace
     auto outcome = http::OutboundResult{};
     if (runtime.federation_proxy)
     {
-        auto const unlocked = NetworkIoUnlock{};
+        auto const unlocked = RuntimeLockRelease{};
         outcome = runtime.federation_proxy->send_outbound_request(request, room_id);
     }
     else if (runtime.outbound_client)
     {
-        auto const unlocked = NetworkIoUnlock{};
+        auto const unlocked = RuntimeLockRelease{};
         outcome = runtime.outbound_client->perform(request);
     }
     else
@@ -2271,7 +2271,7 @@ auto ensure_crypto_provider_holds_key(HomeserverRuntime& runtime, std::string_vi
 
 [[nodiscard]] auto rotate_server_signing_key(HomeserverRuntime& runtime) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
 
     // Ensure a current active key exists to retire (this also loads its secret into
     // the runtime). Without a current key there is nothing to rotate from.
@@ -2379,7 +2379,7 @@ auto ensure_crypto_provider_holds_key(HomeserverRuntime& runtime, std::string_vi
 [[nodiscard]] auto create_room(HomeserverRuntime& runtime, std::string_view access_token,
                                CreateRoomOptions const& options) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     // create_room is called both standalone (this lock is the only one taken:
     // local_smoke_flow.cpp) and from within a request handler that already
     // holds runtime.mutex (client_server.cpp, local_http_router.cpp) — those
@@ -2387,11 +2387,11 @@ auto ensure_crypto_provider_holds_key(HomeserverRuntime& runtime, std::string_vi
     // relock at each call site) so this is never a *nested* acquisition of
     // the same recursive_mutex. Publishing it here, exactly like the other
     // three request-lock-scope entry points, is what lets
-    // resolve_policy_server_hook's NetworkIoUnlock actually find and release
+    // resolve_policy_server_hook's RuntimeLockRelease actually find and release
     // *this* guard — the one genuinely protecting the rest of this function —
     // during the policy-server round trip. Before this, a caller-held outer
     // guard being double-locked here (recursive_mutex permits it, silently)
-    // meant NetworkIoUnlock released only the outer level while this guard
+    // meant RuntimeLockRelease released only the outer level while this guard
     // kept the mutex held, so the network call still ran under an
     // effectively-locked mutex: see the room-creation regression scenario in
     // tests/integration/test_request_lock_contention_flow.cpp.
@@ -3251,7 +3251,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
                              std::vector<std::string> const& via_servers,
                              canonicaljson::Object const* third_party_signed) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     log_diagnostic("room.join.started", {
                                             {"room_id",          std::string{room_id},                    false},
                                             {"has_access_token", access_token.empty() ? "false" : "true", false}
@@ -4026,7 +4026,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
                     // Network-bound key resolution — deliberately outside runtime.mutex.
                     auto const verified =
                         filter_verified_send_join_events(runtime, background_state_bg, policy_bg, our_server_bg);
-                    auto bg_guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+                    auto bg_guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
                     auto const newly_joined = ingest_send_join_state(runtime, verified, policy_bg);
                     auto stored = std::size_t{0U};
                     auto const room_it = std::ranges::find_if(runtime.database.rooms, [&](LocalRoom const& r) {
@@ -4275,7 +4275,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto leave_room(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id)
     -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     log_diagnostic("room.leave.started", {
                                              {"room_id",          std::string{room_id},                    false},
                                              {"has_access_token", access_token.empty() ? "false" : "true", false}
@@ -4405,7 +4405,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
         // perform_sync_outbound_call, which previously left the mutex down for
         // this thread and the next request it served.
         {
-            auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+            auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
 
             // Step 1: make_leave — fetch a leave event template from the remote server.
             auto make_leave_tx = federation::make_outbound_make_membership(
@@ -4620,7 +4620,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto invite_user(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id,
                                std::string_view target_user_id, std::string_view reason) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4658,7 +4658,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
     // unless `id_server` is an operator-trusted IS it can actually reach, and
     // fails closed on any IS error. Spec: client-server-api.md § Inviting a user
     // via a third-party identifier; identity-service-api.md § store-invite.
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex, std::defer_lock};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex, std::defer_lock};
 
     // Validation under the lock: auth, room, membership, and that `id_server`
     // names an operator-trusted identity server.
@@ -4807,7 +4807,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto ban_user(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id,
                             std::string_view target_user_id, std::string_view reason) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4837,7 +4837,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto kick_user(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id,
                              std::string_view target_user_id, std::string_view reason) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4867,7 +4867,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto unban_user(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id,
                               std::string_view target_user_id) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4906,7 +4906,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto forget_room(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id)
     -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4951,7 +4951,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto knock_room(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id)
     -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -5458,7 +5458,7 @@ namespace
             auto const result = client.notify(delivery.pusher.data_url, delivery.notification);
             if (result.ok && !result.rejected_pushkeys.empty())
             {
-                auto lock = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+                auto lock = std::unique_lock<RuntimeMutex>{runtime.mutex};
                 std::ignore = database::delete_pusher(runtime.database.persistent_store, delivery.pusher.user_id,
                                                       delivery.pusher.app_id, delivery.pusher.pushkey);
             }
@@ -5579,7 +5579,7 @@ namespace
     // this event by the caller before this runs, so this only ever needs to
     // either commit (clear pending, raise delivered_stream_ordering) or
     // leave the pending state exactly as it was for a later retry. Performs
-    // the network call outside runtime.mutex (NetworkIoUnlock) but is itself
+    // the network call outside runtime.mutex (RuntimeLockRelease) but is itself
     // synchronous — the caller's request waits for it — see
     // dispatch_appservice_delivery's doc comment for why.
     auto attempt_appservice_batch(HomeserverRuntime& runtime, appservice::AppserviceRegistration const& registration,
@@ -5591,7 +5591,7 @@ namespace
         transaction.events.push_back(std::move(event));
 
         auto const result = [&]() {
-            auto const unlocked = NetworkIoUnlock{};
+            auto const unlocked = RuntimeLockRelease{};
             auto client = appservice::AppserviceClient{*runtime.outbound_client, *runtime.cached_discovery};
             return client.send_transaction(registration, transaction);
         }();

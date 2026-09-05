@@ -1407,7 +1407,7 @@ namespace
             // network I/O under this lock (unlike outbound calls elsewhere in
             // this file), so holding the global mutex for the whole callback
             // does not risk blocking on a remote round trip.
-            auto guard = std::unique_lock<std::recursive_mutex>{rt->mutex};
+            auto guard = std::unique_lock<RuntimeMutex>{rt->mutex};
             auto& store = rt->database.persistent_store;
             auto const room_it = std::ranges::find_if(store.rooms, [&room_id](database::PersistentRoom const& r) {
                 return r.room_id == room_id;
@@ -1575,7 +1575,7 @@ namespace
             // rt->mutex. Take only the global recursive mutex, never a room
             // stripe mutex, so the lock order can never invert against
             // ingest_pdu_event's documented stripe-then-global ordering.
-            auto guard = std::unique_lock<std::recursive_mutex>{rt->mutex};
+            auto guard = std::unique_lock<RuntimeMutex>{rt->mutex};
             auto const parsed = canonicaljson::parse_lossless(invite.invite_event_json);
             auto const* event = std::get_if<canonicaljson::Object>(&parsed.value.storage());
             if (parsed.error != canonicaljson::ParseError::none || event == nullptr)
@@ -1924,7 +1924,7 @@ auto ingest_pdu_event(HomeserverRuntime& runtime, federation::InboundPduEnvelope
     // stripe for the whole database write and prevent concurrent progress on
     // unrelated rooms.
     auto const [stream_ordering, sync_stream_id] = [&]() {
-        auto global_guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+        auto global_guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
         auto const ordering = allocate_stream_ordering(runtime.database);
         auto const sync_id = database::allocate_sync_stream_id(runtime.database.persistent_store);
         return std::make_pair(ordering, sync_id);
@@ -1938,7 +1938,7 @@ auto ingest_pdu_event(HomeserverRuntime& runtime, federation::InboundPduEnvelope
     // sequence so per-room ordering is preserved. The global mutex protects all
     // in-memory PersistentStore / LocalDatabase vectors; it is released only
     // for the backend commit so independent rooms can commit in parallel.
-    auto global_guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto global_guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
 
     auto const third_party_invite_token = [&]() -> std::string {
         auto const* pdu_obj = std::get_if<canonicaljson::Object>(&pdu_parsed.value.storage());
@@ -2138,10 +2138,10 @@ auto wire_federation_callbacks(HomeserverRuntime& runtime) -> void
 [[nodiscard]] auto handle_local_http_request(HomeserverRuntime& runtime, LocalHttpRequest const& request)
     -> LocalHttpResponse
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     // Publish the guard so a blocking network call further down the stack —
     // notably a remote media fetch — can release it for the duration. See
-    // NetworkIoUnlock in request_lock.hpp.
+    // RuntimeLockRelease in request_lock.hpp.
     auto const lock_scope = RequestLockScope{guard};
     auto const correlation = observability::make_correlation_context(runtime.next_request_sequence++);
     [[maybe_unused]] auto const correlation_scope = observability::CorrelationScope{correlation};
@@ -2553,7 +2553,7 @@ auto wire_federation_callbacks(HomeserverRuntime& runtime) -> void
     auto blocked_by_local_policy = false;
 
     {
-        auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+        auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
         if (!runtime.started)
         {
             return response(503U, "runtime not started");

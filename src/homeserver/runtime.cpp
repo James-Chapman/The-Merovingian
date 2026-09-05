@@ -1019,11 +1019,11 @@ auto resolve_policy_server_hook(HomeserverRuntime& runtime, trust_safety::Policy
     // call site — is what actually closes the gap. Every value this
     // function still reads (trust_safety_config, runtime.config, the
     // request built below) is read above this point, while the lock is
-    // still held; nothing after NetworkIoUnlock touches runtime state. See
-    // NetworkIoUnlock in request_lock.hpp.
+    // still held; nothing after RuntimeLockRelease touches runtime state. See
+    // RuntimeLockRelease in request_lock.hpp.
     if (runtime.trust_safety_policy_server)
     {
-        auto const unlocked = NetworkIoUnlock{};
+        auto const unlocked = RuntimeLockRelease{};
         return runtime.trust_safety_policy_server(surface, entity);
     }
 
@@ -1054,7 +1054,7 @@ auto resolve_policy_server_hook(HomeserverRuntime& runtime, trust_safety::Policy
     };
     request.body = serialized.output;
     auto const result = [&]() {
-        auto const unlocked = NetworkIoUnlock{};
+        auto const unlocked = RuntimeLockRelease{};
         return runtime.outbound_client->perform(request);
     }();
     if (!result.ok)

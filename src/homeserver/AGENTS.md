@@ -50,12 +50,12 @@ every inbound `/send`.
 
 Never make a blocking network call while holding it. Both entry points publish
 their guard through `homeserver::RequestLockScope`, so wrap the call — and only
-the call — in a `homeserver::NetworkIoUnlock` scope
+the call — in a `homeserver::RuntimeLockRelease` scope
 (`merovingian/homeserver/request_lock.hpp`):
 
 ```cpp
 auto const result = [&]() {
-    auto const unlocked = NetworkIoUnlock{};   // runtime.mutex released here
+    auto const unlocked = RuntimeLockRelease{};   // runtime.mutex released here
     return runtime.outbound_client->perform(request);
 }();                                          // and re-acquired here
 ```
