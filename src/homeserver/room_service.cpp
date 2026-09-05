@@ -4745,6 +4745,27 @@ struct FederatedJoinOutcome final
     return make_operation_result(true, std::string{room_id});
 }
 
+namespace
+{
+
+// What the identity-server round trip in `invite_user_by_threepid` hands back
+// across the re-lock. An engaged `failure` means the IS did not produce a
+// usable invite, and the caller returns it verbatim.
+struct ThirdPartyInviteFetch final
+{
+    std::optional<OperationResult> failure{};
+    std::string event_json{};
+};
+
+[[nodiscard]] auto third_party_invite_failure(std::string reason, std::uint16_t status) -> ThirdPartyInviteFetch
+{
+    auto fetch = ThirdPartyInviteFetch{};
+    fetch.failure = make_operation_result(false, {}, std::move(reason), status);
+    return fetch;
+}
+
+} // namespace
+
 [[nodiscard]] auto invite_user_by_threepid(HomeserverRuntime& runtime, std::string_view access_token,
                                            std::string_view room_id, std::string_view id_server,
                                            std::string_view medium, std::string_view address,
@@ -4756,11 +4777,10 @@ struct FederatedJoinOutcome final
     // unless `id_server` is an operator-trusted IS it can actually reach, and
     // fails closed on any IS error. Spec: client-server-api.md § Inviting a user
     // via a third-party identifier; identity-service-api.md § store-invite.
-    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex, std::defer_lock};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
 
     // Validation under the lock: auth, room, membership, and that `id_server`
     // names an operator-trusted identity server.
-    guard.lock();
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4795,52 +4815,72 @@ struct FederatedJoinOutcome final
     {
         return make_operation_result(false, {}, "identity server is not trusted", 403U);
     }
-    auto base_url = std::string{*trusted_match};
-    guard.unlock(); // LOCK_RELEASE: reviewed — the identity-server call below is network-bound and must
-                    // not hold runtime.mutex. The guard is function-local, so every exit from here
-                    // releases it rather than stranding it.
+    auto const base_url = std::string{*trusted_match};
 
-    // IS store-invite call: network-bound, deliberately outside runtime.mutex
-    // (matches the convention at filter_verified_send_join_events above).
-    if (runtime.outbound_client == nullptr || runtime.cached_discovery == nullptr)
-    {
-        return make_operation_result(false, {}, "identity server is not reachable", 502U);
-    }
-    auto id_client = merovingian::identity::IdentityServerClient{*runtime.outbound_client, *runtime.cached_discovery,
-                                                                 runtime.config.server().identity_server,
-                                                                 &runtime.test_forced_identity_resolution};
-    auto const invite = id_client.store_invite(base_url, id_access_token, medium, address, room_id, *user_id);
-    if (!invite.ok)
-    {
-        return make_operation_result(false, {}, "identity server is not reachable", 502U);
-    }
-    if (invite.status != 200U)
-    {
-        // IS-level rejection (e.g. 401 bad id_access_token, 404 unbound 3PID).
-        // Fail closed; never fall back to a local-only, unverifiable invite.
-        return make_operation_result(false, {}, "identity server rejected the invite", invite.status);
-    }
-    auto const parsed = merovingian::identity::parse_store_invite_response(invite.body);
-    if (!parsed.has_value() || parsed->public_keys.empty())
-    {
-        return make_operation_result(false, {}, "identity server returned a malformed store-invite response", 502U);
-    }
+    // The IS store-invite round trip is network-bound and runs with
+    // runtime.mutex released. RuntimeLockRelease drops every recursion level
+    // this thread holds, not just this function’s own guard: the client-server
+    // dispatcher already holds the mutex for the whole request, so releasing
+    // one level left it locked for the length of the IS call and stalled every
+    // other request behind it — the 0.12.1 create_room defect and the 0.12.3
+    // leave_room defect, in a third place. Regression cover:
+    // tests/integration/test_request_lock_contention_flow.cpp.
+    //
+    // The block is a lambda so the scope boundary is the lock boundary: every
+    // value it produces is returned rather than declared above the release and
+    // assigned inside it.
+    auto const fetched = [&]() -> ThirdPartyInviteFetch {
+        auto const released = RuntimeLockRelease{guard};
+        std::ignore = released;
+        if (runtime.outbound_client == nullptr || runtime.cached_discovery == nullptr)
+        {
+            return third_party_invite_failure("identity server is not reachable", 502U);
+        }
+        auto id_client = merovingian::identity::IdentityServerClient{
+            *runtime.outbound_client, *runtime.cached_discovery, runtime.config.server().identity_server,
+            &runtime.test_forced_identity_resolution};
+        auto const invite = id_client.store_invite(base_url, id_access_token, medium, address, room_id, *user_id);
+        if (!invite.ok)
+        {
+            return third_party_invite_failure("identity server is not reachable", 502U);
+        }
+        if (invite.status != 200U)
+        {
+            // IS-level rejection (e.g. 401 bad id_access_token, 404 unbound
+            // 3PID). Fail closed; never fall back to a local-only,
+            // unverifiable invite.
+            return third_party_invite_failure("identity server rejected the invite", invite.status);
+        }
+        auto const parsed = merovingian::identity::parse_store_invite_response(invite.body);
+        if (!parsed.has_value() || parsed->public_keys.empty())
+        {
+            return third_party_invite_failure("identity server returned a malformed store-invite response", 502U);
+        }
 
-    // The ephemeral key (last entry) signs the join-side `signed` blob; the
-    // long-term key is first. Carry the ephemeral key as the top-level
-    // public_key and list every key in public_keys so joining servers can
-    // verify via key_validity_url.
-    auto const& ephemeral = parsed->public_keys.back();
-    auto const display_name = parsed->display_name.empty() ? std::string{address} : parsed->display_name;
-    auto const event_json = serialize_third_party_invite_event_json(
-        parsed->token, ephemeral.public_key, ephemeral.key_validity_url, parsed->public_keys, display_name);
-    if (!event_json.has_value())
+        // The ephemeral key (last entry) signs the join-side `signed` blob; the
+        // long-term key is first. Carry the ephemeral key as the top-level
+        // public_key and list every key in public_keys so joining servers can
+        // verify via key_validity_url.
+        auto const& ephemeral = parsed->public_keys.back();
+        auto const display_name = parsed->display_name.empty() ? std::string{address} : parsed->display_name;
+        auto const serialized = serialize_third_party_invite_event_json(
+            parsed->token, ephemeral.public_key, ephemeral.key_validity_url, parsed->public_keys, display_name);
+        if (!serialized.has_value())
+        {
+            return third_party_invite_failure("third-party invite event serialization failed", 500U);
+        }
+        auto fetch = ThirdPartyInviteFetch{};
+        fetch.event_json = *serialized;
+        return fetch;
+    }();
+    if (fetched.failure.has_value())
     {
-        return make_operation_result(false, {}, "third-party invite event serialization failed", 500U);
+        return *fetched.failure;
     }
+    auto const& event_json = fetched.event_json;
 
-    // Re-lock and persist: room state may have changed during the IS round-trip.
-    guard.lock();
+    // Room state may have changed during the IS round-trip, so re-validate now
+    // that the mutex is held again.
     auto* room_after = find_room(runtime.database, room_id);
     if (room_after == nullptr)
     {
@@ -4850,7 +4890,7 @@ struct FederatedJoinOutcome final
     {
         return make_operation_result(false, {}, "user is not joined", 403U);
     }
-    auto const composed = compose_signed_event(runtime, room_id, *user_id, *event_json);
+    auto const composed = compose_signed_event(runtime, room_id, *user_id, event_json);
     if (!composed.has_value())
     {
         return make_operation_result(false, {}, "third-party invite event rejected", 403U);

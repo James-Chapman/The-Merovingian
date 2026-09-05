@@ -33,6 +33,7 @@
 #include "merovingian/homeserver/runtime.hpp"
 #include "merovingian/homeserver/tls.hpp"
 #include "merovingian/http/request.hpp"
+#include "merovingian/identity/identity_client.hpp"
 #include "merovingian/net/tcp_acceptor.hpp"
 #include "merovingian/trust_safety/policy_engine.hpp"
 
@@ -488,6 +489,108 @@ SCENARIO("A stalled peer during a remote room join leaves the rest of the server
                 // returns a usable make_join response; what matters is that it
                 // returned at all rather than holding the mutex forever.
                 REQUIRE(join_status.load() != 0U);
+            }
+        }
+    }
+}
+
+SCENARIO("A stalled identity server during a third-party invite leaves the rest of the server responsive",
+         "[homeserver][client-server][integration][concurrency][locking][3pid]")
+{
+    // Third instance of the same bug class, and the one the 0.12.6 review
+    // found still live. invite_user_by_threepid (room_service.cpp) locks
+    // runtime.mutex itself, validates, then released its OWN guard around the
+    // identity-server /store-invite round trip. Called from the client-server
+    // dispatcher — which already holds the mutex for the whole request — that
+    // released one recursion level and left the outer one held, so the whole
+    // server stalled for the length of the IS call. Exactly the shape of the
+    // create_room defect (0.12.1) and the leave_room defect (0.12.3).
+    //
+    // The assertion is the same in every case: an unrelated request must
+    // complete while the outbound call is still in flight.
+    GIVEN("a room owned by alice and a trusted identity server that never answers")
+    {
+        REQUIRE(sodium_init() >= 0);
+
+        auto started = merovingian::homeserver::start_client_server(registration_enabled_config());
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+        auto const access_token = register_and_login(runtime);
+
+        auto const created = merovingian::homeserver::handle_client_server_request(
+            runtime, {"POST", "/_matrix/client/v3/createRoom", access_token, "{}"});
+        REQUIRE(created.response.status == 200U);
+        auto const created_body = parse_object(created.response.body);
+        auto const* created_room_id = string_member(created_body, "room_id");
+        REQUIRE(created_room_id != nullptr);
+        auto const room_id = *created_room_id;
+
+        // The certificate's common name must be the identity-server host, not
+        // "localhost": the outbound client verifies the peer name against the
+        // URL host and a mismatch fails the handshake before the stall.
+        auto const identity_host = std::string{"is.localhost.test"};
+        auto const certificate = tls_mock::write_test_tls_certificate(identity_host);
+        auto tls_context = merovingian::homeserver::make_tls_server_context(certificate.certificate_file,
+                                                                           certificate.private_key_file);
+        REQUIRE(tls_context.ok());
+        auto acceptor = merovingian::net::TcpAcceptor{};
+        REQUIRE(acceptor.bind("127.0.0.1", 0U).ok);
+        auto const port = acceptor.bound_port();
+        REQUIRE(port > 0U);
+
+        auto const identity_host_port = identity_host + ":" + std::to_string(port);
+        auto const identity_base_url = std::string{"https://"} + identity_host_port;
+        runtime.homeserver.config.server().identity_server.default_server = identity_base_url;
+        runtime.homeserver.config.server().identity_server.trusted_servers = {identity_base_url};
+        runtime.homeserver.test_forced_identity_resolution[identity_host] =
+            merovingian::identity::TestForcedIdentityResolution{{"127.0.0.1"}, certificate.certificate_pem};
+
+        auto stall = tls_mock::StallingTlsServerState{};
+        auto const late_response = tls_mock::json_http_response(
+            "200 OK", R"({"token":"is-issued-token","display_name":"bob","public_keys":[)"
+                      R"({"public_key":"lt-pk","key_validity_url":"https://is.localhost.test/kv/lt"},)"
+                      R"({"public_key":"eph-pk","key_validity_url":"https://is.localhost.test/kv/eph"}]})");
+        auto server_thread = std::thread{[&]() {
+            tls_mock::run_stalling_tls_server(acceptor, *tls_context.context, stall, late_response, max_stall);
+        }};
+        auto const server_join = tls_mock::ScopedThreadJoin{server_thread};
+
+        WHEN("a third-party invite through that identity server is in flight")
+        {
+            // Catch2 assertion macros are not thread-safe: the worker only
+            // records what it saw, and every REQUIRE runs on the main thread.
+            auto invite_status = std::atomic<std::uint16_t>{0U};
+            auto invite_thread = std::thread{[&]() {
+                auto const body = std::string{R"({"id_server":")"} + identity_host_port +
+                                  R"(","medium":"email","address":"bob@example.org",)"
+                                  R"("id_access_token":"opaque-access-token"})";
+                auto const response = merovingian::homeserver::handle_client_server_request(
+                    runtime, {"POST", "/_matrix/client/v3/rooms/" + room_id + "/invite", access_token, body});
+                invite_status.store(response.response.status);
+            }};
+            auto const invite_guard = tls_mock::ScopedThreadJoin{invite_thread};
+
+            auto const peer_saw_request = tls_mock::wait_for_flag(stall.request_received, max_stall);
+
+            THEN("an unrelated client request still completes promptly")
+            {
+                auto const start = std::chrono::steady_clock::now();
+                auto const capabilities = merovingian::homeserver::handle_client_server_request(
+                    runtime, {"GET", "/_matrix/client/v3/capabilities", access_token, {}});
+                auto const elapsed = std::chrono::steady_clock::now() - start;
+
+                // Release the identity server and reap the invite before
+                // asserting, so a failure reports as a failure rather than
+                // stalling the thread joins behind it.
+                stall.released.store(true);
+                invite_thread.join();
+
+                REQUIRE(peer_saw_request);
+                REQUIRE(capabilities.response.status == 200U);
+                REQUIRE(elapsed < responsive_budget);
+                // The invite itself must still complete once the IS answers —
+                // releasing the mutex must not have broken the call.
+                REQUIRE(invite_status.load() == 200U);
             }
         }
     }
