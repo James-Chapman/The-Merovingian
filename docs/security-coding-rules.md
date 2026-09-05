@@ -51,15 +51,23 @@ quickly finding everything a given `AGENTS.md` file contributed.
   entirely (CWE-14 Compiler Removal of Code to Clear Buffers).
   Source: 0.12.5 security audit, finding 17; `src/core/AGENTS.md`.
 
-- **Release a request guard with `homeserver::ScopedGuardRelease`, not a manual
+- **Release a request guard with `homeserver::RuntimeLockRelease`, not a manual
   `guard.unlock(); f(); guard.lock();` triple.** A manual release needs a
-  `// LOCK_RELEASE: reviewed — <reason>` annotation or `scripts/reject-unsafe.sh` rejects it.
+  `// LOCK_RELEASE: reviewed — <reason>` annotation or `scripts/reject-unsafe.sh` rejects it
+  (since 0.12.6 the gate matches `->unlock()` as well as `.unlock()`).
   Why: the RAII scope restores the guard on the exceptional path as well as the normal one,
   so a throwing outbound call cannot leave the locking invariant broken (CWE-667 Improper
-  Locking). RAII is non-negotiable in this codebase; the annotation exists so the handful of
-  legitimate exceptions — releasing before `notify_one`, or before calling a function that
-  self-locks — are visible to a reviewer rather than indistinguishable from a regression.
-  Source: 0.12.5 security audit, finding 14; `include/merovingian/homeserver/request_lock.hpp`.
+  Locking) — and because `runtime.mutex` is recursive, it releases every level the calling
+  thread holds rather than the single level a hand-written `unlock()` drops. A release that
+  leaves an outer level held keeps the mutex locked for the whole of the "released" call;
+  that shipped three times (`create_room` 0.12.1, `leave_room` 0.12.3,
+  `invite_user_by_threepid` 0.12.6), each time reachable by an unprivileged client.
+  RAII is non-negotiable in this codebase; the annotation exists so the handful of
+  legitimate exceptions — releasing before `notify_one`, for instance — are visible to a
+  reviewer rather than indistinguishable from a regression. Releasing before calling a
+  self-locking function is no longer one of them: the callee's own scope handles it.
+  Source: 0.12.5 security audit, finding 14; issue #487;
+  `include/merovingian/homeserver/request_lock.hpp`.
 
 - **RAII is non-negotiable.**
   Why: resources (file descriptors, locks, `SecretBuffer`s, mutex guards) must be released
@@ -452,7 +460,7 @@ quickly finding everything a given `AGENTS.md` file contributed.
   Source: `src/homeserver/AGENTS.md`, `src/media/AGENTS.md`.
 
 - **Never hold `HomeserverRuntime::mutex` across a blocking network call.** Wrap the call
-  in a `homeserver::NetworkIoUnlock` scope (`homeserver/request_lock.hpp`) and keep every
+  in a `homeserver::RuntimeLockRelease` scope (`homeserver/request_lock.hpp`) and keep every
   read and mutation of runtime state outside it.
   Why: that one mutex serialises every client-server request and every inbound federation
   transaction, so a network call held across it turns any remote server into a

@@ -185,35 +185,41 @@ on registration, room creation, and media download/thumbnail) therefore
 release it for the duration of the network round trip and re-acquire it before
 touching runtime state again. The release is RAII: the entry points publish
 their guard through `homeserver::RequestLockScope`, and each network call sits
-inside a `homeserver::NetworkIoUnlock` scope. Signing stays under the lock,
+inside a `homeserver::RuntimeLockRelease` scope. Signing stays under the lock,
 because the outbound call borrows a span into the runtime's `SecretBuffer`. See
 [`http-transport.md`](http-transport.md) "Request lock and blocking network
 calls".
 
-**`NetworkIoUnlock` only releases one lock level.** `HomeserverRuntime::mutex`
-is a `std::recursive_mutex` so that self-locking service functions (`create_room`,
-`join_room`, `leave_room`) stay independently callable, but when such a
-function is called from a request handler that already holds its own guard,
-the recursive acquisition is silent — and `NetworkIoUnlock` releases only the
-*published* (outer) guard, leaving the callee's own (inner, actually-in-scope)
-guard held. 0.12.1 found and fixed this for `create_room` (see
-[`http-transport.md`](http-transport.md) "`NetworkIoUnlock` was incomplete for
-recursive acquisitions"). **`join_room`/`leave_room` were tracked as sharing that
-gap; 0.12.2 disproved it.** They self-lock the same way, but unlike the
-pre-fix `create_room` they already release the guard around their federation
-work with hand-written `guard.unlock()`/`guard.lock()` pairs, so the mutex is
-not held across `make_join`/`make_leave`. A regression test driving a remote
-join against a stalled peer
-(`test_request_lock_contention_flow.cpp`, "A stalled peer during a remote room
-join") passes against the unfixed code and is kept as a guard. Two further findings, both from review on #485. First, `leave_room` carried the
-exception-safety gap common to every hand-written pair — nine separate re-lock
-paths, any throw between them leaving the guard down — now one scoped release.
-Second, and more consequential: releasing inside `leave_room` was NOT enough.
-The client dispatcher holds its own guard on the same recursive mutex for the
-whole request, so the callee's release dropped only the depth it had added and
-the mutex stayed held across `make_leave`/`send_leave`. The leave route now
-releases the dispatcher's guard around the call, which is what actually closes
-the stall. Tracked generally in issue #487.
+**The recursion hazard, and how 0.12.6 removed it.**
+`HomeserverRuntime::mutex` is recursive so that self-locking service functions
+(`create_room`, `join_room`, `leave_room`, `invite_user_by_threepid`) stay
+independently callable. When such a function runs beneath a request handler
+that already holds its own guard, the nested acquisition is silent, and a
+release that drops one level leaves the mutex held for the whole of the
+"released" network call. That defect shipped three times: `create_room`
+(0.12.1), `leave_room` (0.12.3, found by review on #485), and
+`invite_user_by_threepid` (0.12.6, found by the regression test written for
+issue #487). Each was fixed in place, and each fix had a different shape, which
+is what made the pattern worth removing rather than auditing again.
+
+Since 0.12.6 there is one release primitive, `homeserver::RuntimeLockRelease`,
+and it **releases every recursion level the calling thread holds**, restoring
+exactly that many on scope exit, including when the guarded call throws. It can
+do so because `runtime.mutex` is a `homeserver::RuntimeMutex`: a
+`std::recursive_mutex` that also records its owner, so a release scope can ask
+whether the calling thread still holds it. Choosing the "wrong" guard to
+release is no longer a way to keep the mutex locked across a network round
+trip. The two earlier primitives (`NetworkIoUnlock`, acting on the thread's
+published guard, and `ScopedGuardRelease`, acting on a guard in hand) are gone;
+the two constructors of `RuntimeLockRelease` name the same distinction and
+behave identically otherwise.
+
+No hand-written `unlock()`/`lock()` pair around `runtime.mutex` remains in
+`include/` or `src/`, and `scripts/reject-unsafe.sh` rejects new ones. The
+regression cover is `tests/unit/test_request_lock.cpp`, which asserts on what
+another thread can observe rather than on what a guard believes, and
+`tests/integration/test_request_lock_contention_flow.cpp`, which drives a real
+stalled TLS peer per affected route.
 
 **Load/soak evidence for the remaining critical section.**
 `tests/integration/test_runtime_lock_soak_flow.cpp` (opt-in, `build_load_tests`)

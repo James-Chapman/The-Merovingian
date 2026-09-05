@@ -48,8 +48,7 @@ is `declared_mime|sniffed_mime|scanner_clean|bytes` — the pipe-delimited wrapp
 inbound federation handling. Anything holding it blocks every other client and
 every inbound `/send`.
 
-Never make a blocking network call while holding it. Both entry points publish
-their guard through `homeserver::RequestLockScope`, so wrap the call — and only
+Never make a blocking network call while holding it. Wrap the call — and only
 the call — in a `homeserver::RuntimeLockRelease` scope
 (`merovingian/homeserver/request_lock.hpp`):
 
@@ -60,9 +59,24 @@ auto const result = [&]() {
 }();                                          // and re-acquired here
 ```
 
+Both entry points publish their guard through `homeserver::RequestLockScope`,
+which is what the default-constructed form above finds. When the guard is in
+hand instead — a service function that took its own — pass it:
+`RuntimeLockRelease{guard}`. **Either form releases every recursion level this
+thread holds**, so a self-locking service function called from a dispatcher
+that already holds the mutex still frees it outright. That is not a nicety:
+releasing a single level shipped as a server-wide stall three times
+(`create_room` 0.12.1, `leave_room` 0.12.3, `invite_user_by_threepid` 0.12.6).
+
 Keep every read and mutation of runtime state outside the scope. In particular
 request signing stays under the lock, because `OutboundCall::secret_key` borrows
 a span into the runtime's `SecretBuffer`.
+
+When the released region produces values the code after it consumes, return
+them from an immediately-invoked lambda — or a named function, as `join_room`
+does with `perform_federated_join` — rather than declaring them above the
+release. The scope boundary is then the lock boundary, and nothing has to be
+default-constructed and assigned in order to survive it.
 
 See [`docs/http-transport.md`](../../docs/http-transport.md) "Request lock and
 blocking network calls".

@@ -956,7 +956,7 @@ threat it closes; the controls above are the standing defences these reinforce.
   reachable this way by an unauthenticated remote: a `/keys/query` naming a user
   on the attacker's server, and any media reference pointing at it. Mitigated by
   releasing the mutex for the duration of every outbound network call
-  (`homeserver::NetworkIoUnlock`) so a stalled peer costs one request rather than
+  (`homeserver::RuntimeLockRelease`) so a stalled peer costs one request rather than
   the process, and covered by a regression test that holds a real TLS peer open
   and asserts unrelated requests still complete. A third instance of the same
   bug (0.12.1): `resolve_policy_server_hook`'s call to `trust_safety.policy_server_url`
@@ -969,18 +969,27 @@ threat it closes; the controls above are the standing defences these reinforce.
   style of regression test using the injectable `trust_safety_policy_server`
   hook to stand in for a stalled policy server (no outbound TLS pinning
   mechanism exists for this particular call, unlike the federation path).
-  That regression test also surfaced a second, independent bug: `create_room`
-  self-locks `runtime.mutex` (a `std::recursive_mutex`) so it stays callable
-  outside a request handler, but calling it from a handler that already held
-  the lock silently double-locked it — `NetworkIoUnlock` released only the
-  outer level, so the mutex stayed effectively held for the whole "unlocked"
-  network call, and the 0.11.13 `NetworkIoUnlock` mechanism turns out to have
-  been incomplete for any call chain with a second, self-locking function on
-  the stack. Fixed by publishing `RequestLockScope` around `create_room`'s own
-  guard and having every caller release its own guard first — see
-  `docs/http-transport.md`, "`NetworkIoUnlock` was incomplete for recursive
-  acquisitions". `join_room`/`leave_room` share the same self-locking shape
-  and are tracked as follow-up, not yet confirmed either way.
+  That regression test also surfaced a second, independent bug, and the same
+  bug shape then reached production a further two times. `create_room`,
+  `leave_room`, and `invite_user_by_threepid` each self-lock `runtime.mutex` so
+  they stay callable outside a request handler; calling one from a handler that
+  already held the lock silently double-locked it, so a release of a single
+  level left the mutex effectively held for the whole of the "unlocked" network
+  call. `create_room` was fixed in 0.12.1, `leave_room` in 0.12.3 (found by
+  review, having been documented as closed when it was not), and
+  `invite_user_by_threepid` in 0.12.6 (found by a regression test written for
+  issue #487 before any code changed). Each is reachable by an ordinary
+  authenticated client: create a room, leave a room, or invite an email address
+  through an identity server the operator trusts.
+  0.12.6 removes the class rather than the third instance.
+  `runtime.mutex` is now a `homeserver::RuntimeMutex`, a recursive mutex that
+  records its owning thread, and the single release primitive
+  `homeserver::RuntimeLockRelease` drains every level the calling thread holds
+  and restores exactly that many on exit, including when the guarded call
+  throws. No hand-written release of the runtime mutex remains in `include/` or
+  `src/`, and `scripts/reject-unsafe.sh` rejects new ones. See
+  `docs/http-transport.md`, "One release primitive, and why it drains every
+  level".
   Load/soak evidence for the remaining critical section is tracked in
   `docs/todos/production-milestone.md`, "Global runtime lock".
 

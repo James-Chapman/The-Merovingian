@@ -246,7 +246,7 @@ Remote download and thumbnail requests arrive through
 `handle_local_http_request`, which holds `HomeserverRuntime::mutex` for the
 whole request. The federation fetch, its `Location` redirect follow, and the
 server-discovery cascade all release that mutex for the network round trip via
-`homeserver::NetworkIoUnlock`, and re-acquire it before touching repository
+`homeserver::RuntimeLockRelease`, and re-acquire it before touching repository
 metrics, the audit log, or the blob store.
 
 This matters because the same mutex serialises inbound federation traffic: a
