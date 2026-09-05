@@ -1991,15 +1991,18 @@ auto ingest_pdu_event(HomeserverRuntime& runtime, federation::InboundPduEnvelope
 
     // Release only the global mutex for the backend commit. Independent rooms
     // can now commit concurrently (each still holds its own stripe), while the
-    // in-memory store stays protected against concurrent reads/writes.
-    global_guard.unlock(); // LOCK_RELEASE: reviewed — function-local unique_lock; the early return below
-                           // releases rather than strands it, and the in-memory store is only touched
-                           // again after the re-lock.
-    if (!database::commit_persistent_transaction(runtime.database.persistent_store, prepared->statements))
+    // in-memory store stays protected against concurrent reads/writes. The
+    // early return inside the scope re-acquires on the way out, as does a
+    // throw from the backend.
+    auto const committed = [&] {
+        auto const released = RuntimeLockRelease{global_guard};
+        std::ignore = released;
+        return database::commit_persistent_transaction(runtime.database.persistent_store, prepared->statements);
+    }();
+    if (!committed)
     {
         return {federation::PduIngestionStatus::internal_error, "event persistence backend rejected transaction"};
     }
-    global_guard.lock();
 
     database::apply_store_event_with_state(runtime.database.persistent_store, *prepared);
 
@@ -2421,10 +2424,11 @@ auto wire_federation_callbacks(HomeserverRuntime& runtime) -> void
         // handler's own guard first so it is not double-locked, matching the
         // join_room delegation just above and the equivalent client_server.cpp
         // call sites.
-        guard.unlock(); // LOCK_RELEASE: reviewed — create_room self-locks; releasing first avoids a
-                        // double lock, and the guard is function-local so a throw releases it.
-        auto result = create_room(runtime, request.access_token);
-        guard.lock();
+        auto const result = [&] {
+            auto const released = RuntimeLockRelease{guard};
+            std::ignore = released;
+            return create_room(runtime, request.access_token);
+        }();
         return result.ok ? response(200U, result.value)
                          : response(result.status != 0U ? result.status : 403U, result.reason);
     }
@@ -2496,9 +2500,11 @@ auto wire_federation_callbacks(HomeserverRuntime& runtime) -> void
                            {"via_count",          std::to_string(via_servers.size()),               false},
                            {"third_party_signed", third_party_signed == nullptr ? "false" : "true", false}
         });
-        guard.unlock(); // LOCK_RELEASE: reviewed — join_room self-locks; this handler returns
-                        // immediately afterwards and never touches shared state again.
-        auto result = join_room(runtime, request.access_token, room_id, via_servers, third_party_signed);
+        auto const result = [&] {
+            auto const released = RuntimeLockRelease{guard};
+            std::ignore = released;
+            return join_room(runtime, request.access_token, room_id, via_servers, third_party_signed);
+        }();
         log_diagnostic(result.ok ? "room.join.accepted" : "room.join.rejected",
                        {
                            {"room_id", room_id,                                                    false},

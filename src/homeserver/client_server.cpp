@@ -10986,7 +10986,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
     {
         // AppserviceRegistry is immutable after boot (see its class doc
         // comment in registration.hpp) — these references into it stay
-        // valid across the guard.unlock()/guard.lock() pairs below, which
+        // valid across the RuntimeLockRelease scopes below, which
         // release runtime.mutex for the actual outbound network calls per
         // homeserver/AGENTS.md's "never make a blocking network call while
         // holding it" rule.
