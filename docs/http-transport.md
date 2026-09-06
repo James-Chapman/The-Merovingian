@@ -605,6 +605,22 @@ scope can ask `held_by_current_thread()` and keep unlocking until the answer is
 no. `std::recursive_mutex` cannot answer that question, which is why the
 mechanism could not be made safe without the wrapper.
 
+A release scope drops those levels through the mutex, never through a guard:
+the levels belong to `unique_lock` objects in frames it cannot reach. **Every
+`unique_lock` on the mutex therefore keeps reporting `owns_lock() == true` for
+the lifetime of the scope, the one passed in included.** That is sound only
+because nothing outside `request_lock.cpp` reads the flag and the depth is
+restored exactly before any guard can act on it. An earlier revision of this
+change released the named guard first and drained the rest through the mutex;
+review on #490 caught that an inner scope reaching for the thread's published
+guard would then act on a stale flag, unlock a mutex the thread no longer held,
+underflow the recursion depth, and strand `runtime.mutex` locked for the life
+of the process. Nested scopes now read `held_by_current_thread()` and correctly
+find nothing left to release; the regression is
+`tests/unit/test_request_lock.cpp`, "release scopes nest without corrupting the
+recursion depth", which fails against the old shape with `Operation not
+permitted`.
+
 Consequences worth knowing:
 
 - Releasing the caller's guard before calling a self-locking function is no
@@ -615,10 +631,12 @@ Consequences worth knowing:
 - A blocking call should open its release scope where the call is, not where
   the caller is. The callee knows it is about to do network I/O; the caller may
   not.
-- `RuntimeLockRelease::outer_levels_released()` reports how many levels beyond
-  the named guard the scope had to drain. It exists for tests and diagnostics;
-  a non-zero value means some outer frame was holding the mutex across this
-  call, which used to be the bug.
+- `RuntimeLockRelease::levels_released()` reports how many levels the scope
+  dropped and will restore. More than one means some outer frame was holding
+  the mutex across this call, which used to be the bug; zero is the normal
+  answer for a nested scope.
+- Do not read `owns_lock()` on a guard to decide anything. It is not updated
+  while a release scope is open, and no code outside the primitive reads it.
 
 ### `join_room`, and why the released region became a function
 

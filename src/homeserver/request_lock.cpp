@@ -45,49 +45,54 @@ void RuntimeLockRelease::release(std::unique_lock<RuntimeMutex>* guard) noexcept
         // test path.
         return;
     }
+    // The guard is only ever consulted for which mutex it refers to, never for
+    // whether it believes it owns it. `unique_lock::mutex()` answers that even
+    // when the lock is not held.
     mutex_ = guard->mutex();
     if (mutex_ == nullptr)
     {
         return;
     }
-    // Release the guard the caller named first, so that guard observes the
-    // release (`owns_lock()` reports false for the duration) and is the last
-    // thing re-acquired on exit.
-    if (guard->owns_lock())
-    {
-        released_ = guard;
-        released_->unlock();
-    }
-    // Every level still held after that belongs to an outer frame: a
-    // dispatcher's guard, or a self-locking caller's. `runtime.mutex` is
-    // recursive, so leaving one in place keeps the whole server serialised
-    // behind whatever blocking work this scope was opened for. Drain them and
-    // count them; the destructor restores exactly this many.
+    // Drop every level this thread holds, through the mutex rather than
+    // through any guard.
+    //
+    // Two reasons it must work this way. First, the levels belong to
+    // `unique_lock` objects in frames this scope cannot reach — a dispatcher's
+    // guard, a self-locking caller's — and leaving one held keeps the mutex
+    // locked for the whole of the blocking work this scope was opened for.
+    // Second, releasing through one guard while draining the rest through the
+    // mutex would leave that guard's `owns_lock()` flag and the real recursion
+    // depth disagreeing in opposite directions across two objects; an inner
+    // release scope that then trusted a flag would unlock a mutex this thread
+    // no longer holds, underflow `depth_`, and strand the runtime mutex locked
+    // for the life of the process.
+    //
+    // The consequence, and the reason this is safe: **every `unique_lock` on
+    // this mutex keeps reporting `owns_lock() == true` for the lifetime of
+    // this scope, including the one passed in.** Nothing outside this file
+    // reads that flag (`grep -rn owns_lock src include`), the depth is
+    // restored exactly before any of those guards can act on it, and an inner
+    // release scope reads the mutex — see `held_by_current_thread` — so it
+    // correctly finds nothing left to release.
     while (mutex_->held_by_current_thread())
     {
-        mutex_->unlock();
-        ++outer_levels_;
+        mutex_->unlock(); // LOCK_RELEASE: reviewed — this IS the RAII release scope; the destructor
+                          // re-acquires exactly `levels_` on every path, throwing included.
+        ++levels_;
     }
 }
 
 RuntimeLockRelease::~RuntimeLockRelease()
 {
-    // Outer levels first, then the caller's own guard, so the recursion depth
-    // is rebuilt in the order it was taken. On one recursive mutex the order
-    // is immaterial to correctness; it keeps the intent readable.
-    for (auto level = std::size_t{0U}; level < outer_levels_; ++level)
+    for (auto level = std::size_t{0U}; level < levels_; ++level)
     {
         mutex_->lock();
     }
-    if (released_ != nullptr)
-    {
-        released_->lock();
-    }
 }
 
-auto RuntimeLockRelease::outer_levels_released() const noexcept -> std::size_t
+auto RuntimeLockRelease::levels_released() const noexcept -> std::size_t
 {
-    return outer_levels_;
+    return levels_;
 }
 
 } // namespace merovingian::homeserver

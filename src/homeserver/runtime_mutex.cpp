@@ -39,7 +39,8 @@ void RuntimeMutex::unlock()
     {
         owner_.store(std::thread::id{}, std::memory_order_release);
     }
-    mutex_.unlock();
+    mutex_.unlock(); // LOCK_RELEASE: reviewed — this IS the runtime mutex’s unlock; the RAII scope
+                     // callers are pointed at (RuntimeLockRelease) is built on top of it.
 }
 
 auto RuntimeMutex::held_by_current_thread() const noexcept -> bool

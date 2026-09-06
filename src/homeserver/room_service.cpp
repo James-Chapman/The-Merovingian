@@ -3260,10 +3260,12 @@ namespace
 struct FederatedJoinOutcome final
 {
     std::optional<OperationResult> failure{};
-    // Non-owning: room version policies are entries in a static table
-    // (rooms::find_room_version_policy), not runtime state, so this stays
-    // valid across the re-lock.
-    rooms::RoomVersionPolicy const* policy{nullptr};
+    // Held by value. The lookup returns a pointer into a static table, but
+    // storing that pointer here would make the caller's dereference depend on
+    // `failure` being disengaged, and the project forbids raw pointers.
+    // RoomVersionPolicy is a string_view and a handful of enums and bools, and
+    // the background-fill task already copies it.
+    rooms::RoomVersionPolicy policy{};
     std::string remote_server{};
     events::SignedEventResult signed_event{};
     canonicaljson::Value signed_event_value{};
@@ -3343,7 +3345,7 @@ struct FederatedJoinOutcome final
     auto room_id_copy = std::string{room_id};
     auto user_id_copy = std::string{user_id};
     auto our_server_copy = std::string{our_server};
-    auto key_id_copy = key_id;
+    auto key_id_copy = std::string{key_id};
     auto sv_copy = supported_versions;
     auto race_futures = std::vector<std::future<void>>{};
     race_futures.reserve(candidates.size());
@@ -3658,7 +3660,7 @@ struct FederatedJoinOutcome final
                                          : canonicaljson::Array{};
 
     auto outcome = FederatedJoinOutcome{};
-    outcome.policy = policy;
+    outcome.policy = *policy;
     outcome.remote_server = std::move(remote_server);
     outcome.signed_event = std::move(signed_event);
     outcome.signed_event_value = signed_value.value;
@@ -3832,9 +3834,7 @@ struct FederatedJoinOutcome final
         {
             return *joined.failure;
         }
-        // Non-null whenever `failure` is empty: perform_federated_join returns
-        // a failure outcome if find_room_version_policy comes back null.
-        auto const* policy = joined.policy;
+        auto const& policy = joined.policy;
         auto const& remote_server = joined.remote_server;
         auto const& signed_event = joined.signed_event;
         auto const& signed_event_value = joined.signed_event_value;
@@ -3851,7 +3851,7 @@ struct FederatedJoinOutcome final
         // (m.room.encryption, m.room.create, m.room.power_levels, etc.) by
         // checking the raw JSON for the presence of the "state_key" field
         // rather than its emptiness.
-        auto const state_members = ingest_send_join_state(runtime, verified_critical_state, *policy);
+        auto const state_members = ingest_send_join_state(runtime, verified_critical_state, policy);
         for (auto const& m : state_members)
         {
             append_unique_member(joined_members, m);
@@ -3871,9 +3871,9 @@ struct FederatedJoinOutcome final
                     auto event_id = std::string{};
                     if (entry_obj != nullptr)
                     {
-                        if (policy->event_id_format == rooms::EventIdFormat::reference_hash)
+                        if (policy.event_id_format == rooms::EventIdFormat::reference_hash)
                         {
-                            auto const eid = events::make_reference_hash_event_id(auth_entry, *policy);
+                            auto const eid = events::make_reference_hash_event_id(auth_entry, policy);
                             event_id = eid.event_id;
                         }
                         else
@@ -3915,7 +3915,7 @@ struct FederatedJoinOutcome final
                         {
                             return parsed.event.room_id;
                         }
-                        if (policy != nullptr && policy->create_event_is_room_id && !event_id.empty())
+                        if (policy.create_event_is_room_id && !event_id.empty())
                         {
                             return "!" + event_id.substr(1);
                         }
@@ -4117,7 +4117,7 @@ struct FederatedJoinOutcome final
         {
             auto room_id_bg = std::string{room_id};
             auto our_server_bg = our_server;
-            auto policy_bg = *policy;
+            auto policy_bg = policy;
             auto bg_future =
                 std::async(std::launch::async, [&runtime, room_id_bg, our_server_bg, policy_bg, background_member_count,
                                                 background_state_bg = std::move(background_state)]() mutable {

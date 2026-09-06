@@ -75,10 +75,6 @@ SCENARIO("a released guard is restored when the guarded work throws", "[homeserv
                 auto const released = RuntimeLockRelease{guard};
                 std::ignore = released;
                 free_during_scope = free_to_another_thread(mutex);
-                THEN("the guard reports that it no longer owns the mutex")
-                {
-                    REQUIRE_FALSE(guard.owns_lock());
-                }
             }
 
             THEN("the mutex was genuinely free for the duration of that scope")
@@ -168,11 +164,11 @@ SCENARIO("a release scope frees the mutex even when an outer frame also holds it
         WHEN("the service releases the guard it holds for a blocking call")
         {
             auto free_during_scope = false;
-            auto outer_levels = std::size_t{0U};
+            auto released_levels = std::size_t{0U};
             {
                 auto const released = RuntimeLockRelease{service_guard};
                 free_during_scope = free_to_another_thread(mutex);
-                outer_levels = released.outer_levels_released();
+                released_levels = released.levels_released();
             }
 
             THEN("no level of the mutex is left held across that call")
@@ -183,9 +179,9 @@ SCENARIO("a release scope frees the mutex even when an outer frame also holds it
                 REQUIRE(free_during_scope);
             }
 
-            THEN("the outer frame's level is reported as one this scope had to drain")
+            THEN("both levels are reported as released")
             {
-                REQUIRE(outer_levels == 1U);
+                REQUIRE(released_levels == 2U);
             }
 
             THEN("both frames own the mutex again afterwards")
@@ -266,7 +262,7 @@ SCENARIO("the published-guard release frees the mutex whichever guard was publis
         {
             auto const opened = [] {
                 auto const released = RuntimeLockRelease{};
-                return released.outer_levels_released();
+                return released.levels_released();
             }();
 
             THEN("it does nothing at all")
@@ -274,6 +270,110 @@ SCENARIO("the published-guard release frees the mutex whichever guard was publis
                 // The federation worker and direct-call tests reach service
                 // functions without a request guard on the stack.
                 REQUIRE(opened == 0U);
+            }
+        }
+    }
+}
+
+SCENARIO("release scopes nest without corrupting the recursion depth", "[homeserver][locking][security]")
+{
+    // A release scope drops recursion levels through the mutex itself, because
+    // it has no way to reach the `unique_lock` objects that own them. Those
+    // guards therefore keep reporting `owns_lock() == true` while the mutex is
+    // free, and an inner scope that trusted that flag would unlock a mutex the
+    // thread no longer holds: the recursion depth underflows and the runtime
+    // mutex is left permanently locked. Nothing outside the primitive reads
+    // `owns_lock()`, so the scope reads the mutex instead.
+    GIVEN("a published dispatcher guard and a nested service guard")
+    {
+        auto mutex = RuntimeMutex{};
+        auto dispatcher_guard = std::unique_lock<RuntimeMutex>{mutex};
+        auto const published = RequestLockScope{dispatcher_guard};
+        std::ignore = published;
+        auto service_guard = std::unique_lock<RuntimeMutex>{mutex};
+        REQUIRE_FALSE(free_to_another_thread(mutex));
+
+        WHEN("a second release scope opens inside the first")
+        {
+            auto free_in_outer = false;
+            auto free_in_inner = false;
+            auto inner_levels = std::size_t{1U};
+            {
+                auto const outer = RuntimeLockRelease{service_guard};
+                std::ignore = outer;
+                free_in_outer = free_to_another_thread(mutex);
+                {
+                    // A helper deeper in the call stack reaching for the
+                    // thread's published guard, which the outer scope has
+                    // already drained.
+                    auto const inner = RuntimeLockRelease{};
+                    free_in_inner = free_to_another_thread(mutex);
+                    inner_levels = inner.levels_released();
+                }
+                THEN("the inner scope finds nothing left to release")
+                {
+                    REQUIRE(inner_levels == 0U);
+                }
+            }
+
+            THEN("the mutex is free throughout both scopes")
+            {
+                REQUIRE(free_in_outer);
+                REQUIRE(free_in_inner);
+            }
+
+            THEN("every level is restored exactly once when both scopes close")
+            {
+                REQUIRE(mutex.held_by_current_thread());
+                REQUIRE_FALSE(free_to_another_thread(mutex));
+                // Two acquisitions were taken and two must remain. Releasing
+                // both frees the mutex; a depth that underflowed or was
+                // restored twice leaves it held here, and unlocking a mutex
+                // this thread does not own is undefined behaviour TSan reports.
+                service_guard.unlock();
+                REQUIRE(mutex.held_by_current_thread());
+                dispatcher_guard.unlock();
+                REQUIRE_FALSE(mutex.held_by_current_thread());
+                REQUIRE(free_to_another_thread(mutex));
+            }
+        }
+
+        WHEN("code inside a release scope takes a fresh lock and releases again")
+        {
+            auto free_before_fresh_lock = false;
+            auto held_with_fresh_lock = false;
+            auto free_in_inner = false;
+            auto inner_levels = std::size_t{0U};
+            {
+                auto const outer = RuntimeLockRelease{service_guard};
+                std::ignore = outer;
+                free_before_fresh_lock = free_to_another_thread(mutex);
+
+                auto fresh_guard = std::unique_lock<RuntimeMutex>{mutex};
+                held_with_fresh_lock = !free_to_another_thread(mutex);
+                {
+                    auto const inner = RuntimeLockRelease{fresh_guard};
+                    free_in_inner = free_to_another_thread(mutex);
+                    inner_levels = inner.levels_released();
+                }
+                REQUIRE(mutex.held_by_current_thread());
+            }
+
+            THEN("the fresh level is released for the inner scope and restored after it")
+            {
+                REQUIRE(free_before_fresh_lock);
+                REQUIRE(held_with_fresh_lock);
+                REQUIRE(free_in_inner);
+                REQUIRE(inner_levels == 1U);
+            }
+
+            THEN("both original levels are restored when the outer scope closes")
+            {
+                REQUIRE(mutex.held_by_current_thread());
+                service_guard.unlock();
+                REQUIRE(mutex.held_by_current_thread());
+                dispatcher_guard.unlock();
+                REQUIRE_FALSE(mutex.held_by_current_thread());
             }
         }
     }

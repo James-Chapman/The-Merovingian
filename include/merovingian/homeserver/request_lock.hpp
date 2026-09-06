@@ -63,12 +63,23 @@ private:
 //
 // Two constructors, one behaviour:
 //
-//   RuntimeLockRelease{}        // releases via the thread's published guard
-//   RuntimeLockRelease{guard}   // releases via a guard in hand
+//   RuntimeLockRelease{}        // find the mutex via the thread's published guard
+//   RuntimeLockRelease{guard}   // find it via a guard in hand
 //
-// The argument only says which `unique_lock` object should observe the release
-// and re-acquire it — the set of levels released is the same either way, so
-// choosing the "wrong" one can no longer leave the mutex held.
+// The argument says only which `unique_lock` to read the mutex address from,
+// never whether that guard believes it owns it. The set of levels released is
+// the same either way, so choosing the "wrong" one can no longer leave the
+// mutex held.
+//
+// **A guard's `owns_lock()` is NOT cleared for the duration of the scope.**
+// The levels being dropped belong to `unique_lock` objects in frames this
+// scope cannot reach, so the release necessarily goes through the mutex and no
+// guard's bookkeeping flag can be updated — the one passed in included. That
+// is sound only because nothing outside `request_lock.cpp` reads the flag
+// (`grep -rn owns_lock src include`) and the depth is restored exactly before
+// any guard can act on it. Read `RuntimeMutex::held_by_current_thread()`
+// instead if you need to know whether the mutex is held; a nested release
+// scope does exactly that, and so correctly finds nothing left to release.
 //
 // Doing nothing is always a valid outcome: with no guard published and none
 // passed, there is no mutex to act on and the scope neither unlocks nor
@@ -96,19 +107,22 @@ public:
     RuntimeLockRelease(RuntimeLockRelease&&) = delete;
     auto operator=(RuntimeLockRelease&&) -> RuntimeLockRelease& = delete;
 
-    // Number of recursion levels released beyond the guard this scope was
-    // given. A non-zero value means some outer frame held `runtime.mutex`
-    // across this scope's blocking work and would have deadlocked the server
-    // before this primitive started draining those levels. Exposed for tests
-    // and diagnostics; correctness does not depend on anyone reading it.
-    [[nodiscard]] auto outer_levels_released() const noexcept -> std::size_t;
+    // Number of recursion levels this scope dropped, and will restore. More
+    // than one means some outer frame held `runtime.mutex` across this scope's
+    // blocking work and would have stalled the server before this primitive
+    // started draining those levels; zero means the thread held nothing, which
+    // is the normal case for a nested scope. Exposed for tests and
+    // diagnostics; correctness does not depend on anyone reading it.
+    [[nodiscard]] auto levels_released() const noexcept -> std::size_t;
 
 private:
     void release(std::unique_lock<RuntimeMutex>* guard) noexcept;
 
-    std::unique_lock<RuntimeMutex>* released_{nullptr};
+    // Non-owning observer of the mutex this scope released, null when it
+    // released nothing. A reference member cannot express "nothing to do", and
+    // this mirrors what `std::unique_lock` itself stores.
     RuntimeMutex* mutex_{nullptr};
-    std::size_t outer_levels_{0U};
+    std::size_t levels_{0U};
 };
 
 } // namespace merovingian::homeserver

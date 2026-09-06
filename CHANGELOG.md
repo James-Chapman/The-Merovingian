@@ -70,6 +70,37 @@ the same idea at smaller scale, with an immediately-invoked lambda.
   a release through a pointer used to slip past unseen — and exempts by name the
   two files that implement the primitives.
 
+### Fixed in review on #490
+
+Four findings from review, all in code this branch introduced:
+
+- **Nested release scopes corrupted the recursion depth.** The scope released
+  the named guard through `unique_lock::unlock()` and drained the remaining
+  levels through the mutex. Draining cannot clear another `unique_lock`'s
+  ownership flag, so an inner scope reaching for the thread's published guard
+  saw a stale `owns_lock() == true`, unlocked a mutex the thread no longer
+  held, underflowed the depth, and would have stranded `runtime.mutex` locked
+  for the life of the process. The scope now drops every level through the
+  mutex and never consults a guard's flag; nested scopes read
+  `held_by_current_thread()` and correctly find nothing to release. The new
+  scenario fails against the old shape with `Operation not permitted`.
+- **`perform_federated_join` captured a dangling `key_id`.** Extracting the
+  function turned `key_id` into a `std::string_view`, so `auto key_id_copy =
+  key_id;` deduced a view rather than the owning `std::string` the surrounding
+  comment promises. make_join tasks that lose the race are moved into
+  `runtime.orphan_futures_` and outlive `join_room`'s frame, so a slow or
+  semaphore-queued candidate could read freed memory when building its X-Matrix
+  authorization header.
+- **`FederatedJoinOutcome` held the room-version policy as a raw pointer**,
+  making the caller's dereference depend on a separate `failure` field and
+  breaking the project's no-raw-pointers rule. It is held by value now; the
+  background-fill task already copied it.
+- **The reject-unsafe gate exempted two files wholesale**, which would have let
+  any future unannotated release in either primitive through, and
+  `scripts/AGENTS.md` says not to add exceptions to that script. The exemption
+  is per-line again, with the same `LOCK_RELEASE: reviewed` annotation every
+  other site would need.
+
 ### Tests
 
 - `tests/unit/test_request_lock.cpp` rewritten to assert on **what another
@@ -79,6 +110,10 @@ the same idea at smaller scale, with an immediately-invoked lambda.
   a nested dispatcher/service pair, the published-guard constructor over an
   unpublished nested guard, the throwing path in both, and `RuntimeMutex`
   ownership reporting.
+- `tests/unit/test_request_lock.cpp` also covers scope nesting: an inner
+  release scope opening inside an outer one, and a fresh lock taken inside a
+  released region and then released again. Both assert the depth is restored
+  exactly once per level by unwinding the guards and checking ownership ends.
 - `tests/integration/test_request_lock_contention_flow.cpp` gains the
   third-party-invite scenario described above.
 
