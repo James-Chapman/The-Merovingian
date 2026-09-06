@@ -360,6 +360,19 @@ total deadline, with the deadline scaled by the declared length at a
 **16 KiB/s floor** so large, honestly-paced media uploads are unaffected
 while a dribbled 1 MiB body is cut at roughly 94 seconds.
 
+**Every cap must bound the poll that waits on it.** The caps above are
+evaluated between reads, so a `recv` allowed to outlast one makes that cap
+unenforceable. `recv_with_timeout` therefore takes a poll budget, and both the
+head and body loops pass the smallest of the per-read timeout, the overall
+deadline, and the remaining inter-byte allowance; budget expiry is reported
+distinctly from a peer close so the loop re-checks and the cap that actually
+expired ends the request and is the one logged. This was not a hypothetical:
+until 0.12.7 the poll was a fixed 15 seconds while the inter-byte cap was 5, so
+the inter-byte cap could never fire on either the head or the body, and a client
+stalling mid-request was still released only at the 15-second poll. When adding
+a new cap to either loop, add it to the budget as well or it will not take
+effect.
+
 **A body deadline is inert on a TLS listener unless the socket beneath it
 cannot block.** `poll(POLLIN)` proves that TCP bytes are available, never
 that a complete TLS record is: a peer that sends part of a record and stops

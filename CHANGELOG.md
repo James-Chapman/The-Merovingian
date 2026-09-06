@@ -120,6 +120,25 @@ deadline. **M-06 is inert on TLS listeners without M-07**, since a body deadline
 means nothing while a single read beneath it can block forever — which is why
 they ship together. See ADR-0054.
 
+**A cap that could never fire.** Writing the socket-level cover for these two
+turned up a defect in the M-06 fix itself. The slowloris caps are only re-checked
+*between* reads, but `recv_with_timeout` always polled the full 15-second
+per-read window — so one poll outlived the 5-second inter-byte cap and that cap
+could never fire. A client stalling mid-body was still released at 15 seconds,
+exactly the pre-fix timing. The overall deadline worked; the minimum-progress
+half did not.
+
+`recv_with_timeout` now takes a poll budget, and both read loops pass the
+smallest of the per-read timeout, the overall deadline, and the remaining
+inter-byte allowance. Budget expiry is reported distinctly from a peer close, so
+the loop re-checks and the cap that actually expired is what ends the request and
+gets logged.
+
+This applies to the request **head** read as well, which had the identical
+structure. Its comment claimed the caps bound the worst-case worker hold time
+"regardless of how cleverly the client dribbles bytes" — they did not. Fixing
+only the body would have left a provably inert cap beside the one being repaired.
+
 ### M-08: the thumbnail decoder ran under the general server syscall filter
 
 The thumbnail worker exists so that a libpng or libjpeg-turbo memory-safety bug
