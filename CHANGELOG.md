@@ -111,11 +111,21 @@ following the layout and template of the
 the repository root so `adr-tools` and `pyadr` find the directory. Status and
 date are mandatory.
 
-Nine records. [ADR-0000](docs/adr/0000-record-architecture-decisions.md) and
-[ADR-0001](docs/adr/0001-use-markdown-architectural-decision-records.md) record
-the practice and the format; ADR-0002 to ADR-0008 record this branch's
-decisions. It starts here rather than being backfilled, so its silence about an
-older choice means nothing.
+Fifty-two records. [ADR-0000](docs/adr/0000-record-architecture-decisions.md)
+and [ADR-0001](docs/adr/0001-use-markdown-architectural-decision-records.md)
+record the practice and the format; ADR-0002 to ADR-0008 record this branch's
+decisions; **ADR-0009 to ADR-0051 are backfilled** from existing documentation
+and code, covering concurrency, canonical JSON, crypto and secret handling,
+transport and rate limiting, media, appservices, sync, database roles,
+platform support, and process. Each carries a note that its date is the date of
+the record, not of the decision.
+
+Backfilling turned up one documentation defect: `docs/event-engine.md` stated
+that signing keys are regenerated on every restart, "effecting automatic key
+rotation". They are not — `find_active_server_signing_key` selects the stored
+key and republishes a lapsed `valid_until_ts` window rather than replacing it,
+and silent regeneration is prohibited. Corrected, and recorded as
+[ADR-0017](docs/adr/0017-never-regenerate-a-signing-key-silently.md).
 
 Two exist because the code depends on them without saying so locally, which is
 the case the format earns its keep for:

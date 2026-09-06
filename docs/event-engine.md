@@ -172,11 +172,17 @@ tree built programmatically rather than parsed.
 Verification rebuilds the same canonical payload, decodes the Matrix Base64
 signature, and delegates Ed25519 verification to the configured provider.
 
-Runtime signing keys are now generated from system entropy using
+Runtime signing keys are generated from system entropy using
 `crypto_sign_keypair` rather than being deterministically derived from public
-server identity values. The secret key is held in process memory only; on
-restart a new keypair is generated and the public key is upserted, effecting
-automatic key rotation.
+server identity values.
+
+The seed is persisted encrypted under the master key and **reused across
+restarts**: a new key is minted only on first boot or through an explicit
+rotation, and a key whose published `valid_until_ts` window has lapsed is
+republished rather than replaced. Silent regeneration is prohibited, because a
+key minted behind the running signing provider can sign nothing and no peer has
+ever seen it. See [ADR-0017](adr/0017-never-regenerate-a-signing-key-silently.md)
+and `docs/crypto-boundary.md`.
 
 ## Event IDs
 
