@@ -41,6 +41,17 @@ The most secure Matrix Protocol homeserver ever created. Secure by design, imple
 - Before creating a new branch from main, pull from origin so that main is up to date.
 - Bump the version number on creating a new branch. See versioning doc for all the places where the version number needs updating.
 - Update the docs when code change invalidates something.
+- Record a decision in the ADR register (`docs/adr/`) whenever you make one. A
+  decision qualifies when a future reader would otherwise be likely to undo it
+  by accident: a constraint the code depends on but does not state locally, a
+  rejected alternative that looks better in isolation, or a rule about how to
+  write future code. A choice with no rejected alternative is a fact, not a
+  decision, and anything the Matrix spec mandates is not a decision either.
+  Copy `docs/adr/template.md`, number it next, fill in status and date (both
+  mandatory), and add a line to `docs/adr/index.md` in the same commit. Never
+  renumber or delete an entry — mark it superseded. See
+  [ADR-0000](docs/adr/0000-record-architecture-decisions.md) and
+  [ADR-0001](docs/adr/0001-use-markdown-architectural-decision-records.md).
 - Record changes for each version in CHANGELOG.md
 - When a bug or issue is reported, check the spec docs to see if the project does what the spec says.
 - Ignore `.clwb` folder.

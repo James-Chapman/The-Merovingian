@@ -145,7 +145,10 @@ the case the format earns its keep for:
 `docs/AGENTS.md` otherwise forbids new documents; adding an ADR is now the one
 stated exception, since the format's value comes from an immutable file per
 decision. Registered in `docs/AGENTS.md` and the root `AGENTS.md` key-docs
-list.
+list, and the root `AGENTS.md` General Rules now carry the standing rule:
+record a decision in the register whenever you make one, with the test for
+what counts as a decision and the requirement that entries are never
+renumbered or deleted.
 
 ### Tests
 
