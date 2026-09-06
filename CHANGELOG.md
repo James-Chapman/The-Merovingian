@@ -101,6 +101,28 @@ Four findings from review, all in code this branch introduced:
   is per-line again, with the same `LOCK_RELEASE: reviewed` annotation every
   other site would need.
 
+### Decision register introduced
+
+`docs/decisions.md` is new: a numbered register of design decisions whose
+consequences outlive the change that prompted them, with the alternatives that
+were rejected. It starts here rather than being backfilled, so its silence
+about an older choice means nothing.
+
+Seven entries cover this branch. Two are worth calling out because the code
+depends on them without saying so locally:
+
+- **D003** — for the lifetime of a release scope, every `std::unique_lock` on
+  `runtime.mutex` reports `owns_lock() == true` while the mutex is actually
+  free. That is sound only because nothing outside `request_lock.cpp` reads the
+  flag. Introducing such a read anywhere else breaks it.
+- **D002** — a callee's release scope now drops a lock its caller was holding.
+  The blast radius was checked once (`ingest_pdu_event` is the only candidate
+  site, and neither caller holds a level); a new caller of it that holds
+  `runtime.mutex` reopens the question.
+
+Registered in `docs/AGENTS.md` and the root `AGENTS.md` key-docs list, so it is
+part of the documented set rather than an orphan file.
+
 ### Tests
 
 - `tests/unit/test_request_lock.cpp` rewritten to assert on **what another

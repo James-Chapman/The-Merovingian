@@ -29,12 +29,15 @@ new documents.
 | `trust-safety.md` | Policy engine changes |
 | `architecture.md` | Module structure or cross-module dependency changes |
 | `hardening.md` | Runtime hardening controls, seccomp, sandboxing, or build/link hardening changes |
+| `decisions.md` | A design decision is made whose consequences outlive the change that prompted it — a constraint the code depends on but does not state locally, a rejected alternative that looks better in isolation, or a rule about how to write future code. See the register's own "What belongs here". |
 
 ## Do NOT create new documents for
 
 - Per-feature implementation notes — those belong in `CHANGELOG.md`
 - Debug notes or investigation results — those belong in commit messages
 - Temporary analysis — work in conversation context, not files
+- Design rationale — that belongs in `decisions.md`, as a numbered entry in the
+  existing register, not in a new document per decision
 
 ## Formatting
 

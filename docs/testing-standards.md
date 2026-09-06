@@ -24,6 +24,25 @@ This rule applies to:
 - Prefer one behavioral assertion group per test.
 - Security-sensitive code requires negative-path tests.
 
+## Concurrency and locking tests
+
+Assert on what a thread holding none of the resource can observe, not on what a
+guard reports about itself. A `std::recursive_mutex` answers `try_lock()` with
+"yes" to its own owner at any depth, and `std::unique_lock::owns_lock()` is
+bookkeeping that a release scope may deliberately leave stale (see
+[`decisions.md`](decisions.md) D003). Neither distinguishes "the lock is free"
+from "one level of it was released" — the distinction three separate
+production stalls turned on.
+
+- Probe from another thread and assert on the main thread. Catch2's assertion
+  macros are not thread-safe (see "Thread safety tests" in
+  `tests/unit/AGENTS.md`).
+- Cover the nested case, not only the single-scope one. A primitive that is
+  correct in isolation can still be wrong one frame down; that is exactly how a
+  defect survived the first round of review on #490.
+- Prove a new scenario fails against the unfixed code before trusting it. A
+  regression test that passes either way documents nothing.
+
 ## Live client-server probes
 
 Tests that exercise an authenticated endpoint on a deployed Merovingian server
