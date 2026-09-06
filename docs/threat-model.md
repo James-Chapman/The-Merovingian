@@ -1135,6 +1135,105 @@ threat it closes; the controls above are the standing defences these reinforce.
   `default_policy=deny` with an `allowed_servers` list already closed this
   independently, since the policy check runs before resolution.
 
+- **Forged-but-signed federation membership events (0.12.7):** `send_join`,
+  `send_leave`, and `send_knock` verified an inbound PDU's Ed25519 signature,
+  content hash, and sender/origin consistency, then persisted the event and
+  membership row after checking only that the room existed — never running
+  `authorize_event_against_auth_events`, the same gate the ordinary `/send`
+  transaction path already applied. Signature verification establishes who
+  signed an event; it never establishes whether they are permitted to make
+  the transition, so any remote server holding a valid signing key for
+  *any* domain could join a user into an invite-only room, or move a
+  membership it had no power level to move, simply by presenting a correctly
+  signed PDU. Fixed by running the identical authorization gate in the
+  membership acceptor before anything reaches the store.
+- **DNS-driven substitution of a server's TLS identity via SRV delegation
+  (0.12.7):** `ServerDiscoveryResult` had no field distinguishing "where the
+  packets go" from "whose certificate must be presented", so every outbound
+  URL — including `/_matrix/key/v2/server`, the root of trust for every
+  signature a server makes — was built from the SRV target rather than the
+  original hostname the spec requires the certificate to name. SRV records
+  are unsigned DNS, so anyone able to forge a DNS response could redirect a
+  homeserver to a host presenting a certificate for a name it legitimately
+  controls, and be trusted as the origin server. Fixed by adding
+  `ServerDiscoveryResult::tls_server_name` to carry the certificate identity
+  separately from `pinned_addresses`/`resolved_host`, and by making
+  `resolve_destination` take the certificate host as a required parameter
+  rather than deriving it.
+- **Unauthorized room-state disclosure (0.12.7):**
+  `GET /rooms/{roomId}/state/{eventType}/{stateKey}` checked only that the
+  room existed and returned the state event's content to any authenticated
+  user, unlike its two sibling handlers in the same file, which both perform
+  a proper membership check. A non-member could read any named piece of
+  current room state, including state written after they left or without
+  ever having joined; the endpoint's 403 text was also returned for a room
+  that did not exist, at all, giving a non-member no way to distinguish the
+  two. Fixed so a joined member reads current state, a user who has left
+  reads the state as it stood at their leave point, and everyone else —
+  including a banned user, a never-joined user, and a nonexistent room —
+  receives an identical 403.
+- **Refresh tokens outliving logout (0.12.7):** single-device `POST /logout`
+  revoked the access token and flipped the in-memory session but never
+  touched the refresh token, and `refresh_local_session` admits any refresh
+  row that is merely unrevoked — so the client that had just logged out, or
+  anyone holding a stolen refresh token, could immediately mint a fresh
+  access token. `logout_all`, device deletion, and password change already
+  revoked refresh tokens; single-device logout was the one path that made
+  logout cosmetic. Fixed by revoking the device's refresh token alongside its
+  access token on single-device logout.
+- **Resurrection of revoked credentials via password change (0.12.7):** with
+  `logout_devices` (the default), password change revoked every token for
+  the user and then restored the caller's own device with an unfiltered
+  `UPDATE access_tokens SET revoked = false WHERE user_id AND device_id` —
+  a statement that cannot distinguish a token it revoked microseconds
+  earlier from one revoked days earlier by a logout, an admin action, or a
+  previous password change, and so un-revoked all of them. A password change
+  is precisely the action a user takes after discovering a compromise, so
+  this handed the attacker's revoked token back. Fixed by replacing the
+  revoke-then-restore pair with `revoke_tokens_for_user_except_device`,
+  which never touches the caller's device, and by removing
+  `restore_tokens_for_device` outright so no store function can clear a
+  `revoked` flag. See
+  [ADR-0052](adr/0052-revocation-of-credentials-is-one-way.md).
+- **Worker-thread exhaustion via slow request bodies and partial TLS records
+  (0.12.7, two findings fixed together):** request-head reads enforced both
+  an overall deadline and an inter-byte cap, but request-**body** reads
+  enforced neither — only a fresh 15-second poll per 4096-byte chunk, so a
+  client dribbling a declared `Content-Length` could hold a worker thread for
+  roughly `(bytes / chunk) x 15s`, unbounded in practice. Separately, TLS
+  sockets were restored to blocking mode after the handshake and
+  `TlsConnection::read` called `SSL_read_ex` on them directly; the HTTP
+  layer's `poll(POLLIN)` proves TCP bytes arrived, never that a complete TLS
+  record did, so a peer sending one byte of a record made the socket
+  readable, entered `SSL_read_ex`, and blocked in the kernel indefinitely —
+  past the poll deadline, past the head deadline, past the new body
+  deadline, outside every timeout the server believed it was enforcing. The
+  body deadline is inert on TLS listeners without the second fix, which is
+  why they shipped together. Fixed by adding a total body-read deadline
+  scaled to the declared length at a 16 KiB/s floor, and by keeping TLS
+  sockets non-blocking for the life of the connection with one shared
+  `pump()` driving `WANT_READ`/`WANT_WRITE` against a deadline for both
+  reads and writes. See
+  [ADR-0054](adr/0054-tls-sockets-stay-non-blocking-for-the-life-of-the-connection.md).
+- **Unconfined decoder on the primary production platform (0.12.7):** the
+  thumbnail worker exists so a libpng/libjpeg-turbo memory-safety bug is
+  contained rather than fatal, and OpenBSD (`pledge("stdio")`) and FreeBSD
+  (`cap_enter()`) grant it no filesystem, socket, or process-creation access
+  — but on Linux it installed `apply_seccomp_filter()`, the general *server*
+  allowlist, which permits `socket`, `connect`, `sendto`, `openat`,
+  `unlinkat`, `execve`, and `clone`. On the primary production platform the
+  decoder was therefore effectively unconfined despite the file's own
+  comment claiming a decoder exploit had "nothing to reach for". Reaching
+  for the existing stricter `apply_worker_seccomp_filter()` would have
+  looked like a fix while changing almost nothing: it was built for the
+  federation worker and still permits sockets, `openat`, and `clone`. Fixed
+  with a third, decoder-specific profile,
+  `platform::apply_decoder_seccomp_filter()`, matching the `pledge("stdio")`
+  boundary on all three platforms, with a regression test asserting it is
+  strictly tighter than the worker profile on sockets, `openat`, and
+  `clone`. See
+  [ADR-0053](adr/0053-the-thumbnail-decoder-gets-its-own-syscall-profile.md).
+
 ## Security principles
 
 - Fail closed.

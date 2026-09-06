@@ -82,6 +82,20 @@ Implemented now:
   room's current resolved state before calling `store_event_with_state`; events
   that fail auth return `rejected_auth` without a non-200 HTTP status (per Matrix
   /send spec — non-200 causes the remote to back off all federation)
+- auth checking wired into the federation membership endpoints — `send_join`,
+  `send_leave`, and `send_knock` run the identical
+  `authorize_event_against_auth_events` gate, against the room's current
+  resolved state, before the membership acceptor persists the event or the
+  membership row. Until 0.12.7 these endpoints verified only the inbound PDU's
+  Ed25519 signature, content hash, and sender/origin consistency, then checked
+  that the room existed — but signature verification establishes **who signed
+  an event; it never establishes whether they are permitted to make the
+  transition.** A remote server holding any valid signing key could join a
+  user into an invite-only room, or move a membership it had no power level to
+  move, simply by presenting a correctly signed PDU. Both write paths into the
+  store — the ordinary `/send` transaction path above and the membership
+  acceptor here — must enforce this gate: a rule enforced on only one of two
+  paths into the same store is not enforced at all
 - room creator is implicitly treated as joined with power level 100 when
   no sender_member or power_levels event exists, enabling correct
   authorization of initial state events during room bootstrapping
