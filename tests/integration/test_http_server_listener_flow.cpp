@@ -17,6 +17,7 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 #include <arpa/inet.h>
@@ -1336,6 +1338,377 @@ SCENARIO("merovingian-server serves two sequential requests over one persistent 
                 REQUIRE(second_response.starts_with("HTTP/1.1 401"));
                 REQUIRE(stats.accepted_connections == 1U);
                 REQUIRE(stats.completed_requests >= 2U);
+            }
+        }
+    }
+}
+
+// --- M-06 / M-07: bounded reads -------------------------------------------
+//
+// These two findings are one defect surface and are tested together. The HTTP
+// layer expresses every timeout as poll() on the connection descriptor, and
+// that is only a timeout if nothing beneath it can block:
+//
+//   M-06  read_remaining_body() enforced no overall deadline and no minimum
+//         progress rate - only a fresh 15s poll per 4096-byte chunk - so a
+//         client dribbling a declared Content-Length held a worker thread for
+//         as long as it cared to. read_request_head() already enforced both
+//         caps; the body did not.
+//
+//   M-07  TLS sockets were restored to blocking mode after the handshake, so
+//         SSL_read could block indefinitely on a record the peer never
+//         finished sending - past every deadline above it, because poll(POLLIN)
+//         proves TCP bytes arrived, not that a whole TLS record did.
+//
+// A body deadline is inert on a TLS listener while a single read beneath it can
+// block forever, which is why neither is fixed alone.
+
+// M-06: the client stops sending part-way through a declared body. The worker
+// must not stay parked on it. Pre-fix the only thing that eventually released
+// the worker was the 15s per-read poll; the inter-byte cap now closes it at 5s,
+// so the 10s bound below distinguishes the two.
+SCENARIO("merovingian-server drops a client that stalls part-way through a request body",
+         "[homeserver][http][listener][integration][security][m06]")
+{
+    GIVEN("a started runtime and an active HTTP listener")
+    {
+        auto const config = registration_enabled_config();
+        auto runtime_result = merovingian::homeserver::start_client_server(config);
+        REQUIRE(runtime_result.started);
+
+        auto acceptor = merovingian::net::TcpAcceptor{};
+        REQUIRE(acceptor.bind("127.0.0.1", 0U).ok);
+        auto const port = acceptor.bound_port();
+
+        auto shutdown = merovingian::net::ShutdownSignal{};
+        auto stats = merovingian::homeserver::HttpServeStats{};
+        auto runtime = std::move(runtime_result.runtime);
+        auto pool = merovingian::net::ThreadPool{4U};
+
+        auto server_thread = std::thread{[&]() {
+            merovingian::homeserver::serve_http(acceptor, runtime, shutdown, stats,
+                                                merovingian::homeserver::HttpDispatchMode::client_server, pool);
+        }};
+
+        WHEN("the client announces a body, sends a few bytes of it, and then goes silent")
+        {
+            auto const client_fd = connect_loopback(port);
+            REQUIRE(client_fd >= 0);
+            auto const head = std::string{"POST /_matrix/client/v3/register HTTP/1.1\r\nHost: localhost\r\n"
+                                          "Content-Type: application/json\r\nContent-Length: 512\r\n\r\n"};
+            REQUIRE(send_all(client_fd, head));
+            // A partial body, then nothing at all.
+            REQUIRE(send_all(client_fd, std::string{R"({"auth")"}));
+
+            // Read until the server hangs up. peer_closed_within() is no use
+            // here: the server answers the abandoned request before closing, so
+            // the socket becomes readable with response bytes rather than EOF.
+            // What is being measured is when the connection ends, because that
+            // is when the worker goes back to the pool.
+            auto const started = std::chrono::steady_clock::now();
+            auto const response = receive_until_close(client_fd);
+            auto const elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started)
+                    .count();
+            ::close(client_fd);
+
+            // The listener must still be serving: the point of a deadline is
+            // that the worker is returned to the pool, not merely that one
+            // connection died.
+            auto const follow_fd = connect_loopback(port);
+            REQUIRE(follow_fd >= 0);
+            REQUIRE(send_all(follow_fd, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+            auto follow_reader = PlainResponseReader{};
+            auto const follow_response = receive_response(follow_fd, follow_reader);
+            ::close(follow_fd);
+
+            shutdown.fire();
+            server_thread.join();
+            pool.request_stop();
+
+            THEN("the connection is closed well inside the old per-read window, and the listener keeps serving")
+            {
+                // Post-fix this is the 5s inter-byte cap. The old behaviour
+                // could not release the connection before the 15s per-read poll
+                // expired, so a 10s bound fails against the unfixed code.
+                REQUIRE(elapsed_ms < 10000);
+                // Whether the server answers first or just hangs up, it must not
+                // still be holding the request open.
+                std::ignore = response;
+                REQUIRE_FALSE(follow_response.empty());
+                REQUIRE(follow_response.starts_with("HTTP/1.1 "));
+            }
+        }
+    }
+}
+
+// M-06: the case the inter-byte cap alone does NOT catch, and the reason the
+// finding asks for a total deadline as well as a progress rate. This client
+// never goes silent for long enough to trip the inter-byte cap - it trickles
+// steadily, just slowly. Without an overall deadline the read loop follows it
+// for as long as it keeps trickling, which for the Content-Length below is
+// hours. This is the scenario that actually covers the new deadline, so it is
+// worth the wall-clock time it costs.
+SCENARIO("merovingian-server bounds a client that trickles a body indefinitely under the inter-byte cap",
+         "[homeserver][http][listener][integration][security][m06][slow]")
+{
+    GIVEN("a started runtime and an active HTTP listener")
+    {
+        auto const config = registration_enabled_config();
+        auto runtime_result = merovingian::homeserver::start_client_server(config);
+        REQUIRE(runtime_result.started);
+
+        auto acceptor = merovingian::net::TcpAcceptor{};
+        REQUIRE(acceptor.bind("127.0.0.1", 0U).ok);
+        auto const port = acceptor.bound_port();
+
+        auto shutdown = merovingian::net::ShutdownSignal{};
+        auto stats = merovingian::homeserver::HttpServeStats{};
+        auto runtime = std::move(runtime_result.runtime);
+        auto pool = merovingian::net::ThreadPool{4U};
+
+        auto server_thread = std::thread{[&]() {
+            merovingian::homeserver::serve_http(acceptor, runtime, shutdown, stats,
+                                                merovingian::homeserver::HttpDispatchMode::client_server, pool);
+        }};
+
+        WHEN("the client sends one byte at a time, always inside the inter-byte cap")
+        {
+            auto const client_fd = connect_loopback(port);
+            REQUIRE(client_fd >= 0);
+            // 4096 bytes at one byte per 1.5s is over 100 minutes of dribbling
+            // if nothing bounds it.
+            auto const head = std::string{"POST /_matrix/client/v3/register HTTP/1.1\r\nHost: localhost\r\n"
+                                          "Content-Type: application/json\r\nContent-Length: 4096\r\n\r\n"};
+            REQUIRE(send_all(client_fd, head));
+
+            auto const started = std::chrono::steady_clock::now();
+            auto bytes_sent = std::size_t{0U};
+            auto closed = false;
+            // Give up well after the deadline should have fired, so a failure
+            // reports a bounded elapsed time rather than hanging the binary.
+            auto constexpr give_up = std::chrono::seconds{50};
+            while (std::chrono::steady_clock::now() - started < give_up)
+            {
+                if (peer_closed_within(client_fd, 1500))
+                {
+                    closed = true;
+                    break;
+                }
+                if (!send_all(client_fd, std::string{"x"}))
+                {
+                    // The server closed and the write failed: also a close.
+                    closed = true;
+                    break;
+                }
+                ++bytes_sent;
+            }
+            auto const elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started)
+                    .count();
+            ::close(client_fd);
+
+            shutdown.fire();
+            server_thread.join();
+            pool.request_stop();
+
+            THEN("the overall body deadline ends the request even though every gap was a legal one")
+            {
+                REQUIRE(closed);
+                // The deadline is the 30s base plus the declared length at the
+                // 16 KiB/s floor. Anything under 45s is the deadline firing;
+                // without it this client is followed for hours.
+                REQUIRE(elapsed_ms < 45000);
+                // And it was cut off mid-body, not allowed to finish.
+                REQUIRE(bytes_sent < 4096U);
+            }
+        }
+    }
+}
+
+// M-06: the deadline scales with the declared length at a deliberately low
+// throughput floor so that a genuinely slow-but-steady upload is never cut off.
+// A fix that bounded the body by a flat timeout would pass the two scenarios
+// above and break real clients; this is the scenario that would catch it.
+SCENARIO("merovingian-server accepts a body delivered slowly but steadily",
+         "[homeserver][http][listener][integration][m06]")
+{
+    GIVEN("a started runtime and an active HTTP listener")
+    {
+        auto const config = registration_enabled_config();
+        auto runtime_result = merovingian::homeserver::start_client_server(config);
+        REQUIRE(runtime_result.started);
+
+        auto acceptor = merovingian::net::TcpAcceptor{};
+        REQUIRE(acceptor.bind("127.0.0.1", 0U).ok);
+        auto const port = acceptor.bound_port();
+
+        auto shutdown = merovingian::net::ShutdownSignal{};
+        auto stats = merovingian::homeserver::HttpServeStats{};
+        auto runtime = std::move(runtime_result.runtime);
+        auto pool = merovingian::net::ThreadPool{4U};
+
+        auto server_thread = std::thread{[&]() {
+            merovingian::homeserver::serve_http(acceptor, runtime, shutdown, stats,
+                                                merovingian::homeserver::HttpDispatchMode::client_server, pool);
+        }};
+
+        WHEN("the client sends a sizeable body in chunks with real gaps between them")
+        {
+            auto constexpr chunk_count = std::size_t{6U};
+            auto constexpr chunk_bytes = std::size_t{8192U};
+            auto const total = chunk_count * chunk_bytes;
+
+            auto const client_fd = connect_loopback(port);
+            REQUIRE(client_fd >= 0);
+            auto const head = std::string{"POST /_matrix/client/v3/register HTTP/1.1\r\nHost: localhost\r\n"
+                                          "Content-Type: application/json\r\nContent-Length: "} +
+                              std::to_string(total) + "\r\n\r\n";
+            REQUIRE(send_all(client_fd, head));
+
+            auto sent_every_chunk = true;
+            for (auto chunk = std::size_t{0U}; chunk < chunk_count; ++chunk)
+            {
+                // 800ms between chunks: comfortably inside the inter-byte cap,
+                // and slow enough that a flat short deadline would reject it.
+                std::this_thread::sleep_for(std::chrono::milliseconds{800});
+                if (!send_all(client_fd, std::string(chunk_bytes, 'x')))
+                {
+                    sent_every_chunk = false;
+                    break;
+                }
+            }
+            auto reader = PlainResponseReader{};
+            auto const response = receive_response(client_fd, reader);
+            ::close(client_fd);
+
+            shutdown.fire();
+            server_thread.join();
+            pool.request_stop();
+
+            THEN("the whole body is read and the request is answered rather than dropped")
+            {
+                REQUIRE(sent_every_chunk);
+                // The body is deliberate junk, so the status is a client error.
+                // What matters is that the server read all of it and replied,
+                // instead of timing the connection out part-way through.
+                REQUIRE_FALSE(response.empty());
+                REQUIRE(response.starts_with("HTTP/1.1 "));
+            }
+        }
+    }
+}
+
+// M-07: a peer that opens a TLS record and never finishes it. The read must come
+// back on its own deadline rather than parking the thread inside OpenSSL.
+//
+// This drives TlsConnection directly rather than through the listener so the I/O
+// timeout can be set to one second - accept_tls_connection takes it as a
+// parameter - which makes the scenario fast and its bound unambiguous. Against
+// the unfixed code the socket is blocking after the handshake and the second
+// read never returns, so this scenario hangs and the suite reports a timeout,
+// which is a failure.
+SCENARIO("a TLS read returns on its deadline when the peer sends an incomplete record",
+         "[homeserver][http][tls][integration][security][m07]")
+{
+    GIVEN("an established TLS connection with a one-second I/O timeout")
+    {
+        auto const certificate = write_test_tls_certificate();
+        auto tls_context = merovingian::homeserver::make_tls_server_context(certificate.certificate_file,
+                                                                            certificate.private_key_file);
+        REQUIRE(tls_context.ok());
+
+        auto acceptor = merovingian::net::TcpAcceptor{};
+        REQUIRE(acceptor.bind("127.0.0.1", 0U).ok);
+        auto const port = acceptor.bound_port();
+
+        WHEN("the peer completes a handshake, sends one whole record, then half of another")
+        {
+            auto constexpr io_timeout_ms = 1000;
+
+            // Server side: accept, handshake, then two reads. No Catch2
+            // assertions in here - results come back through these locals and
+            // are asserted below, after the join.
+            auto handshake_ok = false;
+            auto first_read = std::ptrdiff_t{0};
+            auto second_read = std::ptrdiff_t{0};
+            auto second_read_ms = std::int64_t{0};
+            auto first_payload = std::string{};
+
+            auto server_thread = std::thread{[&]() {
+                auto const accepted = ::accept(acceptor.fd(), nullptr, nullptr);
+                if (accepted < 0)
+                {
+                    return;
+                }
+                auto accepted_result =
+                    merovingian::homeserver::accept_tls_connection(*tls_context.context, accepted, io_timeout_ms);
+                if (!accepted_result.ok())
+                {
+                    ::close(accepted);
+                    return;
+                }
+                handshake_ok = true;
+                auto& connection = *accepted_result.connection;
+
+                // Control read: a complete record must still work. The
+                // non-blocking change would be worthless if it broke this.
+                auto buffer = std::array<char, 256U>{};
+                first_read = connection.read(buffer.data(), buffer.size());
+                if (first_read > 0)
+                {
+                    first_payload.assign(buffer.data(), static_cast<std::size_t>(first_read));
+                }
+
+                // The read under test: the peer has sent a record header
+                // promising more bytes than it will ever send.
+                auto const started = std::chrono::steady_clock::now();
+                second_read = connection.read(buffer.data(), buffer.size());
+                second_read_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started)
+                        .count();
+                ::close(accepted);
+            }};
+
+            auto client_context = std::unique_ptr<SSL_CTX, SslContextDeleter>{SSL_CTX_new(TLS_client_method())};
+            REQUIRE(client_context != nullptr);
+            SSL_CTX_set_verify(client_context.get(), SSL_VERIFY_NONE, nullptr);
+
+            auto const client_fd = connect_loopback(port);
+            REQUIRE(client_fd >= 0);
+            auto client_socket = merovingian::core::SocketHandle{client_fd};
+            auto client_tls = std::unique_ptr<SSL, SslDeleter>{SSL_new(client_context.get())};
+            REQUIRE(client_tls != nullptr);
+            REQUIRE(SSL_set_fd(client_tls.get(), client_socket.native_handle()) == 1);
+            REQUIRE(SSL_connect(client_tls.get()) == 1);
+
+            REQUIRE(send_all_tls(*client_tls, "ping"));
+            // Let the control read complete before the malformed record lands,
+            // so the two reads cannot be serviced out of order.
+            std::this_thread::sleep_for(std::chrono::milliseconds{200});
+
+            // A TLS application-data record header claiming 64 bytes of payload,
+            // followed by only 5. Written raw, underneath OpenSSL, because the
+            // point is to hand the server an unfinished record. The server's
+            // SSL_read wants 59 more bytes that will never arrive.
+            auto const truncated_record = std::string{"\x17\x03\x03\x00\x40", 5U} + std::string{"abcde"};
+            REQUIRE(send_all(client_socket.native_handle(), truncated_record));
+
+            server_thread.join();
+
+            THEN("the read gives up on its own deadline instead of blocking forever")
+            {
+                REQUIRE(handshake_ok);
+                // Control: the complete record read normally.
+                REQUIRE(first_read == 4);
+                REQUIRE(first_payload == "ping");
+                // The unfinished record yields an error return, not a hang.
+                REQUIRE(second_read < 0);
+                // Bounded by the connection's own timeout. The lower bound
+                // matters too: returning instantly would mean the read was not
+                // waiting for the rest of the record at all.
+                REQUIRE(second_read_ms >= 500);
+                REQUIRE(second_read_ms < 8000);
             }
         }
     }
