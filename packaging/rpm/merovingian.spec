@@ -1,5 +1,5 @@
 Name:           merovingian
-Version:        0.12.6
+Version:        0.12.7
 Release:        1%{?dist}
 Summary:        Secure Matrix Protocol homeserver
 
@@ -101,7 +101,7 @@ fi
 %{_sysconfdir}/merovingian/merovingian.conf.example
 
 %changelog
-* Sat Sep 05 2026 James Chapman <claude@ping.me.uk> - 0.12.6-1
+* Sat Sep 05 2026 James Chapman <claude@ping.me.uk> - 0.12.7-1
 - fix(locking): remove the recursive-mutex release defect class (issue #487) - runtime.mutex is now a RuntimeMutex that records its owning thread; NetworkIoUnlock and ScopedGuardRelease collapse into one RuntimeLockRelease that drains every recursion level the calling thread holds and restores exactly that many on exit, throwing paths included; a third live instance of the stall is fixed in invite_user_by_threepid, where the identity-server store-invite round trip ran with the dispatcher's guard still held; join_room's ~350-line released region is extracted into perform_federated_join so the lock boundary is a function boundary; no hand-written release of the runtime mutex remains in include/ or src/, and reject-unsafe.sh now matches ->unlock() as well as .unlock()
 
 * Fri Sep 04 2026 James Chapman <claude@ping.me.uk> - 0.12.5-1

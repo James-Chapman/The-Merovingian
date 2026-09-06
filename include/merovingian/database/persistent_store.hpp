@@ -815,11 +815,17 @@ struct RoomReloadSnapshot final
 [[nodiscard]] auto revoke_refresh_tokens_for_user(PersistentStore& store, std::string_view user_id) -> std::size_t;
 [[nodiscard]] auto revoke_refresh_tokens_for_device(PersistentStore& store, std::string_view user_id,
                                                     std::string_view device_id) -> std::size_t;
-// Un-revokes the access and refresh tokens for one device. Companion to the
-// per-device revoke helpers, used by the password-change logout_devices flow to
-// keep the caller's own session alive after revoking the user's other devices.
-[[nodiscard]] auto restore_tokens_for_device(PersistentStore& store, std::string_view user_id,
-                                             std::string_view device_id) -> std::size_t;
+// M-05: revokes every access and refresh token for `user_id` except those of
+// `keep_device_id`. Used by the password-change logout_devices flow to drop the
+// user's other sessions while keeping the caller's own alive.
+//
+// This replaced a revoke-all-then-restore-one-device pair. Restoring could not
+// tell the tokens it had just revoked from ones revoked earlier by a logout or
+// an admin action, so it resurrected them — and a password change is exactly
+// what a user does after a compromise. There is deliberately no inverse
+// "restore" helper: revocation is one-way by design. Do not add one.
+[[nodiscard]] auto revoke_tokens_for_user_except_device(PersistentStore& store, std::string_view user_id,
+                                                        std::string_view keep_device_id) -> std::size_t;
 [[nodiscard]] auto update_device_display_name(PersistentStore& store, std::string_view user_id,
                                               std::string_view device_id, std::string_view display_name) -> bool;
 [[nodiscard]] auto delete_device(PersistentStore& store, std::string_view user_id, std::string_view device_id) -> bool;
@@ -1100,7 +1106,8 @@ namespace detail
         -> std::optional<RoomReloadSnapshot>;
     [[nodiscard]] auto load_room_snapshot_from_sqlite(std::string const& path, std::string_view room_id)
         -> std::optional<RoomReloadSnapshot>;
-    [[nodiscard]] auto load_room_snapshot_from_postgresql(std::string_view conninfo, std::string_view runtime_role, std::string_view room_id)
+    [[nodiscard]] auto load_room_snapshot_from_postgresql(std::string_view conninfo, std::string_view runtime_role,
+                                                          std::string_view room_id)
         -> std::optional<RoomReloadSnapshot>;
 
 } // namespace detail

@@ -44,6 +44,24 @@ struct SeccompProbeResult final
 // worker code must use apply_worker_seccomp_filter().
 [[nodiscard]] auto apply_worker_seccomp_filter_with_default(std::uint32_t default_action) noexcept -> bool;
 
+// Applies the DECODER allowlist for the thumbnail worker child (M-08). This is
+// the seccomp equivalent of the pledge("stdio") / cap_enter() calls the BSD
+// branches of media/thumbnail_worker_main.cpp::harden() make: I/O on
+// already-open descriptors, memory, and exit — no sockets, no path-based
+// filesystem access, no exec, no fork/clone.
+//
+// It is NOT apply_worker_seccomp_filter(). That profile serves the federation
+// worker, which needs sockets and threads and therefore permits both; installing
+// it here would leave a compromised image decoder able to open files and connect
+// out. Same fail-closed default action. Returns false on non-Linux or kernels
+// without CONFIG_SECCOMP_FILTER.
+[[nodiscard]] auto apply_decoder_seccomp_filter() noexcept -> bool;
+
+// Decoder-filter variant with a caller-chosen default action, for the same
+// diagnosability reason as apply_seccomp_filter_with_default(). Production
+// decoder code must use apply_decoder_seccomp_filter().
+[[nodiscard]] auto apply_decoder_seccomp_filter_with_default(std::uint32_t default_action) noexcept -> bool;
+
 // Reads /proc/self/status to detect whether a seccomp-bpf filter is active.
 // Returns probed=true and seccomp_active=true when "Seccomp: 2" is found
 // (SECCOMP_MODE_FILTER). On non-Linux, returns probed=false.
@@ -67,6 +85,16 @@ struct SeccompProbeResult final
 // apply_worker_seccomp_filter(). Exposed for unit testing the stricter profile
 // (execve/execveat must be denied; the thread/network/I/O set must be allowed).
 [[nodiscard]] auto worker_seccomp_is_syscall_allowed(int syscall_number) noexcept -> bool;
+
+// Returns the default seccomp-bpf action used by apply_decoder_seccomp_filter().
+// Fail-closed: SECCOMP_RET_KILL_PROCESS (same as the main filter).
+[[nodiscard]] auto decoder_seccomp_default_action() noexcept -> std::uint32_t;
+
+// Returns true if `syscall_number` is present in the decoder allowlist used by
+// apply_decoder_seccomp_filter(). Exposed for unit testing the decoder profile
+// (sockets, exec, fork/clone and path-based filesystem access must all be
+// denied; the stdio/memory/exit set must be allowed).
+[[nodiscard]] auto decoder_seccomp_is_syscall_allowed(int syscall_number) noexcept -> bool;
 
 // Returns the AUDIT_ARCH_* constant the installed filter expects, or std::nullopt
 // when the build architecture is not supported (fail-closed). Exposed for testing.

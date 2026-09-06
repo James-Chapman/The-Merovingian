@@ -18,8 +18,8 @@
 #include "merovingian/federation/key_query.hpp"
 #include "merovingian/federation/outbound_transaction.hpp"
 #include "merovingian/federation/remote_key_cache.hpp"
-#include "merovingian/federation/server_acl.hpp"
 #include "merovingian/federation/security.hpp"
+#include "merovingian/federation/server_acl.hpp"
 #include "merovingian/homeserver/auth_service.hpp"
 #include "merovingian/homeserver/media_service.hpp"
 #include "merovingian/homeserver/request_lock.hpp"
@@ -34,8 +34,8 @@
 #include "merovingian/trust_safety/policy_engine.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -611,7 +611,7 @@ namespace
     // Pipe-delimited federation auth token used by integration-test fixtures:
     // origin|key_id|signature|destination|now_ts|canonical_json_verified.
     [[nodiscard]] auto parse_signed_federation_request(LocalHttpRequest const& request,
-                                                      std::vector<std::string> const& trusted_proxies)
+                                                       std::vector<std::string> const& trusted_proxies)
         -> std::optional<federation::SignedFederationRequest>
     {
         auto const fields = split_pipe_6(request.access_token);
@@ -1416,6 +1416,71 @@ namespace
             {
                 return {false, 404U, "room not found", {}, {}};
             }
+            // M-01: evaluate the room's authorization rules before any part of
+            // this event reaches the store. The Ed25519 signature and
+            // content-hash checks in federation/inbound_request.cpp already ran
+            // before this callback, but they establish only WHO signed the
+            // event — never whether that sender is permitted to make this
+            // membership transition. Without this gate a remote server holding
+            // any valid signing key can join a user into an invite-only room,
+            // or move a membership it has no power level to move, just by
+            // presenting a correctly signed PDU.
+            //
+            // This mirrors the equivalent gate in ingest_pdu_event() below,
+            // which guards the ordinary /send transaction path. The two paths
+            // must stay in step: a rule enforced on only one of them is not
+            // enforced at all, because send_join reaches the same store.
+            //
+            // Spec: docs/matrix-v1.19-spec/server-server-api.md#authorization-rules
+            {
+                auto const pdu_parsed = canonicaljson::parse_lossless(envelope.json);
+                if (pdu_parsed.error != canonicaljson::ParseError::none)
+                {
+                    return {false, 400U, "invalid PDU JSON", {}, {}};
+                }
+                // Prefer the room version recorded in m.room.create over the one
+                // the envelope claims: the sender does not get to choose which
+                // rule set its own event is judged by.
+                auto room_version = room_version_from_store(store, room_id);
+                if (room_version.empty())
+                {
+                    room_version = envelope.room_version;
+                }
+                if (room_version.empty())
+                {
+                    room_version = "12";
+                }
+                auto const* const room_policy = rooms::find_room_version_policy(room_version);
+                if (room_policy == nullptr)
+                {
+                    return {false, 400U, "unknown room version", {}, {}};
+                }
+                // A join may be authorised by a third-party invite; the token in
+                // content.third_party_invite.signed.token selects which
+                // m.room.third_party_invite state event applies. Extracted the
+                // same way ingest_pdu_event does.
+                auto const third_party_invite_token = [&]() -> std::string {
+                    auto const* const pdu_obj = std::get_if<canonicaljson::Object>(&pdu_parsed.value.storage());
+                    auto const* const content =
+                        pdu_obj == nullptr ? nullptr : object_member_as_object(*pdu_obj, "content");
+                    auto const* const third_party_invite =
+                        content == nullptr ? nullptr : object_member_as_object(*content, "third_party_invite");
+                    auto const* const signed_obj = third_party_invite == nullptr
+                                                       ? nullptr
+                                                       : object_member_as_object(*third_party_invite, "signed");
+                    auto const* const token = signed_obj == nullptr ? nullptr : string_member(*signed_obj, "token");
+                    return token == nullptr ? std::string{} : *token;
+                }();
+                auto const auth_map = build_pdu_auth_event_map(store, room_id, envelope.sender,
+                                                               envelope.state_key.value_or(std::string{}),
+                                                               envelope.event_type, third_party_invite_token);
+                auto const auth_decision =
+                    events::authorize_event_against_auth_events(pdu_parsed.value, *room_policy, auth_map);
+                if (!auth_decision.allowed)
+                {
+                    return {false, 403U, std::string{"event auth denied: "} + auth_decision.reason, {}, {}};
+                }
+            }
             auto event = database::PersistentEvent{};
             event.event_id = envelope.event_id;
             event.room_id = envelope.room_id;
@@ -1791,7 +1856,7 @@ namespace
             // store and freshness rule the resolver itself consults first, so the
             // two cannot disagree about whether an outbound call is needed.
             runtime.federation.remote_key_cache_probe = [&runtime, key_clock](std::string_view server_name,
-                                                                             std::string_view key_id) -> bool {
+                                                                              std::string_view key_id) -> bool {
                 auto const cached_key =
                     federation::find_cached_remote_key(runtime.database.persistent_store, server_name, key_id);
                 return cached_key.has_value() &&

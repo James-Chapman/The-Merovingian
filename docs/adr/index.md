@@ -55,6 +55,9 @@
 * [0049 - Treat the specification as the conformance authority](0049-treat-the-specification-as-the-conformance-authority.md)
 * [0050 - Use real dependencies in integration tests](0050-use-real-dependencies-in-integration-tests.md)
 * [0051 - Document inert configuration keys rather than removing them](0051-document-inert-configuration-keys-rather-than-removing-them.md)
+* [0052 - Revocation of credentials is one-way](0052-revocation-of-credentials-is-one-way.md)
+* [0053 - The thumbnail decoder gets its own syscall profile](0053-the-thumbnail-decoder-gets-its-own-syscall-profile.md)
+* [0054 - TLS sockets stay non-blocking for the life of the connection](0054-tls-sockets-stay-non-blocking-for-the-life-of-the-connection.md)
 
 ## Rejected Records
 
