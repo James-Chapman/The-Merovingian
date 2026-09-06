@@ -29,15 +29,23 @@ new documents.
 | `trust-safety.md` | Policy engine changes |
 | `architecture.md` | Module structure or cross-module dependency changes |
 | `hardening.md` | Runtime hardening controls, seccomp, sandboxing, or build/link hardening changes |
-| `decisions.md` | A design decision is made whose consequences outlive the change that prompted it — a constraint the code depends on but does not state locally, a rejected alternative that looks better in isolation, or a rule about how to write future code. See the register's own "What belongs here". |
+| `adr/index.md` | A design decision is made whose consequences outlive the change that prompted it — a constraint the code depends on but does not state locally, a rejected alternative that looks better in isolation, or a rule about how to write future code. Add a new ADR under `adr/`, and a line in `adr/index.md`. See [ADR-0000](adr/0000-record-architecture-decisions.md). |
 
 ## Do NOT create new documents for
 
 - Per-feature implementation notes — those belong in `CHANGELOG.md`
 - Debug notes or investigation results — those belong in commit messages
 - Temporary analysis — work in conversation context, not files
-- Design rationale — that belongs in `decisions.md`, as a numbered entry in the
-  existing register, not in a new document per decision
+### The one exception
+
+Architecture Decision Records are the exception: each decision gets its own
+immutable file under `docs/adr/`, numbered and never renumbered. Copy
+[`adr/template.md`](adr/template.md), fill in status and date (both mandatory),
+and add a line to [`adr/index.md`](adr/index.md) in the same commit. The format
+is MADR 2.1.2; see [ADR-0001](adr/0001-use-markdown-architectural-decision-records.md)
+for what was adopted and what was deliberately not.
+
+Design rationale goes there, not into a general-purpose document.
 
 ## Formatting
 

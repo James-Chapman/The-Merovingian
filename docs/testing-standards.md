@@ -30,7 +30,8 @@ Assert on what a thread holding none of the resource can observe, not on what a
 guard reports about itself. A `std::recursive_mutex` answers `try_lock()` with
 "yes" to its own owner at any depth, and `std::unique_lock::owns_lock()` is
 bookkeeping that a release scope may deliberately leave stale (see
-[`decisions.md`](decisions.md) D003). Neither distinguishes "the lock is free"
+[ADR-0004](adr/0004-release-the-runtime-lock-through-the-mutex-not-a-guard.md)).
+Neither distinguishes "the lock is free"
 from "one level of it was released" — the distinction three separate
 production stalls turned on.
 

@@ -101,27 +101,41 @@ Four findings from review, all in code this branch introduced:
   is per-line again, with the same `LOCK_RELEASE: reviewed` annotation every
   other site would need.
 
-### Decision register introduced
+### Architecture Decision Records introduced
 
-`docs/decisions.md` is new: a numbered register of design decisions whose
-consequences outlive the change that prompted them, with the alternatives that
-were rejected. It starts here rather than being backfilled, so its silence
-about an older choice means nothing.
+`docs/adr/` is new: Architecture Decision Records in the MADR 2.1.2 format,
+following the layout and template of the
+[Opinionated Digital Center's ADR repository](https://github.com/opinionated-digital-center/architecture-decision-records)
+— `docs/adr/NNNN-title-in-lowercase-with-dashes.md`, a table of contents in
+`docs/adr/index.md`, the template in `docs/adr/template.md`, and `.adr-dir` at
+the repository root so `adr-tools` and `pyadr` find the directory. Status and
+date are mandatory.
 
-Seven entries cover this branch. Two are worth calling out because the code
-depends on them without saying so locally:
+Nine records. [ADR-0000](docs/adr/0000-record-architecture-decisions.md) and
+[ADR-0001](docs/adr/0001-use-markdown-architectural-decision-records.md) record
+the practice and the format; ADR-0002 to ADR-0008 record this branch's
+decisions. It starts here rather than being backfilled, so its silence about an
+older choice means nothing.
 
-- **D003** — for the lifetime of a release scope, every `std::unique_lock` on
+Two exist because the code depends on them without saying so locally, which is
+the case the format earns its keep for:
+
+- **[ADR-0004](docs/adr/0004-release-the-runtime-lock-through-the-mutex-not-a-guard.md)**
+  — for the lifetime of a release scope, every `std::unique_lock` on
   `runtime.mutex` reports `owns_lock() == true` while the mutex is actually
   free. That is sound only because nothing outside `request_lock.cpp` reads the
-  flag. Introducing such a read anywhere else breaks it.
-- **D002** — a callee's release scope now drops a lock its caller was holding.
-  The blast radius was checked once (`ingest_pdu_event` is the only candidate
-  site, and neither caller holds a level); a new caller of it that holds
-  `runtime.mutex` reopens the question.
+  flag. Introducing such a read anywhere else breaks it, and no compiler will
+  say so.
+- **[ADR-0003](docs/adr/0003-drain-every-recursion-level-in-one-release-primitive.md)**
+  — a callee's release scope now drops a lock its caller was holding. The blast
+  radius was checked once (`ingest_pdu_event` is the only candidate site, and
+  neither caller holds a level); a new caller of it that holds `runtime.mutex`
+  reopens the question.
 
-Registered in `docs/AGENTS.md` and the root `AGENTS.md` key-docs list, so it is
-part of the documented set rather than an orphan file.
+`docs/AGENTS.md` otherwise forbids new documents; adding an ADR is now the one
+stated exception, since the format's value comes from an immutable file per
+decision. Registered in `docs/AGENTS.md` and the root `AGENTS.md` key-docs
+list.
 
 ### Tests
 
