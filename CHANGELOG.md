@@ -1,3 +1,171 @@
+## 0.12.6
+
+Closes issue #487: the hand-written `guard.unlock(); f(); guard.lock();` pattern
+around `HomeserverRuntime::mutex` is gone, and so is the defect class behind it.
+
+### A third instance of the recursive-release stall, found and fixed
+
+`runtime.mutex` is recursive so that service functions such as `create_room`,
+`join_room`, `leave_room` and `invite_user_by_threepid` stay independently
+callable. When one of them runs beneath a request handler that already holds
+its own guard, `unlock()` drops one recursion level and not the lock, so the
+mutex stays held for the whole of the "released" network call and every other
+client request and inbound federation transaction stalls behind it.
+
+That had already shipped twice (`create_room` in 0.12.1, `leave_room` in
+0.12.3). Writing the regression test for #487 first turned up a third, still
+live: **`invite_user_by_threepid` released only its own guard around the
+identity-server `/store-invite` round trip.** An ordinary authenticated client
+inviting an email address through an operator-trusted identity server froze the
+whole server for the length of that call. The new scenario in
+`tests/integration/test_request_lock_contention_flow.cpp` drives a real TLS
+identity server that accepts and then withholds; against the old code an
+unrelated request took 8001 ms against a 3000 ms budget.
+
+### One release primitive that cannot be misused
+
+- **`HomeserverRuntime::mutex` is now a `homeserver::RuntimeMutex`** — a
+  `std::recursive_mutex` that also records its owning thread, so a release
+  scope can ask whether the calling thread still holds it. `std::recursive_mutex`
+  cannot answer that, which is why the old mechanism could not be made safe.
+- **`NetworkIoUnlock` and `ScopedGuardRelease` collapse into
+  `homeserver::RuntimeLockRelease`.** The two differed in which guard they
+  acted on — the thread's published one versus one in hand — and at a nested
+  call site those are different objects. Picking the wrong one compiled, passed
+  its tests, and held a global mutex across a network round trip; that
+  distinction is exactly what made the `leave_room` fix incomplete. The two
+  constructors still name the choice, but **both release every recursion level
+  the calling thread holds** and restore exactly that many on scope exit,
+  throwing paths included.
+- Releasing a caller's guard before delegating to a self-locking function is no
+  longer load-bearing. The existing call sites that do are kept because they are
+  explicit, not because correctness depends on them.
+
+### `join_room`'s released region is now a function
+
+`join_room`'s release spanned roughly 350 lines, and nine of the forty-four
+values declared inside it were consumed after the re-lock. A mechanical
+conversion would have hoisted those nine above the scope: `const` stripped from
+each, every type forced to be default-constructible, nine initialisations split
+into declare-then-assign inside a 1000-line function. That is why it had been
+deferred.
+
+It is now extracted into `perform_federated_join`, returning a
+`FederatedJoinOutcome` that carries exactly those nine values plus an optional
+failure the caller returns verbatim. The lock boundary is the function
+boundary, nothing needs hoisting, and the release is a two-line scope around the
+call. `invite_user_by_threepid` and the three `local_http_router.cpp` sites use
+the same idea at smaller scale, with an immediately-invoked lambda.
+
+### Everything else converted
+
+- `local_http_router.cpp`: the persistent-store commit release, the `createRoom`
+  delegation, and the join delegation are all `RuntimeLockRelease` scopes. Each
+  had an early return or a self-locking call inside the released region that a
+  throw would have stranded.
+- **No hand-written release of `runtime.mutex` remains in `include/` or
+  `src/`.** The two `unlock()` calls that survive the gate are the make_join
+  race's notify-outside-the-lock idiom on its own local mutex.
+- `scripts/reject-unsafe.sh` now matches `->unlock()` as well as `.unlock()` —
+  a release through a pointer used to slip past unseen — and exempts by name the
+  two files that implement the primitives.
+
+### Fixed in review on #490
+
+Four findings from review, all in code this branch introduced:
+
+- **Nested release scopes corrupted the recursion depth.** The scope released
+  the named guard through `unique_lock::unlock()` and drained the remaining
+  levels through the mutex. Draining cannot clear another `unique_lock`'s
+  ownership flag, so an inner scope reaching for the thread's published guard
+  saw a stale `owns_lock() == true`, unlocked a mutex the thread no longer
+  held, underflowed the depth, and would have stranded `runtime.mutex` locked
+  for the life of the process. The scope now drops every level through the
+  mutex and never consults a guard's flag; nested scopes read
+  `held_by_current_thread()` and correctly find nothing to release. The new
+  scenario fails against the old shape with `Operation not permitted`.
+- **`perform_federated_join` captured a dangling `key_id`.** Extracting the
+  function turned `key_id` into a `std::string_view`, so `auto key_id_copy =
+  key_id;` deduced a view rather than the owning `std::string` the surrounding
+  comment promises. make_join tasks that lose the race are moved into
+  `runtime.orphan_futures_` and outlive `join_room`'s frame, so a slow or
+  semaphore-queued candidate could read freed memory when building its X-Matrix
+  authorization header.
+- **`FederatedJoinOutcome` held the room-version policy as a raw pointer**,
+  making the caller's dereference depend on a separate `failure` field and
+  breaking the project's no-raw-pointers rule. It is held by value now; the
+  background-fill task already copied it.
+- **The reject-unsafe gate exempted two files wholesale**, which would have let
+  any future unannotated release in either primitive through, and
+  `scripts/AGENTS.md` says not to add exceptions to that script. The exemption
+  is per-line again, with the same `LOCK_RELEASE: reviewed` annotation every
+  other site would need.
+
+### Architecture Decision Records introduced
+
+`docs/adr/` is new: Architecture Decision Records in the MADR 2.1.2 format,
+following the layout and template of the
+[Opinionated Digital Center's ADR repository](https://github.com/opinionated-digital-center/architecture-decision-records)
+— `docs/adr/NNNN-title-in-lowercase-with-dashes.md`, a table of contents in
+`docs/adr/index.md`, the template in `docs/adr/template.md`, and `.adr-dir` at
+the repository root so `adr-tools` and `pyadr` find the directory. Status and
+date are mandatory.
+
+Fifty-two records. [ADR-0000](docs/adr/0000-record-architecture-decisions.md)
+and [ADR-0001](docs/adr/0001-use-markdown-architectural-decision-records.md)
+record the practice and the format; ADR-0002 to ADR-0008 record this branch's
+decisions; **ADR-0009 to ADR-0051 are backfilled** from existing documentation
+and code, covering concurrency, canonical JSON, crypto and secret handling,
+transport and rate limiting, media, appservices, sync, database roles,
+platform support, and process. Each carries a note that its date is the date of
+the record, not of the decision.
+
+Backfilling turned up one documentation defect: `docs/event-engine.md` stated
+that signing keys are regenerated on every restart, "effecting automatic key
+rotation". They are not — `find_active_server_signing_key` selects the stored
+key and republishes a lapsed `valid_until_ts` window rather than replacing it,
+and silent regeneration is prohibited. Corrected, and recorded as
+[ADR-0017](docs/adr/0017-never-regenerate-a-signing-key-silently.md).
+
+Two exist because the code depends on them without saying so locally, which is
+the case the format earns its keep for:
+
+- **[ADR-0004](docs/adr/0004-release-the-runtime-lock-through-the-mutex-not-a-guard.md)**
+  — for the lifetime of a release scope, every `std::unique_lock` on
+  `runtime.mutex` reports `owns_lock() == true` while the mutex is actually
+  free. That is sound only because nothing outside `request_lock.cpp` reads the
+  flag. Introducing such a read anywhere else breaks it, and no compiler will
+  say so.
+- **[ADR-0003](docs/adr/0003-drain-every-recursion-level-in-one-release-primitive.md)**
+  — a callee's release scope now drops a lock its caller was holding. The blast
+  radius was checked once (`ingest_pdu_event` is the only candidate site, and
+  neither caller holds a level); a new caller of it that holds `runtime.mutex`
+  reopens the question.
+
+`docs/AGENTS.md` otherwise forbids new documents; adding an ADR is now the one
+stated exception, since the format's value comes from an immutable file per
+decision. Registered in `docs/AGENTS.md` and the root `AGENTS.md` key-docs
+list, and the root `AGENTS.md` General Rules now carry the standing rule:
+record a decision in the register whenever you make one, with the test for
+what counts as a decision and the requirement that entries are never
+renumbered or deleted.
+
+### Tests
+
+- `tests/unit/test_request_lock.cpp` rewritten to assert on **what another
+  thread can observe**, not on what a guard believes. A recursive mutex answers
+  `try_lock()` with "yes" to its own owner at any depth, so only an outside
+  probe distinguishes "released" from "one level released". New scenarios cover
+  a nested dispatcher/service pair, the published-guard constructor over an
+  unpublished nested guard, the throwing path in both, and `RuntimeMutex`
+  ownership reporting.
+- `tests/unit/test_request_lock.cpp` also covers scope nesting: an inner
+  release scope opening inside an outer one, and a fresh lock taken inside a
+  released region and then released again. Both assert the depth is restored
+  exactly once per level by unwinding the guards and checking ownership ends.
+- `tests/integration/test_request_lock_contention_flow.cpp` gains the
+  third-party-invite scenario described above.
+
 ## 0.12.5
 
 Fixes for the security audit recorded in

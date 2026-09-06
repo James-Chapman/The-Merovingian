@@ -12,6 +12,7 @@ homeserver_sources = files(
   'request_lock.cpp',
   'room_service.cpp',
   'runtime.cpp',
+  'runtime_mutex.cpp',
   'runtime_signing_key_store.cpp',
   'space_hierarchy.cpp',
   'tls.cpp',

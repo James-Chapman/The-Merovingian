@@ -24,8 +24,10 @@ Rules:
   mutex serialises every client-server request and every inbound federation
   transaction, so a call held across it converts one slow peer into a
   whole-process stall. Wrap the network call in a
-  `homeserver::NetworkIoUnlock` scope (`homeserver/request_lock.hpp`) and keep
-  every read and mutation of runtime state outside it.
+  `homeserver::RuntimeLockRelease` scope (`homeserver/request_lock.hpp`) and keep
+  every read and mutation of runtime state outside it. The scope releases every
+  recursion level the calling thread holds, so it is correct whether or not a
+  caller further up the stack also holds the mutex.
 
 
 ## Tests

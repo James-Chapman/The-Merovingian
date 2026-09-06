@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "merovingian/homeserver/runtime_mutex.hpp"
+
+#include <cstddef>
 #include <mutex>
 
 namespace merovingian::homeserver
@@ -14,8 +17,9 @@ namespace merovingian::homeserver
 //
 // The publication is thread_local, so one request thread never observes
 // another's guard. A thread that publishes nothing — the federation worker, a
-// test calling a service function directly — leaves the publication null and
-// `NetworkIoUnlock` below then does nothing at all.
+// test calling a service function directly — leaves the publication null, and
+// the default-constructed `RuntimeLockRelease` below then has no guard to
+// release.
 //
 // Nesting is supported: the innermost scope wins and restores its predecessor
 // on exit. That matches the one nesting path in the server, where the
@@ -24,7 +28,7 @@ namespace merovingian::homeserver
 class RequestLockScope final
 {
 public:
-    explicit RequestLockScope(std::unique_lock<std::recursive_mutex>& guard) noexcept;
+    explicit RequestLockScope(std::unique_lock<RuntimeMutex>& guard) noexcept;
     ~RequestLockScope();
 
     RequestLockScope(RequestLockScope const&) = delete;
@@ -33,11 +37,11 @@ public:
     auto operator=(RequestLockScope&&) -> RequestLockScope& = delete;
 
 private:
-    std::unique_lock<std::recursive_mutex>* previous_{nullptr};
+    std::unique_lock<RuntimeMutex>* previous_{nullptr};
 };
 
-// Releases this thread's published request lock for the lifetime of the scope
-// and re-acquires it on exit, including when the guarded call throws.
+// Releases `HomeserverRuntime::mutex` for the lifetime of the scope and
+// re-acquires it on exit, including when the guarded call throws.
 //
 // Holding `runtime.mutex` across outbound HTTP freezes the whole process:
 // every client-server request and every inbound federation transaction
@@ -47,66 +51,78 @@ private:
 // request handler in one of these, and keep runtime state reads and mutations
 // outside it.
 //
-// Doing nothing is always a valid outcome: when no guard is published, or the
-// published guard does not currently own the mutex (a caller released it by
-// hand first), the scope neither unlocks nor re-locks. It therefore composes
-// with the existing hand-written unlock/lock pairs rather than fighting them.
-class NetworkIoUnlock final
+// **It releases every recursion level this thread holds, not just one.**
+// `runtime.mutex` is recursive and a self-locking service function called from
+// a request handler holds it twice: once via the dispatcher's guard and once
+// via its own. Dropping a single level leaves the mutex held for the whole
+// blocking call — the defect shipped three times over
+// (`create_room` 0.12.1, `leave_room` 0.12.3, `invite_user_by_threepid`
+// 0.12.6), each time because the author released the guard they had in hand
+// and not the one an outer frame held. Every level is restored on exit, in the
+// same count, so outer frames resume owning exactly what they owned before.
+//
+// Two constructors, one behaviour:
+//
+//   RuntimeLockRelease{}        // find the mutex via the thread's published guard
+//   RuntimeLockRelease{guard}   // find it via a guard in hand
+//
+// The argument says only which `unique_lock` to read the mutex address from,
+// never whether that guard believes it owns it. The set of levels released is
+// the same either way, so choosing the "wrong" one can no longer leave the
+// mutex held.
+//
+// **A guard's `owns_lock()` is NOT cleared for the duration of the scope.**
+// The levels being dropped belong to `unique_lock` objects in frames this
+// scope cannot reach, so the release necessarily goes through the mutex and no
+// guard's bookkeeping flag can be updated — the one passed in included. That
+// is sound only because nothing outside `request_lock.cpp` reads the flag
+// (`grep -rn owns_lock src include`) and the depth is restored exactly before
+// any guard can act on it. Read `RuntimeMutex::held_by_current_thread()`
+// instead if you need to know whether the mutex is held; a nested release
+// scope does exactly that, and so correctly finds nothing left to release.
+//
+// Doing nothing is always a valid outcome: with no guard published and none
+// passed, there is no mutex to act on and the scope neither unlocks nor
+// re-locks.
+class RuntimeLockRelease final
 {
 public:
-    NetworkIoUnlock() noexcept;
+    // Releases this thread's published request lock (see `RequestLockScope`)
+    // and any further levels the thread holds.
+    RuntimeLockRelease() noexcept;
 
-    // Re-acquires the mutex released by the constructor. A failure to
-    // re-acquire leaves the runtime's locking invariant broken with no way to
-    // signal it from a destructor, so the resulting exception terminates
-    // rather than allowing the caller to continue unsynchronised.
-    ~NetworkIoUnlock();
+    // Releases `guard` and any further levels this thread holds. Use this
+    // whenever the guard is in hand rather than published: a nested call site
+    // has its own guard, and the published one belongs to a different frame.
+    explicit RuntimeLockRelease(std::unique_lock<RuntimeMutex>& guard) noexcept;
 
-    NetworkIoUnlock(NetworkIoUnlock const&) = delete;
-    auto operator=(NetworkIoUnlock const&) -> NetworkIoUnlock& = delete;
-    NetworkIoUnlock(NetworkIoUnlock&&) = delete;
-    auto operator=(NetworkIoUnlock&&) -> NetworkIoUnlock& = delete;
+    // Re-acquires everything the constructor released. A failure to re-acquire
+    // leaves the runtime's locking invariant broken with no way to signal it
+    // from a destructor, so the resulting exception terminates rather than
+    // allowing the caller to continue unsynchronised.
+    ~RuntimeLockRelease();
 
-private:
-    std::unique_lock<std::recursive_mutex>* released_{nullptr};
-};
+    RuntimeLockRelease(RuntimeLockRelease const&) = delete;
+    auto operator=(RuntimeLockRelease const&) -> RuntimeLockRelease& = delete;
+    RuntimeLockRelease(RuntimeLockRelease&&) = delete;
+    auto operator=(RuntimeLockRelease&&) -> RuntimeLockRelease& = delete;
 
-
-// Releases a guard the caller holds directly for the lifetime of the scope and
-// re-acquires it on exit, including when the guarded call throws.
-//
-// This is the counterpart to NetworkIoUnlock for the case where the lock
-// object is in hand rather than published: the caller must release its *own*
-// outer guard before calling a function that takes runtime.mutex itself (a
-// recursive mutex means a nested acquisition would otherwise keep the mutex
-// held across the inner call's blocking work). Those sites were written as a
-// bare `guard.unlock(); f(); guard.lock();` triple, which never re-acquires if
-// `f()` throws or if control leaves the region early — the request then
-// continues, and the next request on this thread runs, with the runtime's
-// locking invariant silently broken.
-//
-// Use this rather than NetworkIoUnlock whenever the guard to release is the
-// local one: NetworkIoUnlock acts on the thread's *published* guard, which at
-// a nested call site is not necessarily the same object.
-class ScopedGuardRelease final
-{
-public:
-    explicit ScopedGuardRelease(std::unique_lock<std::recursive_mutex>& guard) noexcept;
-
-    // Re-acquires the guard released by the constructor. As with
-    // NetworkIoUnlock, a failure to re-acquire leaves the locking invariant
-    // broken with no way to signal it from a destructor, so the resulting
-    // exception terminates rather than letting the caller continue
-    // unsynchronised.
-    ~ScopedGuardRelease();
-
-    ScopedGuardRelease(ScopedGuardRelease const&) = delete;
-    auto operator=(ScopedGuardRelease const&) -> ScopedGuardRelease& = delete;
-    ScopedGuardRelease(ScopedGuardRelease&&) = delete;
-    auto operator=(ScopedGuardRelease&&) -> ScopedGuardRelease& = delete;
+    // Number of recursion levels this scope dropped, and will restore. More
+    // than one means some outer frame held `runtime.mutex` across this scope's
+    // blocking work and would have stalled the server before this primitive
+    // started draining those levels; zero means the thread held nothing, which
+    // is the normal case for a nested scope. Exposed for tests and
+    // diagnostics; correctness does not depend on anyone reading it.
+    [[nodiscard]] auto levels_released() const noexcept -> std::size_t;
 
 private:
-    std::unique_lock<std::recursive_mutex>* released_{nullptr};
+    void release(std::unique_lock<RuntimeMutex>* guard) noexcept;
+
+    // Non-owning observer of the mutex this scope released, null when it
+    // released nothing. A reference member cannot express "nothing to do", and
+    // this mirrors what `std::unique_lock` itself stores.
+    RuntimeMutex* mutex_{nullptr};
+    std::size_t levels_{0U};
 };
 
 } // namespace merovingian::homeserver

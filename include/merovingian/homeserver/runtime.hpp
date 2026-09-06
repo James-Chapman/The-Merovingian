@@ -11,6 +11,7 @@
 #include "merovingian/federation/dispatch_worker.hpp"
 #include "merovingian/federation/inbound_request.hpp"
 #include "merovingian/federation/server_discovery.hpp"
+#include "merovingian/homeserver/runtime_mutex.hpp"
 #include "merovingian/http/outbound_client.hpp"
 #include "merovingian/identity/identity_client.hpp"
 #include "merovingian/media/repository.hpp"
@@ -35,8 +36,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace merovingian::homeserver
@@ -346,8 +347,11 @@ struct HomeserverRuntime final
     std::uint64_t next_request_sequence{1U};
     // Guards mutable runtime state when requests are handled concurrently.
     // Handlers must release it before outbound network I/O so unrelated
-    // requests can continue while a federation round-trip is in flight.
-    mutable std::recursive_mutex mutex{};
+    // requests can continue while a federation round-trip is in flight. Use
+    // `RuntimeLockRelease` (request_lock.hpp) to release it — the mutex is
+    // recursive, and releasing a single level by hand is what produced the
+    // deadlocks in 0.12.1, 0.12.3 and 0.12.6.
+    mutable RuntimeMutex mutex{};
     // Per-room striped mutexes used by inbound PDU ingestion. Each room's events
     // are serialized on their own stripe so per-room ordering is preserved, while
     // events in different rooms can prepare/commit/apply in parallel. The global

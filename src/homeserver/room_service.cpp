@@ -1639,7 +1639,7 @@ namespace
         // Discovery is a DNS/well-known cascade that can burn the full timeout
         // against an unreachable peer, so it must not run under runtime.mutex.
         auto const resolution = [&]() {
-            auto const unlocked = NetworkIoUnlock{};
+            auto const unlocked = RuntimeLockRelease{};
             return federation::discover_server(transaction.destination, *discovery_network, timeout_seconds);
         }();
         if (!resolution.discovery_allowed)
@@ -1698,12 +1698,12 @@ namespace
     auto outcome = http::OutboundResult{};
     if (runtime.federation_proxy)
     {
-        auto const unlocked = NetworkIoUnlock{};
+        auto const unlocked = RuntimeLockRelease{};
         outcome = runtime.federation_proxy->send_outbound_request(request, room_id);
     }
     else if (runtime.outbound_client)
     {
-        auto const unlocked = NetworkIoUnlock{};
+        auto const unlocked = RuntimeLockRelease{};
         outcome = runtime.outbound_client->perform(request);
     }
     else
@@ -2271,7 +2271,7 @@ auto ensure_crypto_provider_holds_key(HomeserverRuntime& runtime, std::string_vi
 
 [[nodiscard]] auto rotate_server_signing_key(HomeserverRuntime& runtime) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
 
     // Ensure a current active key exists to retire (this also loads its secret into
     // the runtime). Without a current key there is nothing to rotate from.
@@ -2379,7 +2379,7 @@ auto ensure_crypto_provider_holds_key(HomeserverRuntime& runtime, std::string_vi
 [[nodiscard]] auto create_room(HomeserverRuntime& runtime, std::string_view access_token,
                                CreateRoomOptions const& options) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     // create_room is called both standalone (this lock is the only one taken:
     // local_smoke_flow.cpp) and from within a request handler that already
     // holds runtime.mutex (client_server.cpp, local_http_router.cpp) — those
@@ -2387,11 +2387,11 @@ auto ensure_crypto_provider_holds_key(HomeserverRuntime& runtime, std::string_vi
     // relock at each call site) so this is never a *nested* acquisition of
     // the same recursive_mutex. Publishing it here, exactly like the other
     // three request-lock-scope entry points, is what lets
-    // resolve_policy_server_hook's NetworkIoUnlock actually find and release
+    // resolve_policy_server_hook's RuntimeLockRelease actually find and release
     // *this* guard — the one genuinely protecting the rest of this function —
     // during the policy-server round trip. Before this, a caller-held outer
     // guard being double-locked here (recursive_mutex permits it, silently)
-    // meant NetworkIoUnlock released only the outer level while this guard
+    // meant RuntimeLockRelease released only the outer level while this guard
     // kept the mutex held, so the network call still ran under an
     // effectively-locked mutex: see the room-creation regression scenario in
     // tests/integration/test_request_lock_contention_flow.cpp.
@@ -3247,11 +3247,438 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
     return split;
 }
 
+namespace
+{
+
+// What a federated join needs to hand back to `join_room` once the network
+// work is done and `runtime.mutex` has been re-acquired.
+//
+// `perform_federated_join` runs with the mutex RELEASED, so it can hold no
+// reference into runtime state — every value here is owned. An engaged
+// `failure` means the join did not get far enough to produce the rest, and
+// `join_room` returns it verbatim.
+struct FederatedJoinOutcome final
+{
+    std::optional<OperationResult> failure{};
+    // Held by value. The lookup returns a pointer into a static table, but
+    // storing that pointer here would make the caller's dereference depend on
+    // `failure` being disengaged, and the project forbids raw pointers.
+    // RoomVersionPolicy is a string_view and a handful of enums and bools, and
+    // the background-fill task already copies it.
+    rooms::RoomVersionPolicy policy{};
+    std::string remote_server{};
+    events::SignedEventResult signed_event{};
+    canonicaljson::Value signed_event_value{};
+    events::EventIdResult event_id_result{};
+    canonicaljson::Array verified_critical_state{};
+    canonicaljson::Array verified_auth_chain{};
+    // Other members' m.room.member events, deferred to the background task
+    // `join_room` spawns once the critical state is persisted.
+    canonicaljson::Array background_state{};
+    std::size_t background_member_count{0U};
+};
+
+[[nodiscard]] auto federated_join_failure(std::string reason, std::uint16_t status) -> FederatedJoinOutcome
+{
+    auto outcome = FederatedJoinOutcome{};
+    outcome.failure = make_operation_result(false, {}, std::move(reason), status);
+    return outcome;
+}
+
+// Runs the whole federated join — make_join race, sign, send_join, signature
+// verification of the returned state — with `runtime.mutex` RELEASED.
+//
+// This is a function rather than a block inside `join_room` for one reason:
+// the scope boundary IS the lock boundary. Nine of the values produced here
+// are consumed after the re-lock, and leaving them as declarations inside a
+// released region meant either hoisting them above the release (stripping
+// `const` from nine initialisations in a 1000-line function) or trusting a
+// hand-written `unlock()`/`lock()` pair to bracket them. Returning them makes
+// the released region something the compiler enforces the shape of.
+//
+// Everything this needs from runtime state is passed in, read under the lock
+// by the caller. `runtime` itself is still touched — `runtime.federation.config`
+// for timeouts, `runtime.orphan_futures_` under its own mutex, and the
+// outbound client — none of which is guarded by `runtime.mutex`.
+[[nodiscard]] auto perform_federated_join(HomeserverRuntime& runtime, std::string_view room_id,
+                                          std::string const& user_id, std::string const& our_server,
+                                          std::vector<std::string> candidates,
+                                          std::vector<std::string> const& supported_versions,
+                                          std::optional<database::PersistentServerSigningKey> const& signing_key,
+                                          std::string_view key_id, std::span<std::uint8_t const> secret_key)
+    -> FederatedJoinOutcome
+{
+    // Parallel make_join race: fire up to join_parallelism concurrent make_join
+    // calls and return on the first successful response. Still-running losers are
+    // moved into runtime.orphan_futures_ to complete in the background; they are
+    // drained in HomeserverRuntime::~HomeserverRuntime() before any member is
+    // destroyed. Completed orphans from a previous race are pruned first.
+    {
+        auto const orphan_lk = std::lock_guard{runtime.orphan_futures_mutex_};
+        reap_completed_futures(runtime.orphan_futures_);
+    }
+    // join_timeout_seconds is the per-call budget for each make_join attempt.
+    // Fall back to remote_timeout_seconds only when the join timeout is
+    // unconfigured (zero), so the default 180s join budget is always preferred
+    // over the 30s general federation timeout for large-room joins.
+    static constexpr auto k_max_join_parallelism = std::ptrdiff_t{512};
+    auto const parallelism = std::min(
+        static_cast<std::ptrdiff_t>(std::max(std::uint32_t{1U}, runtime.federation.config.join_parallelism)),
+        k_max_join_parallelism);
+    auto const per_call_timeout = runtime.federation.config.join_timeout_seconds > 0U
+                                      ? runtime.federation.config.join_timeout_seconds
+                                      : runtime.federation.config.remote_timeout_seconds;
+    struct MakeJoinRaceState
+    {
+        std::mutex mtx{};
+        std::condition_variable cv{};
+        std::optional<std::pair<std::string, std::string>> winner{}; // {server, body}
+        std::string last_error{};
+        int remaining{0};
+    };
+    auto race_state = std::make_shared<MakeJoinRaceState>();
+    race_state->remaining = static_cast<int>(candidates.size());
+    // Semaphore caps the number of concurrent in-flight make_join HTTP calls.
+    auto race_sem = std::make_shared<PortableSemaphore>(static_cast<int>(parallelism));
+    // Owned copies so tasks moved into orphan_futures_ are self-contained
+    // and do not dangle on stack variables in join_room.
+    auto room_id_copy = std::string{room_id};
+    auto user_id_copy = std::string{user_id};
+    auto our_server_copy = std::string{our_server};
+    auto key_id_copy = std::string{key_id};
+    auto sv_copy = supported_versions;
+    auto race_futures = std::vector<std::future<void>>{};
+    race_futures.reserve(candidates.size());
+    for (auto const& candidate : candidates)
+    {
+        log_diagnostic("room.join.remote.make_join", {
+                                                         {"actor",         user_id_copy, false},
+                                                         {"room_id",       room_id_copy, false},
+                                                         {"remote_server", candidate,    false}
+        });
+        race_futures.push_back(std::async(
+            std::launch::async, [&runtime, race_state, race_sem, room_id_copy, user_id_copy, our_server_copy,
+                                 key_id_copy, secret_key, sv_copy, per_call_timeout, cand = candidate]() mutable {
+                // Acquire a concurrency slot before making the HTTP call.
+                race_sem->acquire();
+                struct SemRelease
+                {
+                    PortableSemaphore& s;
+                    ~SemRelease() noexcept
+                    {
+                        s.release();
+                    }
+                } sem_guard{*race_sem};
+                // Bail early if another task already won.
+                {
+                    auto lk = std::unique_lock{race_state->mtx};
+                    if (race_state->winner.has_value())
+                    {
+                        if (--race_state->remaining == 0)
+                        {
+                            lk.unlock(); // LOCK_RELEASE: reviewed — notify outside the lock so the
+                                         // waiter does not immediately block on it.
+                            race_state->cv.notify_one();
+                        }
+                        return;
+                    }
+                }
+                auto tx =
+                    federation::make_outbound_make_membership(federation::FederationEndpoint::make_join, cand,
+                                                              our_server_copy, room_id_copy, user_id_copy, sv_copy);
+                auto [ok, body] = perform_sync_outbound_call(runtime, room_id_copy, tx, key_id_copy, secret_key,
+                                                             "room.join.remote.make_join_failed", per_call_timeout);
+                auto lk = std::unique_lock{race_state->mtx};
+                if (ok && !race_state->winner.has_value())
+                {
+                    race_state->winner = {cand, std::move(body)};
+                }
+                else if (!ok && !race_state->winner.has_value())
+                {
+                    race_state->last_error = std::move(body);
+                }
+                if (--race_state->remaining == 0 || race_state->winner.has_value())
+                {
+                    lk.unlock(); // LOCK_RELEASE: reviewed — notify outside the lock so the waiter
+                                 // does not immediately block on it.
+                    race_state->cv.notify_one();
+                }
+            }));
+    }
+    // Block until first winner, all candidates exhausted, or the overall race
+    // deadline elapses — whichever comes first. The deadline bounds the WHOLE
+    // race (unlike per_call_timeout, which bounds one candidate), so a large via
+    // list cannot grind past what a calling client's own HTTP timeout allows.
+    // A deadline of 0 (unconfigured) preserves the old unbounded wait.
+    auto race_deadline_exceeded = false;
+    {
+        auto lk = std::unique_lock{race_state->mtx};
+        auto const predicate = [&race_state] {
+            return race_state->winner.has_value() || race_state->remaining <= 0;
+        };
+        if (runtime.federation.config.join_race_deadline_seconds > 0U)
+        {
+            auto const deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(runtime.federation.config.join_race_deadline_seconds);
+            race_deadline_exceeded = !race_state->cv.wait_until(lk, deadline, predicate);
+        }
+        else
+        {
+            race_state->cv.wait(lk, predicate);
+        }
+    }
+    // Park still-running losers in orphan_futures_; discard completed ones.
+    {
+        auto orphan_lk = std::lock_guard{runtime.orphan_futures_mutex_};
+        for (auto& f : race_futures)
+        {
+            if (!f.valid())
+            {
+                continue;
+            }
+            if (f.wait_for(std::chrono::seconds{0}) == std::future_status::ready)
+            {
+                // Completed loser — let the future destructor clean up silently.
+            }
+            else
+            {
+                runtime.orphan_futures_.push_back(std::move(f));
+            }
+        }
+    }
+    if (!race_state->winner.has_value())
+    {
+        auto const reason =
+            race_deadline_exceeded ? "make_join race deadline exceeded" : "make_join failed via all candidates";
+        log_diagnostic("room.join.rejected",
+                       {
+                           {"actor",   user_id_copy, false},
+                           {"room_id", room_id_copy, false},
+                           {"status",  "502",        false},
+                           {"reason",  reason,       false}
+        },
+                       observability::LogEventSeverity::warning);
+        auto const message = race_deadline_exceeded
+                                 ? "make_join failed: race deadline exceeded before any candidate succeeded"
+                                 : "make_join failed: " + race_state->last_error;
+        return federated_join_failure(message, 502U);
+    }
+    auto [remote_server, make_body] = std::move(*race_state->winner);
+    // Parse the make_join response and validate the template before we sign it.
+    auto const make_response = canonicaljson::parse_lossless(make_body);
+    auto const* make_obj = std::get_if<canonicaljson::Object>(&make_response.value.storage());
+    if (make_obj == nullptr)
+    {
+        log_diagnostic("room.join.rejected", {
+                                                 {"actor",   user_id,                   false},
+                                                 {"room_id", std::string{room_id},       false},
+                                                 {"status",  "502",                      false},
+                                                 {"reason",  "malformed make_join body", false}
+        });
+        return federated_join_failure("malformed make_join response", 502U);
+    }
+    auto const validated = validate_make_join_event(room_id, user_id, *make_obj);
+    if (!validated.ok)
+    {
+        log_diagnostic("room.join.rejected", {
+                                                 {"actor",   user_id,             false},
+                                                 {"room_id", std::string{room_id}, false},
+                                                 {"status",  "502",                false},
+                                                 {"reason",  validated.reason,     false}
+        });
+        return federated_join_failure(validated.reason, 502U);
+    }
+    auto const room_version = validated.room_version;
+    auto event_object = validated.event;
+    // Compute and attach the content hash (hashes.sha256) before signing.
+    // The Matrix spec requires every PDU to carry this field (room versions >= 2).
+    // Without it, Synapse rejects send_join with:
+    //   SynapseError: 400 - Malformed 'hashes': <class 'NoneType'>
+    auto const content_hash = events::make_content_hash(canonicaljson::Value{event_object});
+    if (!content_hash.error.empty())
+    {
+        log_diagnostic("room.join.rejected", {
+                                                 {"actor",   user_id,             false},
+                                                 {"room_id", std::string{room_id}, false},
+                                                 {"status",  "500",                false},
+                                                 {"reason",  content_hash.error,   false}
+        });
+        return federated_join_failure("join event content hash failed", 500U);
+    }
+    auto hashes_obj = canonicaljson::Object{};
+    hashes_obj.push_back(canonicaljson::make_member("sha256", canonicaljson::Value{content_hash.sha256}));
+    event_object.push_back(canonicaljson::make_member("hashes", canonicaljson::Value{std::move(hashes_obj)}));
+
+    auto event_to_sign = canonicaljson::Value{event_object};
+    // Sign the event with our server's signing key.
+    // signing_key is guaranteed non-empty here: perform_sync_outbound_call
+    // validates secret_key size before executing make_join, so a failed key
+    // means make_ok was false and we returned 502 above.
+    if (runtime.crypto_provider == nullptr)
+    {
+        log_diagnostic("room.join.rejected", {
+                                                 {"actor",   user_id,                                false},
+                                                 {"room_id", std::string{room_id},                    false},
+                                                 {"status",  "500",                                   false},
+                                                 {"reason",  "server signing provider not available", false}
+        });
+        return federated_join_failure("server signing provider not available", 500U);
+    }
+    auto key_store = RuntimeSigningKeyStore{our_server, signing_key.value()};
+    auto const* policy = rooms::find_room_version_policy(room_version);
+    if (policy == nullptr)
+    {
+        log_diagnostic("room.join.rejected", {
+                                                 {"actor",   user_id,                      false},
+                                                 {"room_id", std::string{room_id},          false},
+                                                 {"status",  "500",                         false},
+                                                 {"reason",  "room version policy missing", false}
+        });
+        return federated_join_failure("room version policy missing", 500U);
+    }
+    auto signed_event =
+        events::sign_event_for_server(event_to_sign, *policy, key_store, *runtime.crypto_provider, our_server);
+    if (!signed_event.error.empty())
+    {
+        log_diagnostic("room.join.rejected", {
+                                                 {"actor",   user_id,             false},
+                                                 {"room_id", std::string{room_id}, false},
+                                                 {"status",  "500",                false},
+                                                 {"reason",  signed_event.error,   false}
+        });
+        return federated_join_failure("event signing failed", 500U);
+    }
+    // Compute the event_id from the signed event (room v10+ uses
+    // reference hash-based event IDs).
+    auto const signed_value = canonicaljson::parse_lossless(signed_event.event_json);
+    auto const event_id_result = events::make_reference_hash_event_id(signed_value.value, *policy);
+    if (event_id_result.error.empty() && event_id_result.event_id.empty())
+    {
+        log_diagnostic("room.join.rejected", {
+                                                 {"actor",   user_id,                      false},
+                                                 {"room_id", std::string{room_id},          false},
+                                                 {"status",  "500",                         false},
+                                                 {"reason",  "event_id computation failed", false}
+        });
+        return federated_join_failure("event_id computation failed", 500U);
+    }
+    // Send the signed join event via send_join.
+    auto send_join_tx = federation::make_outbound_send_membership(
+        federation::FederationEndpoint::send_join, remote_server, our_server, room_id, event_id_result.event_id,
+        signed_event.event_json);
+    log_diagnostic("room.join.remote.send_join", {
+                                                     {"actor",         user_id,                   false},
+                                                     {"room_id",       std::string{room_id},       false},
+                                                     {"remote_server", std::string{remote_server}, false},
+                                                     {"event_id",      event_id_result.event_id,   false}
+    });
+    // send_join can return megabytes of room state for large rooms, so give it
+    // the full join budget rather than the shorter remote_timeout used for key
+    // and discovery calls.  Mirror the same fallback chain as make_join.
+    auto const send_join_timeout = runtime.federation.config.join_timeout_seconds > 0U
+                                       ? runtime.federation.config.join_timeout_seconds
+                                       : runtime.federation.config.remote_timeout_seconds;
+    auto const [send_ok, send_body] = perform_sync_outbound_call(
+        runtime, room_id, send_join_tx, key_id, secret_key, "room.join.remote.send_join_failed", send_join_timeout,
+        runtime.federation.config.join_response_max_bytes);
+    if (!send_ok)
+    {
+        log_diagnostic("room.join.rejected",
+                       {
+                           {"actor",   user_id,             false},
+                           {"room_id", std::string{room_id}, false},
+                           {"status",  "502",                false},
+                           {"reason",  "send_join failed",   false}
+        },
+                       observability::LogEventSeverity::warning);
+        return federated_join_failure("send_join failed: " + send_body, 502U);
+    }
+    // Parse the send_join response. The v2 send_join response is
+    // ["200", { ... }] per MSC328; extract the inner object.
+    auto send_response = canonicaljson::parse_lossless(send_body);
+    auto const* send_obj = std::get_if<canonicaljson::Object>(&send_response.value.storage());
+    // If wrapped in ["200", {...}], unwrap the array element.
+    auto const* send_arr = std::get_if<canonicaljson::Array>(&send_response.value.storage());
+    if (send_arr != nullptr && send_arr->size() >= 2U)
+    {
+        auto const* inner = std::get_if<canonicaljson::Object>(&(*send_arr)[1].storage());
+        if (inner != nullptr)
+        {
+            send_obj = inner;
+        }
+    }
+    if (send_obj == nullptr)
+    {
+        log_diagnostic("room.join.rejected", {
+                                                 {"actor",   user_id,                       false},
+                                                 {"room_id", std::string{room_id},           false},
+                                                 {"status",  "502",                          false},
+                                                 {"reason",  "malformed send_join response", false}
+        });
+        return federated_join_failure("malformed send_join response", 502U);
+    }
+    // Fast join: split the state array into "critical" state (everything
+    // except OTHER users' m.room.member — create, power_levels, join_rules,
+    // history_visibility, encryption, our own membership, etc.) and
+    // "background" state (every other member's m.room.member). Critical
+    // state is small — usually a handful of events from one or two signing
+    // domains — and is verified and persisted before this call returns, so
+    // the room is immediately usable (auth checks on the joining user's own
+    // actions only ever depend on critical state). The bulk of a large
+    // room's membership list, and its potentially hundreds of distinct
+    // signing domains, is verified and persisted in the background after
+    // the join response is returned to the client — this is the same
+    // "partial state room" trade-off Synapse's faster-joins feature makes.
+    // Signature verification itself (network-bound key resolution) runs
+    // here, inside the released region, so it never holds runtime.mutex.
+    auto const state_arr_member = std::ranges::find_if(*send_obj, [](canonicaljson::ObjectMember const& m) {
+        return m.key == "state";
+    });
+    auto const* state_arr = state_arr_member != send_obj->end()
+                                ? std::get_if<canonicaljson::Array>(&state_arr_member->value->storage())
+                                : nullptr;
+    auto state_split =
+        state_arr != nullptr ? split_send_join_state_events(*state_arr, user_id) : SendJoinStateSplit{};
+    auto& critical_state = state_split.critical;
+    auto& background_state = state_split.background;
+    auto const background_member_count = background_state.size();
+    // Verify each event's signature before it enters the event graph
+    // (src/federation/AGENTS.md rule 2) — resolves distinct sender-domain
+    // signing keys with bounded parallelism rather than trusting the
+    // resident server's response wholesale. Unverifiable events are
+    // silently dropped, not persisted.
+    auto verified_critical_state =
+        filter_verified_send_join_events(runtime, critical_state, *policy, our_server);
+    auto const auth_arr_member = std::ranges::find_if(*send_obj, [](canonicaljson::ObjectMember const& m) {
+        return m.key == "auth_chain";
+    });
+    auto const* auth_arr = auth_arr_member != send_obj->end()
+                               ? std::get_if<canonicaljson::Array>(&auth_arr_member->value->storage())
+                               : nullptr;
+    auto verified_auth_chain = auth_arr != nullptr
+                                         ? filter_verified_send_join_events(runtime, *auth_arr, *policy, our_server)
+                                         : canonicaljson::Array{};
+
+    auto outcome = FederatedJoinOutcome{};
+    outcome.policy = *policy;
+    outcome.remote_server = std::move(remote_server);
+    outcome.signed_event = std::move(signed_event);
+    outcome.signed_event_value = signed_value.value;
+    outcome.event_id_result = event_id_result;
+    outcome.verified_critical_state = std::move(verified_critical_state);
+    outcome.verified_auth_chain = std::move(verified_auth_chain);
+    outcome.background_state = std::move(background_state);
+    outcome.background_member_count = background_member_count;
+    return outcome;
+}
+
+} // namespace
+
 [[nodiscard]] auto join_room(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id,
                              std::vector<std::string> const& via_servers,
                              canonicaljson::Object const* third_party_signed) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     log_diagnostic("room.join.started", {
                                             {"room_id",          std::string{room_id},                    false},
                                             {"has_access_token", access_token.empty() ? "false" : "true", false}
@@ -3390,361 +3817,32 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
         auto const signing_key = find_active_server_signing_key(runtime);
         auto const key_id = signing_key.has_value() ? signing_key->key_id : std::string{};
         auto const secret_key = runtime.database.signing_secret_key.bytes();
-        guard.unlock(); // LOCK_RELEASE: reviewed — the federated-join network work below must not hold
-                        // runtime.mutex. The guard is function-local, so each of the early returns in
-                        // that window releases it rather than stranding it.
-        // Parallel make_join race: fire up to join_parallelism concurrent make_join
-        // calls and return on the first successful response. Still-running losers are
-        // moved into runtime.orphan_futures_ to complete in the background; they are
-        // drained in HomeserverRuntime::~HomeserverRuntime() before any member is
-        // destroyed. Completed orphans from a previous race are pruned first.
+        // The whole federated join — make_join race, sign, send_join, and
+        // signature verification of the state it returns — runs with
+        // runtime.mutex released. RuntimeLockRelease drops every level this
+        // thread holds, so a caller that reached join_room while already
+        // holding the mutex (the client-server dispatcher, the local router)
+        // does not leave it locked across the round trip; the destructor
+        // restores exactly what it released, on the throwing path too.
+        auto joined = [&] {
+            auto const released = RuntimeLockRelease{guard};
+            std::ignore = released;
+            return perform_federated_join(runtime, room_id, *user_id, our_server, std::move(candidates),
+                                          supported_versions, signing_key, key_id, secret_key);
+        }();
+        if (joined.failure.has_value())
         {
-            auto const orphan_lk = std::lock_guard{runtime.orphan_futures_mutex_};
-            reap_completed_futures(runtime.orphan_futures_);
+            return *joined.failure;
         }
-        // join_timeout_seconds is the per-call budget for each make_join attempt.
-        // Fall back to remote_timeout_seconds only when the join timeout is
-        // unconfigured (zero), so the default 180s join budget is always preferred
-        // over the 30s general federation timeout for large-room joins.
-        static constexpr auto k_max_join_parallelism = std::ptrdiff_t{512};
-        auto const parallelism = std::min(
-            static_cast<std::ptrdiff_t>(std::max(std::uint32_t{1U}, runtime.federation.config.join_parallelism)),
-            k_max_join_parallelism);
-        auto const per_call_timeout = runtime.federation.config.join_timeout_seconds > 0U
-                                          ? runtime.federation.config.join_timeout_seconds
-                                          : runtime.federation.config.remote_timeout_seconds;
-        struct MakeJoinRaceState
-        {
-            std::mutex mtx{};
-            std::condition_variable cv{};
-            std::optional<std::pair<std::string, std::string>> winner{}; // {server, body}
-            std::string last_error{};
-            int remaining{0};
-        };
-        auto race_state = std::make_shared<MakeJoinRaceState>();
-        race_state->remaining = static_cast<int>(candidates.size());
-        // Semaphore caps the number of concurrent in-flight make_join HTTP calls.
-        auto race_sem = std::make_shared<PortableSemaphore>(static_cast<int>(parallelism));
-        // Owned copies so tasks moved into orphan_futures_ are self-contained
-        // and do not dangle on stack variables in join_room.
-        auto room_id_copy = std::string{room_id};
-        auto user_id_copy = *user_id;
-        auto our_server_copy = std::string{our_server};
-        auto key_id_copy = key_id;
-        auto sv_copy = supported_versions;
-        auto race_futures = std::vector<std::future<void>>{};
-        race_futures.reserve(candidates.size());
-        for (auto const& candidate : candidates)
-        {
-            log_diagnostic("room.join.remote.make_join", {
-                                                             {"actor",         user_id_copy, false},
-                                                             {"room_id",       room_id_copy, false},
-                                                             {"remote_server", candidate,    false}
-            });
-            race_futures.push_back(std::async(
-                std::launch::async, [&runtime, race_state, race_sem, room_id_copy, user_id_copy, our_server_copy,
-                                     key_id_copy, secret_key, sv_copy, per_call_timeout, cand = candidate]() mutable {
-                    // Acquire a concurrency slot before making the HTTP call.
-                    race_sem->acquire();
-                    struct SemRelease
-                    {
-                        PortableSemaphore& s;
-                        ~SemRelease() noexcept
-                        {
-                            s.release();
-                        }
-                    } sem_guard{*race_sem};
-                    // Bail early if another task already won.
-                    {
-                        auto lk = std::unique_lock{race_state->mtx};
-                        if (race_state->winner.has_value())
-                        {
-                            if (--race_state->remaining == 0)
-                            {
-                                lk.unlock(); // LOCK_RELEASE: reviewed — notify outside the lock so the
-                                             // waiter does not immediately block on it.
-                                race_state->cv.notify_one();
-                            }
-                            return;
-                        }
-                    }
-                    auto tx =
-                        federation::make_outbound_make_membership(federation::FederationEndpoint::make_join, cand,
-                                                                  our_server_copy, room_id_copy, user_id_copy, sv_copy);
-                    auto [ok, body] = perform_sync_outbound_call(runtime, room_id_copy, tx, key_id_copy, secret_key,
-                                                                 "room.join.remote.make_join_failed", per_call_timeout);
-                    auto lk = std::unique_lock{race_state->mtx};
-                    if (ok && !race_state->winner.has_value())
-                    {
-                        race_state->winner = {cand, std::move(body)};
-                    }
-                    else if (!ok && !race_state->winner.has_value())
-                    {
-                        race_state->last_error = std::move(body);
-                    }
-                    if (--race_state->remaining == 0 || race_state->winner.has_value())
-                    {
-                        lk.unlock(); // LOCK_RELEASE: reviewed — notify outside the lock so the waiter
-                                     // does not immediately block on it.
-                        race_state->cv.notify_one();
-                    }
-                }));
-        }
-        // Block until first winner, all candidates exhausted, or the overall race
-        // deadline elapses — whichever comes first. The deadline bounds the WHOLE
-        // race (unlike per_call_timeout, which bounds one candidate), so a large via
-        // list cannot grind past what a calling client's own HTTP timeout allows.
-        // A deadline of 0 (unconfigured) preserves the old unbounded wait.
-        auto race_deadline_exceeded = false;
-        {
-            auto lk = std::unique_lock{race_state->mtx};
-            auto const predicate = [&race_state] {
-                return race_state->winner.has_value() || race_state->remaining <= 0;
-            };
-            if (runtime.federation.config.join_race_deadline_seconds > 0U)
-            {
-                auto const deadline = std::chrono::steady_clock::now() +
-                                      std::chrono::seconds(runtime.federation.config.join_race_deadline_seconds);
-                race_deadline_exceeded = !race_state->cv.wait_until(lk, deadline, predicate);
-            }
-            else
-            {
-                race_state->cv.wait(lk, predicate);
-            }
-        }
-        // Park still-running losers in orphan_futures_; discard completed ones.
-        {
-            auto orphan_lk = std::lock_guard{runtime.orphan_futures_mutex_};
-            for (auto& f : race_futures)
-            {
-                if (!f.valid())
-                {
-                    continue;
-                }
-                if (f.wait_for(std::chrono::seconds{0}) == std::future_status::ready)
-                {
-                    // Completed loser — let the future destructor clean up silently.
-                }
-                else
-                {
-                    runtime.orphan_futures_.push_back(std::move(f));
-                }
-            }
-        }
-        if (!race_state->winner.has_value())
-        {
-            auto const reason =
-                race_deadline_exceeded ? "make_join race deadline exceeded" : "make_join failed via all candidates";
-            log_diagnostic("room.join.rejected",
-                           {
-                               {"actor",   user_id_copy, false},
-                               {"room_id", room_id_copy, false},
-                               {"status",  "502",        false},
-                               {"reason",  reason,       false}
-            },
-                           observability::LogEventSeverity::warning);
-            auto const message = race_deadline_exceeded
-                                     ? "make_join failed: race deadline exceeded before any candidate succeeded"
-                                     : "make_join failed: " + race_state->last_error;
-            return make_operation_result(false, {}, message, 502U);
-        }
-        auto [remote_server, make_body] = std::move(*race_state->winner);
-        // Parse the make_join response and validate the template before we sign it.
-        auto const make_response = canonicaljson::parse_lossless(make_body);
-        auto const* make_obj = std::get_if<canonicaljson::Object>(&make_response.value.storage());
-        if (make_obj == nullptr)
-        {
-            log_diagnostic("room.join.rejected", {
-                                                     {"actor",   *user_id,                   false},
-                                                     {"room_id", std::string{room_id},       false},
-                                                     {"status",  "502",                      false},
-                                                     {"reason",  "malformed make_join body", false}
-            });
-            return make_operation_result(false, {}, "malformed make_join response", 502U);
-        }
-        auto const validated = validate_make_join_event(room_id, *user_id, *make_obj);
-        if (!validated.ok)
-        {
-            log_diagnostic("room.join.rejected", {
-                                                     {"actor",   *user_id,             false},
-                                                     {"room_id", std::string{room_id}, false},
-                                                     {"status",  "502",                false},
-                                                     {"reason",  validated.reason,     false}
-            });
-            return make_operation_result(false, {}, validated.reason, 502U);
-        }
-        auto const room_version = validated.room_version;
-        auto event_object = validated.event;
-        // Compute and attach the content hash (hashes.sha256) before signing.
-        // The Matrix spec requires every PDU to carry this field (room versions >= 2).
-        // Without it, Synapse rejects send_join with:
-        //   SynapseError: 400 - Malformed 'hashes': <class 'NoneType'>
-        auto const content_hash = events::make_content_hash(canonicaljson::Value{event_object});
-        if (!content_hash.error.empty())
-        {
-            log_diagnostic("room.join.rejected", {
-                                                     {"actor",   *user_id,             false},
-                                                     {"room_id", std::string{room_id}, false},
-                                                     {"status",  "500",                false},
-                                                     {"reason",  content_hash.error,   false}
-            });
-            return make_operation_result(false, {}, "join event content hash failed", 500U);
-        }
-        auto hashes_obj = canonicaljson::Object{};
-        hashes_obj.push_back(canonicaljson::make_member("sha256", canonicaljson::Value{content_hash.sha256}));
-        event_object.push_back(canonicaljson::make_member("hashes", canonicaljson::Value{std::move(hashes_obj)}));
-
-        auto event_to_sign = canonicaljson::Value{event_object};
-        // Sign the event with our server's signing key.
-        // signing_key is guaranteed non-empty here: perform_sync_outbound_call
-        // validates secret_key size before executing make_join, so a failed key
-        // means make_ok was false and we returned 502 above.
-        if (runtime.crypto_provider == nullptr)
-        {
-            log_diagnostic("room.join.rejected", {
-                                                     {"actor",   *user_id,                                false},
-                                                     {"room_id", std::string{room_id},                    false},
-                                                     {"status",  "500",                                   false},
-                                                     {"reason",  "server signing provider not available", false}
-            });
-            return make_operation_result(false, {}, "server signing provider not available", 500U);
-        }
-        auto key_store = RuntimeSigningKeyStore{our_server, signing_key.value()};
-        auto const* policy = rooms::find_room_version_policy(room_version);
-        if (policy == nullptr)
-        {
-            log_diagnostic("room.join.rejected", {
-                                                     {"actor",   *user_id,                      false},
-                                                     {"room_id", std::string{room_id},          false},
-                                                     {"status",  "500",                         false},
-                                                     {"reason",  "room version policy missing", false}
-            });
-            return make_operation_result(false, {}, "room version policy missing", 500U);
-        }
-        auto const signed_event =
-            events::sign_event_for_server(event_to_sign, *policy, key_store, *runtime.crypto_provider, our_server);
-        if (!signed_event.error.empty())
-        {
-            log_diagnostic("room.join.rejected", {
-                                                     {"actor",   *user_id,             false},
-                                                     {"room_id", std::string{room_id}, false},
-                                                     {"status",  "500",                false},
-                                                     {"reason",  signed_event.error,   false}
-            });
-            return make_operation_result(false, {}, "event signing failed", 500U);
-        }
-        // Compute the event_id from the signed event (room v10+ uses
-        // reference hash-based event IDs).
-        auto const signed_value = canonicaljson::parse_lossless(signed_event.event_json);
-        auto const event_id_result = events::make_reference_hash_event_id(signed_value.value, *policy);
-        if (event_id_result.error.empty() && event_id_result.event_id.empty())
-        {
-            log_diagnostic("room.join.rejected", {
-                                                     {"actor",   *user_id,                      false},
-                                                     {"room_id", std::string{room_id},          false},
-                                                     {"status",  "500",                         false},
-                                                     {"reason",  "event_id computation failed", false}
-            });
-            return make_operation_result(false, {}, "event_id computation failed", 500U);
-        }
-        // Send the signed join event via send_join.
-        auto send_join_tx = federation::make_outbound_send_membership(
-            federation::FederationEndpoint::send_join, remote_server, our_server, room_id, event_id_result.event_id,
-            signed_event.event_json);
-        log_diagnostic("room.join.remote.send_join", {
-                                                         {"actor",         *user_id,                   false},
-                                                         {"room_id",       std::string{room_id},       false},
-                                                         {"remote_server", std::string{remote_server}, false},
-                                                         {"event_id",      event_id_result.event_id,   false}
-        });
-        // send_join can return megabytes of room state for large rooms, so give it
-        // the full join budget rather than the shorter remote_timeout used for key
-        // and discovery calls.  Mirror the same fallback chain as make_join.
-        auto const send_join_timeout = runtime.federation.config.join_timeout_seconds > 0U
-                                           ? runtime.federation.config.join_timeout_seconds
-                                           : runtime.federation.config.remote_timeout_seconds;
-        auto const [send_ok, send_body] = perform_sync_outbound_call(
-            runtime, room_id, send_join_tx, key_id, secret_key, "room.join.remote.send_join_failed", send_join_timeout,
-            runtime.federation.config.join_response_max_bytes);
-        if (!send_ok)
-        {
-            log_diagnostic("room.join.rejected",
-                           {
-                               {"actor",   *user_id,             false},
-                               {"room_id", std::string{room_id}, false},
-                               {"status",  "502",                false},
-                               {"reason",  "send_join failed",   false}
-            },
-                           observability::LogEventSeverity::warning);
-            return make_operation_result(false, {}, "send_join failed: " + send_body, 502U);
-        }
-        // Parse the send_join response. The v2 send_join response is
-        // ["200", { ... }] per MSC328; extract the inner object.
-        auto send_response = canonicaljson::parse_lossless(send_body);
-        auto const* send_obj = std::get_if<canonicaljson::Object>(&send_response.value.storage());
-        // If wrapped in ["200", {...}], unwrap the array element.
-        auto const* send_arr = std::get_if<canonicaljson::Array>(&send_response.value.storage());
-        if (send_arr != nullptr && send_arr->size() >= 2U)
-        {
-            auto const* inner = std::get_if<canonicaljson::Object>(&(*send_arr)[1].storage());
-            if (inner != nullptr)
-            {
-                send_obj = inner;
-            }
-        }
-        if (send_obj == nullptr)
-        {
-            log_diagnostic("room.join.rejected", {
-                                                     {"actor",   *user_id,                       false},
-                                                     {"room_id", std::string{room_id},           false},
-                                                     {"status",  "502",                          false},
-                                                     {"reason",  "malformed send_join response", false}
-            });
-            return make_operation_result(false, {}, "malformed send_join response", 502U);
-        }
-        // Fast join: split the state array into "critical" state (everything
-        // except OTHER users' m.room.member — create, power_levels, join_rules,
-        // history_visibility, encryption, our own membership, etc.) and
-        // "background" state (every other member's m.room.member). Critical
-        // state is small — usually a handful of events from one or two signing
-        // domains — and is verified and persisted before this call returns, so
-        // the room is immediately usable (auth checks on the joining user's own
-        // actions only ever depend on critical state). The bulk of a large
-        // room's membership list, and its potentially hundreds of distinct
-        // signing domains, is verified and persisted in the background after
-        // the join response is returned to the client — this is the same
-        // "partial state room" trade-off Synapse's faster-joins feature makes.
-        // Signature verification itself (network-bound key resolution) runs
-        // BEFORE guard.lock() below so it never holds runtime.mutex.
-        auto const state_arr_member = std::ranges::find_if(*send_obj, [](canonicaljson::ObjectMember const& m) {
-            return m.key == "state";
-        });
-        auto const* state_arr = state_arr_member != send_obj->end()
-                                    ? std::get_if<canonicaljson::Array>(&state_arr_member->value->storage())
-                                    : nullptr;
-        auto state_split =
-            state_arr != nullptr ? split_send_join_state_events(*state_arr, *user_id) : SendJoinStateSplit{};
-        auto& critical_state = state_split.critical;
-        auto& background_state = state_split.background;
-        auto const background_member_count = background_state.size();
-        // Verify each event's signature before it enters the event graph
-        // (src/federation/AGENTS.md rule 2) — resolves distinct sender-domain
-        // signing keys with bounded parallelism rather than trusting the
-        // resident server's response wholesale. Unverifiable events are
-        // silently dropped, not persisted.
-        auto const verified_critical_state =
-            filter_verified_send_join_events(runtime, critical_state, *policy, our_server);
-        auto const auth_arr_member = std::ranges::find_if(*send_obj, [](canonicaljson::ObjectMember const& m) {
-            return m.key == "auth_chain";
-        });
-        auto const* auth_arr = auth_arr_member != send_obj->end()
-                                   ? std::get_if<canonicaljson::Array>(&auth_arr_member->value->storage())
-                                   : nullptr;
-        auto const verified_auth_chain = auth_arr != nullptr
-                                             ? filter_verified_send_join_events(runtime, *auth_arr, *policy, our_server)
-                                             : canonicaljson::Array{};
-
-        guard.lock();
+        auto const& policy = joined.policy;
+        auto const& remote_server = joined.remote_server;
+        auto const& signed_event = joined.signed_event;
+        auto const& signed_event_value = joined.signed_event_value;
+        auto const& event_id_result = joined.event_id_result;
+        auto const& verified_critical_state = joined.verified_critical_state;
+        auto const& verified_auth_chain = joined.verified_auth_chain;
+        auto background_state = std::move(joined.background_state);
+        auto const background_member_count = joined.background_member_count;
         // Persist the room locally with the joined user as a member.
         // State events from the remote response are persisted to the
         // database so the room has enough state for auth checks.
@@ -3753,14 +3851,14 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
         // (m.room.encryption, m.room.create, m.room.power_levels, etc.) by
         // checking the raw JSON for the presence of the "state_key" field
         // rather than its emptiness.
-        auto const state_members = ingest_send_join_state(runtime, verified_critical_state, *policy);
+        auto const state_members = ingest_send_join_state(runtime, verified_critical_state, policy);
         for (auto const& m : state_members)
         {
             append_unique_member(joined_members, m);
         }
         // Persist auth chain events for auth-rule resolution. Signatures were
-        // already verified above (filter_verified_send_join_events), before
-        // guard.lock() was taken.
+        // already verified inside perform_federated_join, with runtime.mutex
+        // released.
         for (auto const& auth_entry : verified_auth_chain)
         {
             auto const serialized = canonicaljson::serialize_canonical(auth_entry);
@@ -3773,9 +3871,9 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
                     auto event_id = std::string{};
                     if (entry_obj != nullptr)
                     {
-                        if (policy->event_id_format == rooms::EventIdFormat::reference_hash)
+                        if (policy.event_id_format == rooms::EventIdFormat::reference_hash)
                         {
-                            auto const eid = events::make_reference_hash_event_id(auth_entry, *policy);
+                            auto const eid = events::make_reference_hash_event_id(auth_entry, policy);
                             event_id = eid.event_id;
                         }
                         else
@@ -3817,7 +3915,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
                         {
                             return parsed.event.room_id;
                         }
-                        if (policy != nullptr && policy->create_event_is_room_id && !event_id.empty())
+                        if (policy.create_event_is_room_id && !event_id.empty())
                         {
                             return "!" + event_id.substr(1);
                         }
@@ -3882,7 +3980,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
             auto join_depth = std::uint64_t{0U};
             auto join_prev_ids = std::vector<std::string>{};
             auto join_auth_ids = std::vector<std::string>{};
-            if (auto const* obj = std::get_if<canonicaljson::Object>(&signed_value.value.storage()))
+            if (auto const* obj = std::get_if<canonicaljson::Object>(&signed_event_value.storage()))
             {
                 if (auto const* d = json_integer_member(*obj, "depth"); d != nullptr && *d >= 0)
                 {
@@ -4019,14 +4117,14 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
         {
             auto room_id_bg = std::string{room_id};
             auto our_server_bg = our_server;
-            auto policy_bg = *policy;
+            auto policy_bg = policy;
             auto bg_future =
                 std::async(std::launch::async, [&runtime, room_id_bg, our_server_bg, policy_bg, background_member_count,
                                                 background_state_bg = std::move(background_state)]() mutable {
                     // Network-bound key resolution — deliberately outside runtime.mutex.
                     auto const verified =
                         filter_verified_send_join_events(runtime, background_state_bg, policy_bg, our_server_bg);
-                    auto bg_guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+                    auto bg_guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
                     auto const newly_joined = ingest_send_join_state(runtime, verified, policy_bg);
                     auto stored = std::size_t{0U};
                     auto const room_it = std::ranges::find_if(runtime.database.rooms, [&](LocalRoom const& r) {
@@ -4275,7 +4373,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto leave_room(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id)
     -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     log_diagnostic("room.leave.started", {
                                              {"room_id",          std::string{room_id},                    false},
                                              {"has_access_token", access_token.empty() ? "false" : "true", false}
@@ -4405,7 +4503,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
         // perform_sync_outbound_call, which previously left the mutex down for
         // this thread and the next request it served.
         {
-            auto const released = merovingian::homeserver::ScopedGuardRelease{guard};
+            auto const released = merovingian::homeserver::RuntimeLockRelease{guard};
 
             // Step 1: make_leave — fetch a leave event template from the remote server.
             auto make_leave_tx = federation::make_outbound_make_membership(
@@ -4620,7 +4718,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto invite_user(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id,
                                std::string_view target_user_id, std::string_view reason) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4647,6 +4745,27 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
     return make_operation_result(true, std::string{room_id});
 }
 
+namespace
+{
+
+// What the identity-server round trip in `invite_user_by_threepid` hands back
+// across the re-lock. An engaged `failure` means the IS did not produce a
+// usable invite, and the caller returns it verbatim.
+struct ThirdPartyInviteFetch final
+{
+    std::optional<OperationResult> failure{};
+    std::string event_json{};
+};
+
+[[nodiscard]] auto third_party_invite_failure(std::string reason, std::uint16_t status) -> ThirdPartyInviteFetch
+{
+    auto fetch = ThirdPartyInviteFetch{};
+    fetch.failure = make_operation_result(false, {}, std::move(reason), status);
+    return fetch;
+}
+
+} // namespace
+
 [[nodiscard]] auto invite_user_by_threepid(HomeserverRuntime& runtime, std::string_view access_token,
                                            std::string_view room_id, std::string_view id_server,
                                            std::string_view medium, std::string_view address,
@@ -4658,11 +4777,10 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
     // unless `id_server` is an operator-trusted IS it can actually reach, and
     // fails closed on any IS error. Spec: client-server-api.md § Inviting a user
     // via a third-party identifier; identity-service-api.md § store-invite.
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex, std::defer_lock};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
 
     // Validation under the lock: auth, room, membership, and that `id_server`
     // names an operator-trusted identity server.
-    guard.lock();
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4697,52 +4815,72 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
     {
         return make_operation_result(false, {}, "identity server is not trusted", 403U);
     }
-    auto base_url = std::string{*trusted_match};
-    guard.unlock(); // LOCK_RELEASE: reviewed — the identity-server call below is network-bound and must
-                    // not hold runtime.mutex. The guard is function-local, so every exit from here
-                    // releases it rather than stranding it.
+    auto const base_url = std::string{*trusted_match};
 
-    // IS store-invite call: network-bound, deliberately outside runtime.mutex
-    // (matches the convention at filter_verified_send_join_events above).
-    if (runtime.outbound_client == nullptr || runtime.cached_discovery == nullptr)
-    {
-        return make_operation_result(false, {}, "identity server is not reachable", 502U);
-    }
-    auto id_client = merovingian::identity::IdentityServerClient{*runtime.outbound_client, *runtime.cached_discovery,
-                                                                 runtime.config.server().identity_server,
-                                                                 &runtime.test_forced_identity_resolution};
-    auto const invite = id_client.store_invite(base_url, id_access_token, medium, address, room_id, *user_id);
-    if (!invite.ok)
-    {
-        return make_operation_result(false, {}, "identity server is not reachable", 502U);
-    }
-    if (invite.status != 200U)
-    {
-        // IS-level rejection (e.g. 401 bad id_access_token, 404 unbound 3PID).
-        // Fail closed; never fall back to a local-only, unverifiable invite.
-        return make_operation_result(false, {}, "identity server rejected the invite", invite.status);
-    }
-    auto const parsed = merovingian::identity::parse_store_invite_response(invite.body);
-    if (!parsed.has_value() || parsed->public_keys.empty())
-    {
-        return make_operation_result(false, {}, "identity server returned a malformed store-invite response", 502U);
-    }
+    // The IS store-invite round trip is network-bound and runs with
+    // runtime.mutex released. RuntimeLockRelease drops every recursion level
+    // this thread holds, not just this function’s own guard: the client-server
+    // dispatcher already holds the mutex for the whole request, so releasing
+    // one level left it locked for the length of the IS call and stalled every
+    // other request behind it — the 0.12.1 create_room defect and the 0.12.3
+    // leave_room defect, in a third place. Regression cover:
+    // tests/integration/test_request_lock_contention_flow.cpp.
+    //
+    // The block is a lambda so the scope boundary is the lock boundary: every
+    // value it produces is returned rather than declared above the release and
+    // assigned inside it.
+    auto const fetched = [&]() -> ThirdPartyInviteFetch {
+        auto const released = RuntimeLockRelease{guard};
+        std::ignore = released;
+        if (runtime.outbound_client == nullptr || runtime.cached_discovery == nullptr)
+        {
+            return third_party_invite_failure("identity server is not reachable", 502U);
+        }
+        auto id_client = merovingian::identity::IdentityServerClient{
+            *runtime.outbound_client, *runtime.cached_discovery, runtime.config.server().identity_server,
+            &runtime.test_forced_identity_resolution};
+        auto const invite = id_client.store_invite(base_url, id_access_token, medium, address, room_id, *user_id);
+        if (!invite.ok)
+        {
+            return third_party_invite_failure("identity server is not reachable", 502U);
+        }
+        if (invite.status != 200U)
+        {
+            // IS-level rejection (e.g. 401 bad id_access_token, 404 unbound
+            // 3PID). Fail closed; never fall back to a local-only,
+            // unverifiable invite.
+            return third_party_invite_failure("identity server rejected the invite", invite.status);
+        }
+        auto const parsed = merovingian::identity::parse_store_invite_response(invite.body);
+        if (!parsed.has_value() || parsed->public_keys.empty())
+        {
+            return third_party_invite_failure("identity server returned a malformed store-invite response", 502U);
+        }
 
-    // The ephemeral key (last entry) signs the join-side `signed` blob; the
-    // long-term key is first. Carry the ephemeral key as the top-level
-    // public_key and list every key in public_keys so joining servers can
-    // verify via key_validity_url.
-    auto const& ephemeral = parsed->public_keys.back();
-    auto const display_name = parsed->display_name.empty() ? std::string{address} : parsed->display_name;
-    auto const event_json = serialize_third_party_invite_event_json(
-        parsed->token, ephemeral.public_key, ephemeral.key_validity_url, parsed->public_keys, display_name);
-    if (!event_json.has_value())
+        // The ephemeral key (last entry) signs the join-side `signed` blob; the
+        // long-term key is first. Carry the ephemeral key as the top-level
+        // public_key and list every key in public_keys so joining servers can
+        // verify via key_validity_url.
+        auto const& ephemeral = parsed->public_keys.back();
+        auto const display_name = parsed->display_name.empty() ? std::string{address} : parsed->display_name;
+        auto const serialized = serialize_third_party_invite_event_json(
+            parsed->token, ephemeral.public_key, ephemeral.key_validity_url, parsed->public_keys, display_name);
+        if (!serialized.has_value())
+        {
+            return third_party_invite_failure("third-party invite event serialization failed", 500U);
+        }
+        auto fetch = ThirdPartyInviteFetch{};
+        fetch.event_json = *serialized;
+        return fetch;
+    }();
+    if (fetched.failure.has_value())
     {
-        return make_operation_result(false, {}, "third-party invite event serialization failed", 500U);
+        return *fetched.failure;
     }
+    auto const& event_json = fetched.event_json;
 
-    // Re-lock and persist: room state may have changed during the IS round-trip.
-    guard.lock();
+    // Room state may have changed during the IS round-trip, so re-validate now
+    // that the mutex is held again.
     auto* room_after = find_room(runtime.database, room_id);
     if (room_after == nullptr)
     {
@@ -4752,7 +4890,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
     {
         return make_operation_result(false, {}, "user is not joined", 403U);
     }
-    auto const composed = compose_signed_event(runtime, room_id, *user_id, *event_json);
+    auto const composed = compose_signed_event(runtime, room_id, *user_id, event_json);
     if (!composed.has_value())
     {
         return make_operation_result(false, {}, "third-party invite event rejected", 403U);
@@ -4807,7 +4945,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto ban_user(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id,
                             std::string_view target_user_id, std::string_view reason) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4837,7 +4975,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto kick_user(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id,
                              std::string_view target_user_id, std::string_view reason) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4867,7 +5005,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto unban_user(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id,
                               std::string_view target_user_id) -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4906,7 +5044,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto forget_room(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id)
     -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -4951,7 +5089,7 @@ auto split_send_join_state_events(canonicaljson::Array const& state_arr, std::st
 [[nodiscard]] auto knock_room(HomeserverRuntime& runtime, std::string_view access_token, std::string_view room_id)
     -> OperationResult
 {
-    auto guard = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+    auto guard = std::unique_lock<RuntimeMutex>{runtime.mutex};
     auto const user_id = authenticated_user(runtime, access_token);
     if (!user_id.has_value())
     {
@@ -5458,7 +5596,7 @@ namespace
             auto const result = client.notify(delivery.pusher.data_url, delivery.notification);
             if (result.ok && !result.rejected_pushkeys.empty())
             {
-                auto lock = std::unique_lock<std::recursive_mutex>{runtime.mutex};
+                auto lock = std::unique_lock<RuntimeMutex>{runtime.mutex};
                 std::ignore = database::delete_pusher(runtime.database.persistent_store, delivery.pusher.user_id,
                                                       delivery.pusher.app_id, delivery.pusher.pushkey);
             }
@@ -5579,7 +5717,7 @@ namespace
     // this event by the caller before this runs, so this only ever needs to
     // either commit (clear pending, raise delivered_stream_ordering) or
     // leave the pending state exactly as it was for a later retry. Performs
-    // the network call outside runtime.mutex (NetworkIoUnlock) but is itself
+    // the network call outside runtime.mutex (RuntimeLockRelease) but is itself
     // synchronous — the caller's request waits for it — see
     // dispatch_appservice_delivery's doc comment for why.
     auto attempt_appservice_batch(HomeserverRuntime& runtime, appservice::AppserviceRegistration const& registration,
@@ -5591,7 +5729,7 @@ namespace
         transaction.events.push_back(std::move(event));
 
         auto const result = [&]() {
-            auto const unlocked = NetworkIoUnlock{};
+            auto const unlocked = RuntimeLockRelease{};
             auto client = appservice::AppserviceClient{*runtime.outbound_client, *runtime.cached_discovery};
             return client.send_transaction(registration, transaction);
         }();

@@ -106,7 +106,7 @@ users and rooms on demand, so a flat 404 makes the namespace pointless.
 - **A failing appservice is a miss, not an error.** Unreachable or declining
   contributes nothing; the next candidate is tried and the request ultimately
   404s. A bridge being down must never turn a 404 into a 502.
-- Both outbound calls use `homeserver::ScopedGuardRelease`, so `runtime.mutex`
+- Both outbound calls use `homeserver::RuntimeLockRelease`, so `runtime.mutex`
   is released for the round trip and restored even if the call throws.
 - Covered by `tests/integration/test_appservice_query_hooks_flow.cpp`, which
   asserts on the bytes actually sent — the outbound half was dead code for its

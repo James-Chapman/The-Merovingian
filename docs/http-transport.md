@@ -511,7 +511,7 @@ reads for 20–44 seconds at a time.
 
 The entry points now publish their guard through
 `homeserver::RequestLockScope`, and each blocking network call runs inside a
-`homeserver::NetworkIoUnlock` scope that releases the mutex for the round trip
+`homeserver::RuntimeLockRelease` scope that releases the mutex for the round trip
 and re-acquires it on exit — including when the call throws. Both types live in
 [`include/merovingian/homeserver/request_lock.hpp`](../include/merovingian/homeserver/request_lock.hpp).
 
@@ -521,9 +521,11 @@ Rules for anything added to these paths:
   runtime state stay outside it, before or after.
 - Request signing stays under the lock: `OutboundCall::secret_key` borrows a
   span into the runtime's `SecretBuffer`, which the lock protects.
-- The scope is a no-op when no guard is published (the federation worker, a test
-  calling a service function directly) or when a caller already released the
-  lock by hand, so it composes with the existing `unlock()`/`lock()` pairs.
+- The scope is a no-op when no guard is published and none is passed in (the
+  federation worker, a test calling a service function directly).
+- It releases **every** recursion level the calling thread holds, not only the
+  guard it was handed, and restores exactly that many on exit. See "One release
+  primitive" below for why that matters.
 
 ### `resolve_policy_server_hook` (0.12.1)
 
@@ -541,7 +543,7 @@ despite #415.
 
 The fix wraps the remainder of `resolve_policy_server_hook` — the injectable
 `trust_safety_policy_server` test hook and the real
-`OutboundClient::perform` call alike — in one `NetworkIoUnlock` scope, so
+`OutboundClient::perform` call alike — in one `RuntimeLockRelease` scope, so
 every call site is fixed at the source rather than needing four separate
 call-site changes. Everything the function still reads
 (`trust_safety_config`, `runtime.config`, the request built from them) is
@@ -551,83 +553,115 @@ for the regression coverage (registration, room creation, and media
 download, each gated on a blocking policy-server hook while an unrelated
 request is asserted to complete promptly).
 
-### `NetworkIoUnlock` was incomplete for recursive acquisitions (0.12.1)
+### One release primitive, and why it drains every level (0.12.1 - 0.12.6)
 
-`HomeserverRuntime::mutex` is a `std::recursive_mutex` specifically so that a
-service function such as `create_room` can take its own lock and remain
-independently callable outside a request handler (`local_smoke_flow.cpp` does
-exactly this). But `create_room` is *also* called directly from
-`client_server.cpp`, which already holds its own outer guard for the whole
-request. `std::recursive_mutex` permits that nested acquisition silently — the
-same thread simply increments a recursion count — so nothing failed loudly.
+`HomeserverRuntime::mutex` is a recursive mutex specifically so that a service
+function such as `create_room` can take its own lock and remain independently
+callable outside a request handler (`local_smoke_flow.cpp` does exactly this).
+But `create_room` is *also* called from `client_server.cpp`, which already
+holds its own outer guard for the whole request. A recursive mutex permits that
+nested acquisition silently — the same thread increments a recursion count — so
+nothing failed loudly.
 
-The problem: `NetworkIoUnlock` releases exactly one `std::unique_lock`, the
-one published via `RequestLockScope`. When the room-creation regression test
-above gated `create_room`'s call into `resolve_policy_server_hook`, the
-outer guard (published) got released, but `create_room`'s own inner guard —
-the second, nested acquisition, and the one actually in lexical scope at the
-point of the network call — was never touched. The mutex stayed held by that
-thread for the full duration of the (attempted) unlock, and a concurrent
-request on another thread blocked forever waiting for the same
-`recursive_mutex`. **This means the `NetworkIoUnlock` mechanism, as shipped
-in 0.11.13, was correct only for call chains with exactly one lock
-acquisition on the stack; it silently did nothing for any chain that passed
-through a second, self-locking function.** The room-creation regression test
-caught this by deadlocking rather than by a failed assertion — the strongest
-possible signal that a lock invariant, not just a status code, was wrong.
+The consequence: `unlock()` drops one level, not the lock. A handler that
+released the guard it had in hand, while an outer frame still held one, kept
+the mutex locked for the entire duration of the network call it thought it had
+released it for. Every other client request and every inbound federation
+transaction blocked behind it for the length of the remote timeout.
 
-Fixed by publishing `RequestLockScope` around `create_room`'s own guard
-(`room_service.cpp`) and releasing the caller's outer guard with
-`guard.unlock()` before delegating to `create_room` — `guard.lock()`
-afterward, when later code still needs the lock — at all three call sites
-(`client_server.cpp` ×2: create and room-upgrade; `local_http_router.cpp` ×1).
-This is the same unlock/call/relock idiom `local_http_router.cpp` already
-used for `join_room`, so `create_room`'s own guard becomes the *only* lock in
-scope and the one `NetworkIoUnlock` actually finds and releases.
+That defect reached production three times, in three different shapes, found
+three different ways:
 
-**`join_room` and `leave_room` have the identical self-locking shape but NOT
-the same gap** — checked in 0.12.2, and the suspicion recorded here in 0.12.1
-was wrong. Both already release their guard around the federation round trip
-with hand-written `guard.unlock()`/`guard.lock()` pairs, so the mutex is not
-held across `make_join`/`send_join`/`make_leave`. The regression written to
-expose the supposed stall — a remote join against a peer that accepts and
-withholds, asserting an unrelated request stays inside the responsiveness
-budget — passes against the unfixed code, and is kept so the property cannot
-regress silently.
+| Where | Version | How it was found |
+|---|---|---|
+| `create_room` via `resolve_policy_server_hook` | 0.12.1 | A regression test deadlocked rather than failing an assertion |
+| `leave_room` via the client leave route | 0.12.3 | Review on #485; it had been documented as closed when it was not |
+| `invite_user_by_threepid` via the client invite route | 0.12.6 | A regression test written for issue #487 before any code changed |
 
-What they do carry is the exception-safety gap common to every hand-written
-pair in the codebase: a throw between the release and the re-lock leaves the
-guard down and the next request on that thread running unsynchronised. That is
-the defect `ScopedGuardRelease` exists to remove, and it is why the remaining
-hand-written sites are worth converting even though none of them deadlocks.
+The first two were fixed at the call site, by releasing the caller's guard
+before delegating. That works, but it depends on every future caller of every
+self-locking function remembering to do it, and on choosing between two
+primitives that differed in a way nothing checked: `NetworkIoUnlock` acted on
+the thread's *published* guard (`RequestLockScope`), `ScopedGuardRelease` on a
+guard *in hand*. At a nested call site those are different objects, and picking
+the wrong one produced code that compiled, passed its tests, and held a global
+mutex across a network round trip.
 
-`leave_room` is converted (0.12.2): its nine hand-written re-locks are gone and
-the whole three-round-trip exchange sits in one scoped release, so the guard is
-restored on every exit including a throw.
+0.12.6 removes the choice. There is one primitive,
+`homeserver::RuntimeLockRelease`, whose two constructors say only which
+`unique_lock` should observe the release:
 
-**That alone did not close the stall**, which review on #485 caught. The client
-dispatcher holds its own guard on the same recursive mutex for the duration of
-the request, so a release inside `leave_room` drops only the depth the callee
-added — the mutex stays held across `make_leave`/`send_leave`. The leave route
-therefore releases the dispatcher's guard around the call too, with
-`ScopedGuardRelease` rather than a hand-written pair. This is the same failure
-shape as `create_room`, found twice by different means, which is why the
-remaining hand-written sites are tracked for removal in issue #487 rather than
-audited individually. The one value consumed after the
-scope — the `send_leave` result, needed by the membership write that must hold
-the lock — is declared before it and assigned inside.
+```cpp
+auto const released = RuntimeLockRelease{};        // the thread's published guard
+auto const released = RuntimeLockRelease{guard};   // a guard in hand
+```
 
-**`join_room` is deliberately not converted.** Its released region spans ~350
-lines and nine of the forty-four values declared inside it are consumed after
-the re-lock (`verified_critical_state`, `verified_auth_chain`, `signed_event`,
-`event_id_result` among them). Hoisting those would strip `const` from nine
-declarations, require each type to be default-constructible, and split nine
-initialisations into declare-then-assign — a real loss of const-correctness
-inside a 1019-line function, bought for an exception-safety gain with no live
-bug behind it. The correct fix is to extract the released region into its own
-function returning a result struct, at which point the scope boundary becomes
-the function boundary and nothing needs hoisting. That is a refactor, not a
-lock-idiom swap, and is tracked as such rather than attempted piecemeal.
+Both release **every recursion level the calling thread holds** and restore
+exactly that many on scope exit, including when the guarded call throws. They
+can do so because `runtime.mutex` is now a `homeserver::RuntimeMutex`
+([`runtime_mutex.hpp`](../include/merovingian/homeserver/runtime_mutex.hpp)):
+a `std::recursive_mutex` that also records its owning thread, so a release
+scope can ask `held_by_current_thread()` and keep unlocking until the answer is
+no. `std::recursive_mutex` cannot answer that question, which is why the
+mechanism could not be made safe without the wrapper.
+
+A release scope drops those levels through the mutex, never through a guard:
+the levels belong to `unique_lock` objects in frames it cannot reach. **Every
+`unique_lock` on the mutex therefore keeps reporting `owns_lock() == true` for
+the lifetime of the scope, the one passed in included.** That is sound only
+because nothing outside `request_lock.cpp` reads the flag and the depth is
+restored exactly before any guard can act on it. An earlier revision of this
+change released the named guard first and drained the rest through the mutex;
+review on #490 caught that an inner scope reaching for the thread's published
+guard would then act on a stale flag, unlock a mutex the thread no longer held,
+underflow the recursion depth, and strand `runtime.mutex` locked for the life
+of the process. Nested scopes now read `held_by_current_thread()` and correctly
+find nothing left to release; the regression is
+`tests/unit/test_request_lock.cpp`, "release scopes nest without corrupting the
+recursion depth", which fails against the old shape with `Operation not
+permitted`.
+
+Consequences worth knowing:
+
+- Releasing the caller's guard before calling a self-locking function is no
+  longer necessary. The existing call sites that do (`create_room` and
+  `join_room` in `local_http_router.cpp`, `create_room` in `client_server.cpp`)
+  are kept because they are correct and explicit, not because they are load
+  bearing.
+- A blocking call should open its release scope where the call is, not where
+  the caller is. The callee knows it is about to do network I/O; the caller may
+  not.
+- `RuntimeLockRelease::levels_released()` reports how many levels the scope
+  dropped and will restore. More than one means some outer frame was holding
+  the mutex across this call, which used to be the bug; zero is the normal
+  answer for a nested scope.
+- Do not read `owns_lock()` on a guard to decide anything. It is not updated
+  while a release scope is open, and no code outside the primitive reads it.
+
+### `join_room`, and why the released region became a function
+
+`join_room`'s released region spans roughly 350 lines, and nine of the
+forty-four values declared inside it are consumed after the re-lock
+(`verified_critical_state`, `verified_auth_chain`, `signed_event`,
+`event_id_result` among them). Wrapping it in a release scope mechanically
+would have meant hoisting those nine declarations above the scope: stripping
+`const` from each, requiring every type to be default-constructible, and
+splitting nine initialisations into declare-then-assign inside a 1000-line
+function.
+
+0.12.6 extracts the region into `perform_federated_join`, which returns a
+`FederatedJoinOutcome` carrying exactly those nine values plus an optional
+failure the caller returns verbatim. The lock boundary is now the function
+boundary: nothing needs hoisting, every declaration keeps its `const`, and the
+release itself is a two-line `RuntimeLockRelease` scope around the call. The
+same idea at smaller scale — an immediately-invoked lambda returning a small
+result struct — is what `invite_user_by_threepid` and the three
+`local_http_router.cpp` sites use.
+
+**No hand-written `unlock()`/`lock()` pair around `runtime.mutex` remains in
+`include/` or `src/`.** `scripts/reject-unsafe.sh` rejects new ones, matching
+`->unlock()` as well as `.unlock()` since 0.12.6, and exempting only the two
+files that implement the primitives themselves.
 
 ## Load/soak evidence
 

@@ -50,11 +50,11 @@ class HookToolingTests(unittest.TestCase):
         self.assertTrue(gate.is_file(), "reject-unsafe.sh is missing")
         script = gate.read_text(encoding="utf-8")
 
-        # WHEN a developer replaces a ScopedGuardRelease scope with a manual
+        # WHEN a developer replaces a RuntimeLockRelease scope with a manual
         # unlock/lock pair (0.12.5 security audit, finding 14).
         # THEN the gate rejects it unless they annotate why RAII does not fit.
         self.assertIn("LOCK_RELEASE: reviewed", script)
-        self.assertIn("ScopedGuardRelease", script)
+        self.assertIn("RuntimeLockRelease", script)
         # AND the rule is scoped to production code: tests drive locking
         # primitives directly on purpose, so scanning them would only produce
         # annotations that say "this is a test".
