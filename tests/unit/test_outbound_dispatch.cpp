@@ -671,8 +671,14 @@ SCENARIO("Inbound send_join records remote membership for outbound delivery",
         homeserver.dispatch_worker.reset(worker.get());
         std::ignore = worker.release();
 
+        // public_chat, not the default preset: these scenarios drive a remote
+        // send_join for a user who holds no invite, and membership_acceptor now
+        // runs the room's authorization rules before persisting (M-01). Under the
+        // default private_chat preset that join is correctly refused. These tests
+        // are about device-list and outbound-dispatch behaviour on a join, so the
+        // join itself has to be one the room actually permits.
         auto const room = merovingian::homeserver::handle_client_server_request(
-            runtime, {"POST", "/_matrix/client/v3/createRoom", token, {}});
+            runtime, {"POST", "/_matrix/client/v3/createRoom", token, R"({"preset":"public_chat"})"});
         REQUIRE(room.response.status == 200U);
         auto const id = room_id(room.response.body);
 
@@ -764,8 +770,14 @@ SCENARIO("Inbound send_join records remote membership for outbound delivery",
         homeserver.dispatch_worker.reset(worker.get());
         std::ignore = worker.release();
 
+        // public_chat, not the default preset: these scenarios drive a remote
+        // send_join for a user who holds no invite, and membership_acceptor now
+        // runs the room's authorization rules before persisting (M-01). Under the
+        // default private_chat preset that join is correctly refused. These tests
+        // are about device-list and outbound-dispatch behaviour on a join, so the
+        // join itself has to be one the room actually permits.
         auto const room = merovingian::homeserver::handle_client_server_request(
-            runtime, {"POST", "/_matrix/client/v3/createRoom", token, {}});
+            runtime, {"POST", "/_matrix/client/v3/createRoom", token, R"({"preset":"public_chat"})"});
         REQUIRE(room.response.status == 200U);
         auto const id = room_id(room.response.body);
 

@@ -322,6 +322,8 @@ auto DispatchWorker::run_once() -> bool
     auto call = OutboundCall{};
     call.transaction = transaction;
     call.resolved_host = resolution->resolved_host;
+    // M-02: carry the certificate identity alongside the resolved target.
+    call.tls_server_name = resolution->tls_server_name;
     call.resolved_port = resolution->resolved_port;
     call.pinned_addresses = resolution->pinned_addresses;
     // Take a private copy of the signing identity under the lock: update_signing_identity

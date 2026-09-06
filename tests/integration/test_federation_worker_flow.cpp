@@ -614,11 +614,45 @@ SCENARIO("handle_membership_ingest_request persists a worker-relayed federated j
         REQUIRE(runtime.federation.membership_acceptor);
 
         auto const room_id = std::string{"!membership-room:example.com"};
-        // membership_acceptor's only precondition is that the room exists —
-        // a bare room row is enough; no create/power_levels/join_rules state is
-        // required to persist a join and its m.room.member state row.
+        // membership_acceptor runs the room's authorization rules before it
+        // persists anything (M-01), so a bare room row is no longer enough: with
+        // no m.room.create and no m.room.join_rules in the store there is nothing
+        // for the join to be authorized against, and it is refused. Seed the
+        // minimum real room state a public join needs, so this scenario exercises
+        // the IPC relay it is actually about rather than an unauthorized join.
         REQUIRE(
             merovingian::database::store_room(runtime.database.persistent_store, {room_id, "@resident:example.com"}));
+        {
+            auto const creator = std::string{"@resident:example.com"};
+            auto seed_state = [&](std::string_view event_id, std::string_view type, std::string_view state_key,
+                                  std::string const& content_json, std::uint64_t ordering) {
+                auto event = merovingian::database::PersistentEvent{};
+                event.event_id = std::string{event_id};
+                event.room_id = room_id;
+                event.sender_user_id = creator;
+                event.depth = ordering;
+                event.stream_ordering = ordering;
+                event.json = std::string{R"({"room_id":")"} + room_id + R"(","sender":")" + creator +
+                             R"(","origin_server_ts":1000,"type":")" + std::string{type} + R"(","state_key":")" +
+                             std::string{state_key} + R"(","content":)" + content_json + "}";
+                auto state = merovingian::database::PersistentStateEvent{room_id, std::string{type},
+                                                                        std::string{state_key}, std::string{event_id}};
+                REQUIRE(merovingian::database::store_event_with_state(runtime.database.persistent_store,
+                                                                     std::move(event), state));
+            };
+            // room_version must match the "room_version":"10" the ingest request
+            // below declares, or the event is judged under the wrong rule set.
+            seed_state("$seed-create:example.com", "m.room.create", "",
+                       R"({"room_version":"10","creator":"@resident:example.com"})", 1U);
+            seed_state("$seed-creator-member:example.com", "m.room.member", creator,
+                       R"({"membership":"join"})", 2U);
+            seed_state("$seed-power-levels:example.com", "m.room.power_levels", "",
+                       R"({"users":{"@resident:example.com":100},"users_default":0,"ban":50,"kick":50,"invite":0})",
+                       3U);
+            // public: the remote user holds no invite, so the join is authorized
+            // by the join rule alone.
+            seed_state("$seed-join-rules:example.com", "m.room.join_rules", "", R"({"join_rule":"public"})", 4U);
+        }
 
         WHEN("a membership_ingest request shaped like a real worker's is handled")
         {

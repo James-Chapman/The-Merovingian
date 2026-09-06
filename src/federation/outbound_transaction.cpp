@@ -37,15 +37,20 @@ namespace
     [[nodiscard]] auto build_url(OutboundCall const& call) -> std::string
     {
         auto url = std::string{"https://"};
+        // M-02: the URL host is the TLS identity, not the resolved target. On an
+        // SRV path resolved_host is the SRV target, and the spec requires the
+        // certificate to match the original hostname instead. The connection
+        // still lands on the resolved target because pinned_addresses is bound
+        // to this authority through CURLOPT_RESOLVE.
+        auto const& url_host = call.tls_server_name.empty() ? call.resolved_host : call.tls_server_name;
         // IPv6 literals contain colons that would collide with the port separator
         // in the URL authority, so they must be bracketed per RFC 3986.
-        auto const needs_brackets =
-            call.resolved_host.find(':') != std::string::npos && call.resolved_host.front() != '[';
+        auto const needs_brackets = url_host.find(':') != std::string::npos && url_host.front() != '[';
         if (needs_brackets)
         {
             url += '[';
         }
-        url += call.resolved_host;
+        url += url_host;
         if (needs_brackets)
         {
             url += ']';

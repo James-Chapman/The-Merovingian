@@ -1,3 +1,155 @@
+## 0.12.7
+
+Fixes the eight findings of the 0.12.6 security audit. All eight were verified
+against the code and against the v1.19 spec before any change was made; none
+were misreads.
+
+Two of them are only meaningful together, and two of them were not what the
+audit's suggested remedy would have produced. Both cases are called out below,
+because in each the obvious fix would have looked complete while leaving the
+hole open.
+
+### M-01 (critical): federation membership endpoints persisted state without authorizing it
+
+`send_join`, `send_leave` and `send_knock` verified the inbound PDU's Ed25519
+signature, its content hash, and its sender/origin consistency — and then
+persisted the event and the membership row after checking only that the room
+existed. Signature verification establishes **who signed an event; it never
+establishes whether they are permitted to make the transition.** Any remote
+server holding a valid signing key could therefore join a user into an
+invite-only room, or move a membership it had no power level to move, simply by
+presenting a correctly signed PDU.
+
+The ordinary `/send` transaction path already got this right: `ingest_pdu_event`
+builds an auth-event map and runs `authorize_event_against_auth_events` before
+persisting. The membership acceptor now runs the identical gate, before anything
+reaches the store. A rule enforced on only one of two paths into the same store
+is not enforced at all.
+
+### M-02: SRV delegation moved the TLS identity to the SRV target
+
+Spec §Resolving server names, steps 4 and 5: *"Requests are made to the resolved
+IP address and port, with a `Host` header of `<hostname>`. The target server must
+present a valid certificate for `<hostname>`."* `<hostname>` is the original
+server name — the spec follows those steps with a section explaining precisely
+why the SRV target must **not** be used instead.
+
+`ServerDiscoveryResult` had no field distinguishing "where the packets go" from
+"whose certificate must be presented", so every outbound URL was built from
+`resolved_host` — the SRV target. SRV records are unsigned DNS, so anyone able to
+forge a DNS response could redirect a homeserver to a host presenting a
+certificate for a name it legitimately controls, and be trusted as the origin
+server. That includes `/_matrix/key/v2/server`, the root of trust for every
+signature that server ever makes.
+
+`ServerDiscoveryResult::tls_server_name` now carries the certificate identity —
+the original hostname for the SRV and direct paths, the delegated hostname under
+well-known delegation, never the SRV target. Outbound URLs are built from it,
+while `pinned_addresses` continues to route the connection to the discovered
+target via `CURLOPT_RESOLVE`, so SNI, `Host` and certificate validation all sit
+on the authoritative name. `resolve_destination` takes the certificate host as a
+required parameter rather than deriving it, so a future discovery branch cannot
+silently inherit the wrong one. All three production URL builders were affected,
+not only the key cache cited in the finding.
+
+### M-03: named room-state reads were not authorized at all
+
+`GET /rooms/{roomId}/state/{eventType}/{stateKey}` checked that the room existed
+and then returned the state event's content to **any authenticated user**. The
+two sibling handlers directly above it in the same file both perform a proper
+membership check; this one did not. Its 403 text ("not a member of this room")
+was also returned for a room that simply did not exist.
+
+Per the spec, a joined member now reads current state, and a user who has left
+reads the state as it stood at their leave point — not the current value, which
+would leak everything written after they left. Everyone else, including a user
+with no membership row and a room that does not exist, receives an identical 403,
+so a non-member cannot distinguish the two. A ban denies access outright: the
+spec sentence names "joined" and "has left", and a banned user should not get
+more than the full-state endpoint gives anyone who is not currently joined.
+
+### M-04: logout left the device's refresh token usable
+
+Single-device logout revoked the access token and flipped the in-memory session,
+but never touched the refresh token. `refresh_local_session` admits any refresh
+row that is merely unrevoked, so the client that had just logged out — or anyone
+holding a stolen refresh token — could immediately mint a fresh access token.
+Logout was cosmetic. `logout_all`, device deletion and password change all
+revoked refresh tokens already; single-device logout was the one path that did
+not, and now does.
+
+### M-05: password change resurrected previously revoked tokens
+
+With `logout_devices` (the default), the password-change flow revoked every token
+for the user and then restored the caller's own device with an unfiltered
+`UPDATE access_tokens SET revoked = false WHERE user_id AND device_id`.
+
+That statement cannot distinguish a token it revoked microseconds earlier from
+one revoked days earlier by a logout, an admin action, or a previous password
+change. It un-revoked all of them. **A password change is the action a user takes
+after discovering a compromise, and it handed the attacker's revoked token back.**
+
+The revoke-then-restore pair is replaced by
+`revoke_tokens_for_user_except_device`, which never touches the caller's device,
+so there is nothing to reinstate. `restore_tokens_for_device` is deleted
+outright: no code path can now clear a `revoked` flag. See ADR-0052 — revocation
+is one-way, and that is a rule for future code, not just a fix here.
+
+### M-06 and M-07: request-body and TLS read deadlines (these two only work together)
+
+**M-06:** request-head reads enforced both an overall deadline and an inter-byte
+cap. Request-**body** reads enforced neither — only a fresh 15-second poll per
+4096-byte chunk, so a client dribbling a declared `Content-Length` could hold a
+worker thread for roughly `(bytes / chunk) x 15s` without ever timing out. The
+body now carries both caps, with the overall deadline scaled by the declared
+length at a 16 KiB/s floor so that large media uploads are unaffected while a
+dribbled 1 MiB body is cut at about 94 seconds instead of 65 minutes.
+
+**M-07:** TLS sockets were restored to blocking mode after the handshake, and
+`TlsConnection::read` called `SSL_read_ex` on them. The HTTP layer's
+`poll(POLLIN)` proves that *TCP bytes* are available — never that a *complete TLS
+record* is. A peer sending one byte of a record made the socket readable, entered
+`SSL_read_ex`, and blocked in the kernel indefinitely: past the poll deadline,
+past the head deadline, outside every timeout the server believed it was
+enforcing. One connection could park one worker thread for as long as the
+attacker liked.
+
+Sockets now stay non-blocking for the life of the connection, and one shared
+`pump()` drives `WANT_READ`/`WANT_WRITE` for both reads and writes against a
+deadline. **M-06 is inert on TLS listeners without M-07**, since a body deadline
+means nothing while a single read beneath it can block forever — which is why
+they ship together. See ADR-0054.
+
+### M-08: the thumbnail decoder ran under the general server syscall filter
+
+The thumbnail worker exists so that a libpng or libjpeg-turbo memory-safety bug
+is contained rather than fatal. OpenBSD confines it with `pledge("stdio")` and
+FreeBSD with `cap_enter()` — neither grants filesystem, socket or
+process-creation access. On Linux it installed `apply_seccomp_filter()`, the
+general **server** allowlist, which permits `socket`, `connect`, `sendto`,
+`openat`, `unlinkat`, `execve` and `clone`. On the primary production platform
+the decoder was effectively unconfined, while the file's own comment claimed a
+decoder exploit had "nothing to reach for".
+
+The existing stricter `apply_worker_seccomp_filter()` is **not** a substitute,
+and using it would have looked like a fix while changing almost nothing: it was
+built for the federation worker, removes only `execve`/`execveat`, and still
+permits sockets, `openat` and `clone`. A new decoder profile now matches the
+`pledge("stdio")` boundary, so all three platforms confine the decoder
+equivalently. A regression test asserts the decoder profile is strictly tighter
+than the worker profile, so a later "simplification" onto the shared filter fails
+the suite instead of silently reopening this. See ADR-0053.
+
+### Decisions recorded
+
+- **ADR-0052** — revocation of credentials is one-way; no database function may
+  clear a `revoked` flag.
+- **ADR-0053** — sandbox profiles are named for the threat they contain, not for
+  the kind of process that installs them.
+- **ADR-0054** — TLS sockets stay non-blocking for the life of the connection;
+  nothing below the HTTP layer may perform a blocking I/O call on a connection
+  descriptor.
+
 ## 0.12.6
 
 Closes issue #487: the hand-written `guard.unlock(); f(); guard.lock();` pattern

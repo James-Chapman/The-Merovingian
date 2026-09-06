@@ -1616,6 +1616,9 @@ namespace
     auto const forced_it = runtime.test_forced_outbound_resolution.find(std::string{transaction.destination});
     auto const forced = forced_it != runtime.test_forced_outbound_resolution.end();
     auto resolved_host = std::string{};
+    // M-02: the name the certificate must match, which differs from
+    // resolved_host on SRV-discovered destinations.
+    auto tls_server_name = std::string{};
     auto resolved_port = std::uint16_t{8448U};
     auto pinned_addresses = std::vector<std::string>{};
     auto trusted_ca_pem = std::string{};
@@ -1651,6 +1654,7 @@ namespace
             return {false, "server discovery failed"};
         }
         resolved_host = resolution.resolved_host;
+        tls_server_name = resolution.tls_server_name;
         resolved_port = resolution.resolved_port;
         pinned_addresses = resolution.pinned_addresses;
     }
@@ -1665,6 +1669,7 @@ namespace
     auto call = federation::OutboundCall{};
     call.transaction = transaction;
     call.resolved_host = resolved_host;
+    call.tls_server_name = tls_server_name;
     call.resolved_port = resolved_port;
     call.pinned_addresses = pinned_addresses;
     call.trusted_ca_pem = trusted_ca_pem;

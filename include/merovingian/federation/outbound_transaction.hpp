@@ -51,6 +51,15 @@ struct OutboundCall final
 {
     OutboundTransaction transaction{};
     std::string resolved_host{};
+    // M-02: the name the destination's certificate must be valid for, and the
+    // URL host used for SNI and the Host header. Differs from resolved_host
+    // whenever discovery went through an SRV record: resolved_host is then the
+    // SRV target, but the spec requires the certificate to match the original
+    // (or well-known delegated) hostname. Copy this from
+    // ServerDiscoveryResult::tls_server_name. Empty means "same as
+    // resolved_host", which is correct for callers that bypass discovery and
+    // set resolved_host to an authoritative name directly.
+    std::string tls_server_name{};
     std::uint16_t resolved_port{8448U};
     std::vector<std::string> pinned_addresses{};
     std::string key_id{};

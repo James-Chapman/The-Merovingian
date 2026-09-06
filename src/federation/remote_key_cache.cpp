@@ -200,13 +200,20 @@ namespace
             return {false, {}, discovery.reason.empty() ? "discovery failed" : discovery.reason};
         }
         auto url = std::string{"https://"};
-        auto const needs_brackets =
-            discovery.resolved_host.find(':') != std::string::npos && discovery.resolved_host.front() != '[';
+        // M-02: use the TLS identity as the URL host, not the resolved target.
+        // For an SRV-discovered destination those differ, and the key endpoint is
+        // exactly where it matters most: this response is the root of trust for
+        // every signature that server ever makes, so validating the certificate
+        // against an SRV target chosen by unsigned DNS would let a DNS attacker
+        // substitute the server's signing keys wholesale. pinned_addresses still
+        // routes the connection to the discovered target.
+        auto const& url_host = discovery.tls_server_name.empty() ? discovery.resolved_host : discovery.tls_server_name;
+        auto const needs_brackets = url_host.find(':') != std::string::npos && url_host.front() != '[';
         if (needs_brackets)
         {
             url += '[';
         }
-        url += discovery.resolved_host;
+        url += url_host;
         if (needs_brackets)
         {
             url += ']';
