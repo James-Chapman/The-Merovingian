@@ -15,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -292,6 +293,34 @@ struct TlsResponseReader final
     }
     auto probe = std::array<char, 1U>{};
     return ::recv(fd, probe.data(), probe.size(), MSG_PEEK | MSG_DONTWAIT) == 0;
+}
+
+// True once the peer has hung up. Any pending bytes are drained and discarded
+// first: when the server answers a request the client then abandons, the socket
+// becomes readable with RESPONSE DATA, which is not EOF. peer_closed_within()
+// reports that case as "not closed" and returns immediately, so using it to pace
+// a loop turns the loop into a busy spin — which is exactly how the trickle
+// scenario below came to send thousands of bytes on NetBSD instead of one every
+// 1.5 seconds.
+[[nodiscard]] auto peer_closed_now(int fd) -> bool
+{
+    auto buffer = std::array<char, 1024U>{};
+    while (true)
+    {
+        auto const received = ::recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
+        if (received == 0)
+        {
+            return true;
+        }
+        if (received < 0)
+        {
+            // Nothing pending is the connection still being open; anything else
+            // (ECONNRESET, EPIPE) means the peer is gone.
+            return errno != EAGAIN && errno != EWOULDBLOCK;
+        }
+        // Drained some response bytes; keep going until the socket is drained
+        // so the EOF underneath them is visible.
+    }
 }
 
 struct TlsTestCertificate final
@@ -1488,9 +1517,15 @@ SCENARIO("merovingian-server bounds a client that trickles a body indefinitely u
             // Give up well after the deadline should have fired, so a failure
             // reports a bounded elapsed time rather than hanging the binary.
             auto constexpr give_up = std::chrono::seconds{50};
+            // Pace the dribble with an explicit sleep rather than with a poll
+            // timeout. Once the server answers, a poll returns instantly on the
+            // response bytes, and a loop paced by it stops dribbling and starts
+            // spinning — the cadence has to be independent of readability.
+            auto constexpr dribble_interval = std::chrono::milliseconds{1500};
             while (std::chrono::steady_clock::now() - started < give_up)
             {
-                if (peer_closed_within(client_fd, 1500))
+                std::this_thread::sleep_for(dribble_interval);
+                if (peer_closed_now(client_fd))
                 {
                     closed = true;
                     break;
@@ -1519,7 +1554,9 @@ SCENARIO("merovingian-server bounds a client that trickles a body indefinitely u
                 // 16 KiB/s floor. Anything under 45s is the deadline firing;
                 // without it this client is followed for hours.
                 REQUIRE(elapsed_ms < 45000);
-                // And it was cut off mid-body, not allowed to finish.
+                // And it was cut off mid-body, not allowed to finish. At one
+                // byte per 1.5s the declared 4096 could not be reached inside
+                // the give-up window even if nothing bounded the request.
                 REQUIRE(bytes_sent < 4096U);
             }
         }
