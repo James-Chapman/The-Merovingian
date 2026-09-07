@@ -55,6 +55,13 @@ auto FederationProxy::handle(LocalHttpRequest const& request) -> LocalHttpRespon
         return handle_federation_http_request(runtime_, request);
     }
 
+    // The federation version endpoint is a required unauthenticated probe.
+    // Keep it on the main process with the other non-X-Matrix endpoints.
+    if (request.method == "GET" && is_federation_version_endpoint(request.target))
+    {
+        return handle_federation_http_request(runtime_, request);
+    }
+
     // #323: verify the inbound X-Matrix signature in the main process before
     // forwarding to the worker. Only the verified peer identity crosses the
     // (authenticated) IPC channel; the raw peer Authorization header — which

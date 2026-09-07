@@ -463,11 +463,15 @@ client_rate_limits.default_per_ip=90/60s
 #   admin           operator-only endpoints
 #   generic         everything else
 #client_rate_limits.tier.auth_sensitive=20/60s
-#client_rate_limits.tier.media=60/60s
+#client_rate_limits.tier.media=20/60s
 #client_rate_limits.tier.sync=90/60s
 #client_rate_limits.tier.federation=600/60s
 #client_rate_limits.tier.admin=30/60s
 #client_rate_limits.tier.generic=90/60s
+# Thumbnail requests have a built-in 60/60s refinement. Raise only these
+# prefixes if clients still receive 429 responses during room rendering:
+#client_rate_limits.per_ip./_matrix/client/v1/media/thumbnail=120/60s
+#client_rate_limits.per_ip./_matrix/media/v3/thumbnail=120/60s
 
 # Per-module log level overrides
 # Each entry maps a logger name to a level (trace|debug|info|notice|

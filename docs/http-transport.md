@@ -393,9 +393,12 @@ slowloris rate — a quiet connection is not a slow client. A connection
 
 ## Rate-limit policy
 
-Runtime rate limiting is enforced on every client-server and inbound federation
-request before dispatch. Two independent wall-clock token-bucket tiers are
-maintained:
+Runtime rate limiting is enforced on client-server requests and authenticated
+inbound federation traffic before dispatch. The public federation version
+endpoint, `GET /_matrix/federation/v1/version`, is served locally without
+X-Matrix authentication or rate limiting, as specified by Matrix v1.19.
+Its implementation version comes from the Meson project version.
+Two independent wall-clock token-bucket tiers are maintained:
 
 - **Per-IP**, keyed by `(effective_client_ip, normalized_route)`.
 - **Per-user**, keyed by `(authenticated_user_id, normalized_route)` for
@@ -420,14 +423,15 @@ cap applies regardless of which room, device, or media ID appears in the URL.
 | Tier | Routes | Default per-IP policy |
 | --- | --- | --- |
 | `auth_sensitive` | `/login`, `/register`, `/refresh`, and every `*/requestToken` route (matched by suffix) — unauthenticated, so the per-IP bucket is the only defense | 20/60s |
-| `media` | `/_matrix/media/*` and `/_matrix/client/v1/media/*` | 20/60s |
+| `media` | `/_matrix/media/*` and `/_matrix/client/v1/media/*` | 20/60s; thumbnail refinement 60/60s |
 | `sync` | `/sync` plus the MSC4186 and simplified MSC3575 sliding-sync long-polls | 90/60s |
 | `federation` | `/_matrix/federation/*` routes reaching the client-server dispatcher | 120/60s |
 | `admin` | `/_merovingian/admin/*` | 30/60s |
 | `generic` | every other client-server route | `client_rate_limits.default_per_ip` (90/60s) |
 
 Built-in per-endpoint refinements inside a tier: device and key APIs at
-30/60s, search at 20/60s — each request does real work (a bounded in-memory
+30/60s, search at 20/60s, and thumbnails at 60/60s. Search requests do real
+work (a bounded in-memory
 scan, see `ClientApiLimits::max_search_events_scanned`) rather than a cheap
 lookup. The built-in per-user cap is 5/60s on `/login`.
 
@@ -467,6 +471,16 @@ tiering only makes them explicit and complete. One deliberate tightening: the
 auth-sensitive tier now covers `/refresh`, the `*/requestToken` family, and
 non-`POST` hits on `/login`/`/register`, which previously fell into the 90/60s
 generic fallback.
+
+Different thumbnail media IDs normalize to the same per-IP action bucket.
+The 60/minute refinement accommodates ordinary room-rendering bursts while
+uploads and full media downloads retain the 20/minute tier default. Prefer a
+thumbnail-prefix override over raising the whole media tier if local usage
+still needs a higher cap; the [user manual](user-manual.md) provides an
+example. Each denied request emits one `rate_limit.exceeded`
+warning, while preserving both its rate-limit and request-rejection audit
+records. Suppressing diagnostics does not change enforcement or HTTP 429
+retry information.
 
 **Fail-closed on an unresolvable policy (issue #412):** the per-IP policy
 resolves to a value on every route unless a configured entry, tier override, or

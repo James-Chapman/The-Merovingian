@@ -146,6 +146,32 @@ SCENARIO("Rate-limit tier defaults carry the secure design-doc caps", "[http][ra
     }
 }
 
+SCENARIO("Thumbnail bursts have a scoped rate-limit refinement", "[http][rate-limit][tier][thumbnail]")
+{
+    GIVEN("the default client rate-limit configuration")
+    {
+        auto clock = ManualClock{};
+        auto const config = merovingian::http::default_client_rate_limit_config();
+        auto const engine = RateLimitEngine{config, clock};
+
+        WHEN("thumbnail, upload, and download policies are resolved")
+        {
+            THEN("both thumbnail API forms allow 60 requests per minute")
+            {
+                REQUIRE(resolved_max(engine, "/_matrix/client/v1/media/thumbnail/example.org/media") == 60U);
+                REQUIRE(resolved_max(engine, "/_matrix/media/v3/thumbnail/example.org/media") == 60U);
+            }
+
+            AND_THEN("other media operations retain the 20 request tier default")
+            {
+                REQUIRE(resolved_max(engine, "/_matrix/client/v1/media/upload") == 20U);
+                REQUIRE(resolved_max(engine, "/_matrix/client/v1/media/download/example.org/media") == 20U);
+                REQUIRE(resolved_max(engine, "/_matrix/media/v3/download/example.org/media") == 20U);
+            }
+        }
+    }
+}
+
 SCENARIO("Rate-limit tier overrides apply to every route in the tier", "[http][rate-limit][tier][config]")
 {
     GIVEN("an engine whose operator tightened the media tier and the auth_sensitive tier")

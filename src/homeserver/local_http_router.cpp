@@ -21,6 +21,7 @@
 #include "merovingian/federation/security.hpp"
 #include "merovingian/federation/server_acl.hpp"
 #include "merovingian/homeserver/auth_service.hpp"
+#include "merovingian/homeserver/federation_request_routing.hpp"
 #include "merovingian/homeserver/media_service.hpp"
 #include "merovingian/homeserver/request_lock.hpp"
 #include "merovingian/homeserver/room_service.hpp"
@@ -2638,6 +2639,12 @@ auto wire_federation_callbacks(HomeserverRuntime& runtime) -> void
             request.target.substr(0U, request.target.find('?')) == "/_matrix/federation/v1/openid/userinfo")
         {
             return federation_openid_userinfo_response(runtime, request);
+        }
+        if (request.method == "GET" && is_federation_version_endpoint(request.target))
+        {
+            auto const body =
+                std::string{"{\"server\":{\"name\":\"Merovingian\",\"version\":\""} + MEROVINGIAN_VERSION + "\"}}";
+            return response(200U, body);
         }
         if (!starts_with(request.target, "/_matrix/federation/"))
         {

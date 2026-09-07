@@ -226,52 +226,39 @@ public:
         }
     }
 
-    auto log(LogLevel level, std::string const& line) -> void
-    {
-        auto const flush = level >= LogLevel::notice;
-        if (m_console_log_level.load() <= level)
-        {
-            console_log(line, flush);
-        }
-        if (m_file_log_level.load() <= level)
-        {
-            file_log(line, flush);
-        }
-    }
-
     auto trace(std::string const& module, std::string const& message) -> void
     {
-        log(LogLevel::trace, make_log_line("TRACE", module, message));
+        log(LogLevel::trace, module, make_log_line("TRACE", module, message));
     }
 
     auto debug(std::string const& module, std::string const& message) -> void
     {
-        log(LogLevel::debug, make_log_line("DEBUG", module, message));
+        log(LogLevel::debug, module, make_log_line("DEBUG", module, message));
     }
 
     auto info(std::string const& module, std::string const& message) -> void
     {
-        log(LogLevel::info, make_log_line("INFO", module, message));
+        log(LogLevel::info, module, make_log_line("INFO", module, message));
     }
 
     auto notice(std::string const& module, std::string const& message) -> void
     {
-        log(LogLevel::notice, make_log_line("NOTICE", module, message));
+        log(LogLevel::notice, module, make_log_line("NOTICE", module, message));
     }
 
     auto warning(std::string const& module, std::string const& message) -> void
     {
-        log(LogLevel::warning, make_log_line("WARNING", module, message));
+        log(LogLevel::warning, module, make_log_line("WARNING", module, message));
     }
 
     auto error(std::string const& module, std::string const& message) -> void
     {
-        log(LogLevel::error, make_log_line("ERROR", module, message));
+        log(LogLevel::error, module, make_log_line("ERROR", module, message));
     }
 
     auto critical(std::string const& module, std::string const& message) -> void
     {
-        log(LogLevel::critical, make_log_line("CRITICAL", module, message));
+        log(LogLevel::critical, module, make_log_line("CRITICAL", module, message));
     }
 
 private:
@@ -315,12 +302,30 @@ private:
         return std::string{result.data()};
     }
 
-    static auto make_log_line(std::string const& level, std::string const& module, std::string const& message)
-        -> std::string
+    static auto make_log_line(std::string const& level, std::string const& module,
+                              std::string const& message) -> std::string
     {
         auto stream = std::ostringstream{};
         stream << current_date_time() << "  <" << level << ">  " << module << ":  " << message << '\n';
         return stream.str();
+    }
+
+    auto log(LogLevel level, std::string_view module, std::string const& line) -> void
+    {
+        if (static_cast<int>(module_log_level(module)) > static_cast<int>(level))
+        {
+            return;
+        }
+
+        auto const flush = level >= LogLevel::notice;
+        if (m_console_log_level.load() <= level)
+        {
+            console_log(line, flush);
+        }
+        if (m_file_log_level.load() <= level)
+        {
+            file_log(line, flush);
+        }
     }
 
     auto console_log(std::string const& message, bool flush) -> void
@@ -614,8 +619,8 @@ auto string_format(std::string const& format, Args&&... args) -> std::string
 // Build the message body for a diagnostic log line: "event=<event> key=value ...".
 // The module name and level header are added by the SingleLog named methods via
 // make_log_line, so they must not be included here.
-[[nodiscard]] inline auto diagnostic_message(std::string_view event, std::vector<StructuredLogField> const& fields)
-    -> std::string
+[[nodiscard]] inline auto diagnostic_message(std::string_view event,
+                                             std::vector<StructuredLogField> const& fields) -> std::string
 {
     auto msg = std::string{"event="} + std::string{event};
     for (auto const& field : fields)
@@ -633,12 +638,6 @@ inline auto log_diagnostic(std::string_view logger, std::string_view event,
                            std::vector<StructuredLogField> const& fields = {},
                            LogEventSeverity severity = LogEventSeverity::debug) -> void
 {
-    auto const level = severity_to_log_level(severity);
-    auto const module_level = SingleLog::instance().module_log_level(logger);
-    if (static_cast<int>(module_level) > static_cast<int>(level))
-    {
-        return;
-    }
     auto const mod = std::string{logger};
     auto const msg = diagnostic_message(event, fields);
     auto& log = SingleLog::instance();

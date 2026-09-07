@@ -21,6 +21,21 @@ shell = find_program('sh')
     args: [meson.project_source_root() / 'scripts' / 'check-unit-test-registration.sh', meson.project_source_root()],
   )
 
+  logger_filter_fixture = executable(
+    'logger-filter-fixture',
+    'tooling/logger_filter_fixture.cpp',
+    include_directories: inc,
+    dependencies: thread_dep,
+    link_with: [observability_lib, platform_lib],
+  )
+
+  test(
+    'logger-module-filter',
+    python,
+    args: [meson.project_source_root() / 'tests' / 'tooling' / 'test_logger_filter.py', logger_filter_fixture.full_path()],
+    depends: logger_filter_fixture,
+  )
+
   test(
     'catch2-bdd-tests',
     shell,

@@ -27,10 +27,10 @@ namespace
         return value.size() >= prefix.size() && value.substr(0U, prefix.size()) == prefix;
     }
 
-    // Built-in per-endpoint refinements WITHIN a tier. These are the routes
-    // whose secure default is tighter than their tier's default. Kept in
-    // sync with the literal maps in default_client_rate_limit_config() —
-    // both places list the same three routes.
+    // Built-in per-endpoint refinements WITHIN a tier. Kept in sync with the
+    // literal maps in default_client_rate_limit_config(). Thumbnail requests
+    // are cheap individually but arrive in bursts while a client renders a
+    // room, so they use a higher cap than other media operations.
     [[nodiscard]] auto builtin_per_ip_refinement(std::string_view target) noexcept -> std::optional<RateLimitPolicy>
     {
         if (starts_with(target, "/_matrix/client/v3/keys/") || starts_with(target, "/_matrix/client/v3/devices"))
@@ -40,6 +40,11 @@ namespace
         if (starts_with(target, "/_matrix/client/v3/search"))
         {
             return RateLimitPolicy{20U, 60U};
+        }
+        if (starts_with(target, "/_matrix/client/v1/media/thumbnail/") ||
+            starts_with(target, "/_matrix/media/v3/thumbnail/"))
+        {
+            return RateLimitPolicy{60U, 60U};
         }
         return std::nullopt;
     }
@@ -198,22 +203,25 @@ auto default_client_rate_limit_config() noexcept -> RateLimitConfig
     // Design-doc defaults (0.5.0), now expressed through tiers: 20/min per IP
     // for the auth-sensitive tier (login/register/refresh/requestToken), 5/min
     // per user for login, 30/min for keys/devices, 20/min for media and
-    // search, 120/min for federation routes on the client listener, 90/min
-    // for sync and everything else, 30/min for /_merovingian/admin/* —
+    // search, and 60/min for thumbnail bursts. Federation routes on the
+    // client listener use 120/min, sync and everything else use 90/min, and
+    // /_merovingian/admin/* uses 30/min —
     // operator-only, low-volume, but still throttled against brute-force
     // token guessing. Search gets the same 20/min-per-IP tier as media: like
     // media, each request can do real work (a bounded in-memory scan of the
     // caller's joined-room events, capped by
     // ClientApiLimits::max_search_events_scanned) rather than a cheap lookup,
     // so it is throttled tighter than the generic fallback. The tier defaults
-    // themselves live in rate_limit_tier_default(); only the refinements that
-    // are tighter than their tier are seeded here.
+    // themselves live in rate_limit_tier_default(); endpoint refinements are
+    // seeded here.
     return RateLimitConfig{
         .builtin_per_ip =
             {
                              {"/_matrix/client/v3/keys/", {30U, 60U}},
                              {"/_matrix/client/v3/devices", {30U, 60U}},
                              {"/_matrix/client/v3/search", {20U, 60U}},
+                             {"/_matrix/client/v1/media/thumbnail/", {60U, 60U}},
+                             {"/_matrix/media/v3/thumbnail/", {60U, 60U}},
                              },
         .builtin_per_user =
             {

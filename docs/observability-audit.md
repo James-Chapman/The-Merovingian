@@ -2,6 +2,22 @@
 
 This capability note describes runtime-wired observability and audit behavior.
 
+All diagnostic logging entry points apply the configured module/default
+threshold before the console and file sink thresholds. `--debug` enables
+debug-level console output but does not override `log_modules.*=info` or an
+explicit module level. See [log filtering](log-filtering.md).
+
+Each client rate-limit rejection emits one `rate_limit.exceeded` warning,
+including the cap and effective IP. Both `rate_limit.exceeded` and
+`request.rejected` policy audit records are retained; the second record no
+longer emits a duplicate HTTP 429 diagnostic. Filtering warnings does not
+suppress either audit record or change the rate-limit response.
+
+Unauthenticated federation version discovery is served locally without an
+X-Matrix authorization warning. Remote-media connection and HTTP failure
+warnings still report failed remote operations; they are not suppressed by
+an `info` threshold.
+
 ## Included now
 
 - Admin health summaries through `/_merovingian/admin/health`.
@@ -81,10 +97,10 @@ This capability note describes runtime-wired observability and audit behavior.
 
 ## Failure routing (0.5.0)
 
-Five high-signal failure call sites route through a single
-`observability::log_diagnostic_audit` helper. At severity `warning` or
-above, the helper both emits the structured log line and appends a row
-to `audit_log`:
+Failure call sites use diagnostic/audit helpers that append an audit row
+at severity `warning` or above independently of the diagnostic threshold.
+The companion `request.rejected` audit row for HTTP 429 is appended directly
+to avoid a duplicate warning. The event catalogue is:
 
 | Call site | Logger | Audit category | Audit event type |
 |-----------|--------|----------------|------------------|

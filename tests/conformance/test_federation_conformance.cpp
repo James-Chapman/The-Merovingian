@@ -20,18 +20,24 @@
 // |  concluding that a failing assertion is wrong.                           |
 // +-------------------------------------------------------------------------+
 
+#include "../support/master_key.hpp"
 #include "federation_signing_test_support.hpp"
 #include "merovingian/canonicaljson/parser.hpp"
 #include "merovingian/canonicaljson/value.hpp"
+#include "merovingian/config/config.hpp"
 #include "merovingian/federation/inbound_ingestion.hpp"
 #include "merovingian/federation/inbound_request.hpp"
 #include "merovingian/federation/key_query.hpp"
 #include "merovingian/federation/membership_endpoints.hpp"
 #include "merovingian/federation/runtime_federation.hpp"
+#include "merovingian/homeserver/federation_request_routing.hpp"
+#include "merovingian/homeserver/local_http_router.hpp"
+#include "merovingian/homeserver/runtime.hpp"
 #include "merovingian/rooms/room_version_policy.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
@@ -54,8 +60,8 @@ namespace
     return config;
 }
 
-[[nodiscard]] auto remote_for(std::string const& origin, std::string const& key_id, std::string const& key_seed)
-    -> merovingian::federation::FederationRemoteRuntime
+[[nodiscard]] auto remote_for(std::string const& origin, std::string const& key_id,
+                              std::string const& key_seed) -> merovingian::federation::FederationRemoteRuntime
 {
     auto remote = merovingian::federation::FederationRemoteRuntime{};
     remote.server_name = origin;
@@ -88,8 +94,8 @@ namespace
 }
 
 [[nodiscard]] auto signed_put_request(std::string const& origin, std::string const& key_id, std::string const& key_seed,
-                                      std::string const& target, std::string const& body)
-    -> merovingian::federation::SignedFederationRequest
+                                      std::string const& target,
+                                      std::string const& body) -> merovingian::federation::SignedFederationRequest
 {
     auto request = merovingian::federation::SignedFederationRequest{};
     request.method = "PUT";
@@ -107,8 +113,8 @@ namespace
 }
 
 [[nodiscard]] auto signed_post_request(std::string const& origin, std::string const& key_id,
-                                       std::string const& key_seed, std::string const& target, std::string const& body)
-    -> merovingian::federation::SignedFederationRequest
+                                       std::string const& key_seed, std::string const& target,
+                                       std::string const& body) -> merovingian::federation::SignedFederationRequest
 {
     auto request = merovingian::federation::SignedFederationRequest{};
     request.method = "POST";
@@ -130,14 +136,116 @@ auto const origin = std::string{"remote.example.org"};
 auto const key_id = std::string{"ed25519:auto"};
 auto const key_seed = std::string{"conformance-test-seed"};
 
+// Spec: Matrix Server-Server API v1.19
+// Endpoint / Section: GET /_matrix/federation/v1/version
+// URL: ../../docs/matrix-v1.19-spec/server-server-api.md#get_matrixfederationv1version
+//
+// The version endpoint is required, unauthenticated, and must be matched as an
+// exact path so lookalike federation routes still require X-Matrix auth.
+SCENARIO("Federation version endpoint is identified only for its exact path",
+         "[conformance][federation][version][routing]")
+{
+    GIVEN("federation version and lookalike request targets")
+    {
+        WHEN("the endpoint matcher is called")
+        {
+            THEN("the exact endpoint and query form are recognized")
+            {
+                REQUIRE(merovingian::homeserver::is_federation_version_endpoint("/_matrix/federation/v1/version"));
+                REQUIRE(
+                    merovingian::homeserver::is_federation_version_endpoint("/_matrix/federation/v1/version?probe=1"));
+            }
+
+            THEN("lookalike paths are not recognized")
+            {
+                REQUIRE_FALSE(
+                    merovingian::homeserver::is_federation_version_endpoint("/_matrix/federation/v1/version/extra"));
+                REQUIRE_FALSE(
+                    merovingian::homeserver::is_federation_version_endpoint("/prefix/_matrix/federation/v1/version"));
+                REQUIRE_FALSE(
+                    merovingian::homeserver::is_federation_version_endpoint("/_matrix/federation/v1/versionish"));
+            }
+        }
+    }
+}
+
+// Spec: Matrix Server-Server API v1.19
+// Endpoint / Section: GET /_matrix/federation/v1/version; Request authentication
+// URL: ../../docs/matrix-v1.19-spec/server-server-api.md#get_matrixfederationv1version
+// The protocol handler must answer this endpoint before attempting X-Matrix
+// authorization. Worker-proxy interception is covered by the real-worker
+// integration scenario.
+SCENARIO("Federation version endpoint is served without authentication",
+         "[conformance][federation][version][authentication]")
+{
+    GIVEN("a started homeserver and unauthenticated federation requests")
+    {
+        auto security = merovingian::config::SecurityConfig{};
+        security.secrets.master_key_file = merovingian::tests::shared_master_key_file();
+        security.federation.enabled = true;
+        auto config = merovingian::config::Config{
+            merovingian::config::ServerConfig{},           merovingian::config::ListenersConfig{},
+            merovingian::config::DatabaseConfig{},         security,
+            merovingian::config::ClientRateLimitsConfig{}, merovingian::config::LogModulesConfig{}};
+        auto started = merovingian::homeserver::start_runtime(config);
+        REQUIRE(started.started);
+        WHEN("an unauthenticated exact version request is sent to the federation handler")
+        {
+            THEN("the response is 200 and contains the required server object")
+            {
+                for (auto const& target : {"/_matrix/federation/v1/version", "/_matrix/federation/v1/version?probe=1"})
+                {
+                    auto const response = merovingian::homeserver::handle_federation_http_request(
+                        started.runtime, {"GET", target, {}, {}});
+                    // Spec MUST: the endpoint requires no authentication and returns
+                    // the implementation name and version with HTTP 200.
+                    REQUIRE(response.status == 200U);
+                    auto const parsed = merovingian::canonicaljson::parse_lossless(response.body);
+                    REQUIRE(parsed.error == merovingian::canonicaljson::ParseError::none);
+                    REQUIRE(std::holds_alternative<merovingian::canonicaljson::Object>(parsed.value.storage()));
+                    auto const& root = std::get<merovingian::canonicaljson::Object>(parsed.value.storage());
+                    auto const member = [](merovingian::canonicaljson::Object const& object,
+                                           std::string_view key) -> merovingian::canonicaljson::Value const& {
+                        auto const it = std::ranges::find_if(object, [key](auto const& item) {
+                            return item.key == key;
+                        });
+                        REQUIRE(it != object.end());
+                        REQUIRE(it->value);
+                        return *it->value;
+                    };
+                    auto const& server = member(root, "server");
+                    REQUIRE(std::holds_alternative<merovingian::canonicaljson::Object>(server.storage()));
+                    auto const& server_object = std::get<merovingian::canonicaljson::Object>(server.storage());
+                    REQUIRE(std::get<std::string>(member(server_object, "name").storage()) == "Merovingian");
+                    REQUIRE(std::get<std::string>(member(server_object, "version").storage()) == MEROVINGIAN_VERSION);
+                }
+            }
+        }
+
+        WHEN("lookalike and authenticated endpoint requests are sent without auth")
+        {
+            auto const lookalike = merovingian::homeserver::handle_federation_http_request(
+                started.runtime, {"GET", "/_matrix/federation/v1/version/extra", {}, {}});
+            auto const send = merovingian::homeserver::handle_federation_http_request(
+                started.runtime, {"PUT", "/_matrix/federation/v1/send/txn", {}, "{}"});
+
+            THEN("they remain rejected by the federation authentication boundary")
+            {
+                REQUIRE(lookalike.status >= 400U);
+                REQUIRE(send.status >= 400U);
+            }
+        }
+    }
+}
+
 // Build a properly signed m.room.member PDU from the remote server.
 // The event is signed with the same key_seed used by remote_for(), so
 // authorize_federation_pdu verifies the Ed25519 signature and
 // verify_pdu_content_hash passes. The membership parameter selects
 // "join", "leave", or "knock".
 [[nodiscard]] auto make_signed_member_pdu(std::string const& room_id_arg, std::string const& sender,
-                                          std::string const& membership, std::string_view room_ver = "12")
-    -> std::string
+                                          std::string const& membership,
+                                          std::string_view room_ver = "12") -> std::string
 {
     auto const unsigned_json = std::string{"{\"type\":\"m.room.member\",\"room_id\":\""} + room_id_arg +
                                "\",\"sender\":\"" + sender + "\",\"state_key\":\"" + sender +
@@ -150,8 +258,8 @@ auto const key_seed = std::string{"conformance-test-seed"};
 // Build a properly signed v2 invite body wrapping a signed m.room.member
 // invite event from the remote server.
 [[nodiscard]] auto make_signed_v2_invite_body(std::string const& room_id_arg, std::string const& sender,
-                                              std::string const& state_key, std::string_view room_ver = "12")
-    -> std::string
+                                              std::string const& state_key,
+                                              std::string_view room_ver = "12") -> std::string
 {
     auto const unsigned_json = std::string{"{\"type\":\"m.room.member\",\"room_id\":\""} + room_id_arg +
                                "\",\"sender\":\"" + sender + "\",\"state_key\":\"" + state_key +
@@ -164,8 +272,8 @@ auto const key_seed = std::string{"conformance-test-seed"};
 }
 
 // Navigate a JSON object and return a pointer to the Value for `key`.
-[[nodiscard]] auto json_get(merovingian::canonicaljson::Object const& obj, std::string const& key)
-    -> merovingian::canonicaljson::Value const*
+[[nodiscard]] auto json_get(merovingian::canonicaljson::Object const& obj,
+                            std::string const& key) -> merovingian::canonicaljson::Value const*
 {
     for (auto const& m : obj)
         if (m.key == key)
