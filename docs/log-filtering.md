@@ -1,23 +1,24 @@
-# Operator log filtering (0.5.0)
+# Operator log filtering
 
-The `--debug` flag is the operator's escape hatch when an investigation
-needs every line the runtime can produce. It is also a firehose. This
-guide covers the 0.5.0 knobs that let you dial the firehose down to
-the modules you care about, plus the audit-routing changes that
-guarantee the high-signal lines never get lost in the noise.
+Configured log levels control which diagnostic messages can reach either
+output sink. This applies to structured diagnostics, direct `SingleLog`
+calls, and the `LOG_*`/`LOGF_*` macros. Audit persistence is independent
+of diagnostic filtering.
 
 ## `--debug` and the default level
 
-`--debug` lowers the **default** log level to `debug` so modules
-without an explicit override start speaking at debug-level verbosity.
-Nothing about per-module filtering changes unless you also set
-`log_modules.*` keys in `merovingian.conf`.
+`--debug` lowers the **console sink** threshold to `debug`. It does not
+override `log_modules` or change the module default, which is `info`.
+A message must meet both its module threshold and its output sink threshold.
+An explicit module setting overrides the wildcard default for that module.
+`info` suppresses `trace` and `debug`, while retaining `info` and higher
+severities, including warnings and errors. `off` suppresses all diagnostic
+messages from the selected module.
 
-To revert to the pre-0.5.0 default, drop `--debug` or set the
-default level explicitly:
+To suppress debug messages even in a `--debug` run, set:
 
 ```conf
-# Silences everything not explicitly bumped to a higher level
+# Applies to every module without an explicit override
 log_modules.*=info
 ```
 
@@ -45,8 +46,8 @@ log_modules.rate_limit=debug
 
 ## Audit-routed failure lines
 
-The seven high-signal failure call sites emit a structured log line
-**and** append a row to `audit_log` at the same instant:
+The following failure events are persisted to `audit_log`, including when
+their diagnostic messages are filtered out:
 
 | Logger | Audit event type | Audit category |
 |--------|------------------|----------------|
@@ -58,10 +59,11 @@ The seven high-signal failure call sites emit a structured log line
 | `client_server` | `request.user_suspended` | `auth` |
 | `auth` | `registration_policy.denied` | `policy` |
 
-`log_diagnostic_audit` is the helper. It is the **only** path that
-writes to `audit_log` from these call sites, so a row in the audit
-log and a line in stderr will always agree on the actor / target /
-reason.
+For a client HTTP 429, `rate_limit.exceeded` emits the warning with the
+effective IP and cap details. The additional `request.rejected` audit record
+is retained without a second diagnostic warning. Other request rejections
+still emit their own warning. Rate-limit enforcement and retry responses
+are unaffected by this diagnostic deduplication.
 
 ## Reading the audit log
 
@@ -98,3 +100,9 @@ without a registry. The runtime uses the following conventions:
 
 Unrecognised module names are accepted and the level is recorded —
 there is no error. Restart the server to apply.
+
+Legacy `LOG_*`/`LOGF_*` macros use the calling function name as their logger
+name (for example, `handle` for the WorkerPool reply diagnostic). They obey
+that name's explicit setting, or `log_modules.*` when none exists. Function
+traces use `FunctionTrace`. Structured diagnostics use the named modules
+in the table above.

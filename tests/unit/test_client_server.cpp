@@ -20,9 +20,9 @@
 // |  concluding that a failing assertion is wrong.                           |
 // +-------------------------------------------------------------------------+
 
-#include "../support/master_key.hpp"
 #include "../federation_signing_test_support.hpp"
 #include "../support/json_test_support.hpp"
+#include "../support/master_key.hpp"
 #include "../support/registration_token.hpp"
 #include "merovingian/config/config.hpp"
 #include "merovingian/database/persistent_store.hpp"
@@ -30,11 +30,13 @@
 #include "merovingian/homeserver/auth_service.hpp"
 #include "merovingian/homeserver/client_server.hpp"
 #include "merovingian/http/request.hpp"
+#include "merovingian/observability/logger.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -43,6 +45,18 @@
 
 namespace
 {
+
+struct ModuleLogLevelGuard final
+{
+    merovingian::observability::SingleLog& logger;
+    std::string module;
+    merovingian::observability::LogLevel previous;
+
+    ~ModuleLogLevelGuard()
+    {
+        logger.set_module_log_level(module, previous);
+    }
+};
 
 [[nodiscard]] auto registration_enabled_config() -> merovingian::config::Config
 {
@@ -2753,6 +2767,53 @@ SCENARIO("Client-server runtime normalizes route-template rate-limit buckets", "
     }
 }
 
+SCENARIO("A rate-limited request preserves both policy audit events when diagnostics are disabled",
+         "[homeserver][client-server][rate-limit-warning]")
+{
+    GIVEN("a started client-server runtime with a one-request route bucket")
+    {
+        auto started = merovingian::homeserver::start_client_server(registration_enabled_config());
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+        merovingian::homeserver::install_test_rate_limit_engine(runtime);
+        auto const audit_events_before = runtime.homeserver.database.persistent_store.audit_log.size();
+        auto& logger = merovingian::observability::SingleLog::instance();
+        auto rate_limit_log_guard = ModuleLogLevelGuard{logger, "rate_limit", logger.module_log_level("rate_limit")};
+        auto client_server_log_guard =
+            ModuleLogLevelGuard{logger, "client_server", logger.module_log_level("client_server")};
+        logger.set_module_log_level("rate_limit", merovingian::observability::LogLevel::off);
+        logger.set_module_log_level("client_server", merovingian::observability::LogLevel::off);
+
+        WHEN("the same request is sent twice from one source")
+        {
+            auto const first = merovingian::homeserver::handle_client_server_request(
+                runtime, {"GET", "/_matrix/client/v3/account/whoami", "bad", {}, {}, "203.0.113.50"});
+            auto const denied = merovingian::homeserver::handle_client_server_request(
+                runtime, {"GET", "/_matrix/client/v3/account/whoami", "bad", {}, {}, "203.0.113.50"});
+
+            THEN("the second request is 429 and creates one rate-limit audit plus one HTTP rejection audit")
+            {
+                REQUIRE(first.response.status == 401U);
+                REQUIRE(denied.response.status == 429U);
+                REQUIRE(denied.response.body.find("M_LIMIT_EXCEEDED") != std::string::npos);
+                REQUIRE(denied.response.body.find("\"retry_after_ms\"") != std::string::npos);
+                REQUIRE(std::ranges::any_of(denied.response.headers, [](auto const& header) {
+                    return header.first == "Retry-After" && std::stoul(header.second) > 0U;
+                }));
+                auto const& audit = runtime.homeserver.database.persistent_store.audit_log;
+                auto const begin = audit.begin() + static_cast<std::ptrdiff_t>(audit_events_before);
+                auto const end = audit.end();
+                REQUIRE(std::ranges::count_if(begin, end, [](auto const& event) {
+                            return event.event_type == "rate_limit.exceeded";
+                        }) == 1);
+                REQUIRE(std::ranges::count_if(begin, end, [](auto const& event) {
+                            return event.event_type == "request.rejected" && event.reason.find("429:") == 0U;
+                        }) == 1);
+            }
+        }
+    }
+}
+
 SCENARIO("Sync endpoint returns stream token and event bodies for initial and incremental sync",
          "[homeserver][client-server][sync]")
 {
@@ -4852,10 +4913,10 @@ SCENARIO("An SSO redirectUrl allowlist entry naming a bare origin does not match
         WHEN("redirectUrl carries a query directly after the allowed origin")
         {
             auto const response = merovingian::homeserver::handle_client_server_request(
-                runtime,
-                {"GET", "/_matrix/client/v3/login/sso/redirect?redirectUrl=https%3A%2F%2Fclient.example.com%3Fx%3D1",
-                 {},
-                 {}});
+                runtime, {"GET",
+                          "/_matrix/client/v3/login/sso/redirect?redirectUrl=https%3A%2F%2Fclient.example.com%3Fx%3D1",
+                          {},
+                          {}});
 
             THEN("the redirect is allowed: ? is a valid boundary too")
             {

@@ -2,7 +2,7 @@ project(
   'merovingian',
   'cpp',
   'c',
-  version: '0.12.7',
+  version: '0.12.8',
   license: 'GPL-3.0-or-later',
   meson_version: '>=1.1.0',
   default_options: [
@@ -116,6 +116,9 @@ if get_option('hardening')
 endif
 
 inc = include_directories('include')
+
+# Protocol version discovery shares the canonical package/build version.
+add_project_arguments('-DMEROVINGIAN_VERSION="' + meson.project_version() + '"', language: 'cpp')
 
 # Bake the installation sysconfdir so the binary can locate its default config
 # without requiring an explicit --config flag.

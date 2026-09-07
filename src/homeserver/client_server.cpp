@@ -8700,15 +8700,12 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
     auto const rate_limit_decision = allow(rt, req);
     if (!rate_limit_decision.allowed)
     {
-        log_diagnostic_audit(rt.homeserver.database, "client_server", "request.rejected",
-                             {
-                                 {"method", req.method,                                       false},
-                                 {"target", observability::sanitized_http_target(req.target), false},
-                                 {"status", "429",                                            false},
-                                 {"reason", "rate limit exceeded",                            false}
-        },
-                             observability::LogEventSeverity::warning, observability::AuditCategory::policy,
-                             "request.rejected", "<unknown>", req.target, "429:rate limit exceeded");
+        // `allow()` already emits the warning-level rate_limit.exceeded
+        // diagnostic and its audit row. Keep the separate request.rejected
+        // audit event for the HTTP outcome without emitting a duplicate
+        // warning for the same 429.
+        append_local_audit(rt.homeserver.database, observability::AuditCategory::policy, "request.rejected",
+                           "<unknown>", req.target, "429:rate limit exceeded");
         return dispatch_err(req, rt, 429U, "M_LIMIT_EXCEEDED", "rate limit exceeded",
                             rate_limit_decision.retry_after_ms);
     }

@@ -982,7 +982,8 @@ Default route-aware policies applied when no override is configured:
 |---|---|
 | Login / registration | 20/60s per IP; 5/60s per user on `/login` |
 | Device and key APIs | 30/60s per IP |
-| Media APIs | 20/60s per IP |
+| Media uploads and downloads | 20/60s per IP |
+| Media thumbnails | 60/60s per IP |
 | Generic client APIs | 90/60s per IP fallback |
 
 Example overrides:
@@ -993,6 +994,24 @@ client_rate_limits.per_user./_matrix/client/v3/login=5/60s
 client_rate_limits.default_per_ip=90/60s
 ```
 
+Client startup or opening a large room can request many different thumbnails
+in a short burst. Those requests share a per-IP thumbnail bucket, whose
+60/minute default accommodates ordinary browsing without widening upload or
+full-download limits. For installations still seeing thumbnail HTTP 429
+responses, increase the thumbnail prefixes only, for example:
+
+```ini
+client_rate_limits.per_ip./_matrix/client/v1/media/thumbnail=120/60s
+client_rate_limits.per_ip./_matrix/media/v3/thumbnail=120/60s
+```
+
+Restart to apply, then review actual 429 responses and resource use before
+raising the cap further. These overrides preserve upload/download limits.
+A `client_rate_limits.tier.media` override would change all media operations.
+Sync has its own 90/minute per-IP bucket: investigate immediate sync responses,
+multiple devices behind one IP, or retry loops before tuning
+`client_rate_limits.tier.sync`. Hiding warnings does not prevent HTTP 429s.
+
 #### Per-module log levels — `log_modules.*`
 
 | Key | Default | When to change |
@@ -1000,9 +1019,11 @@ client_rate_limits.default_per_ip=90/60s
 | `log_modules.<module>` | unset | Override the level for a specific module. |
 | `log_modules.*` | unset | Set the default level for all unlisted modules. |
 
-Use `log_modules.*=debug` to make a `--debug` run less noisy by default, then
-raise or lower specific modules. See [`docs/log-filtering.md`](log-filtering.md)
-for the module list.
+The default is `info`. `--debug` enables debug output at the console sink;
+module/default settings still filter both console and file output. To enable
+debugging for a module, use `--debug` and `log_modules.<module>=debug`.
+Use `log_modules.*=debug` only when debug output is wanted for unlisted modules
+as well. See [`docs/log-filtering.md`](log-filtering.md) for the module list.
 
 ### Reloadability policy
 
@@ -1992,8 +2013,10 @@ merovingian-server --debug --log-file /var/log/merovingian/debug.log \
   --config /etc/merovingian/merovingian.conf
 ```
 
-`--debug` lowers the default log level to `debug`. `--log-file` writes
-trace/debug diagnostics to the selected file.
+`--debug` lowers the console sink threshold to `debug`. `--log-file` enables
+the file sink, whose threshold is `trace`. Both sinks still obey the
+configured module/default levels, so set the relevant modules to `debug`
+or `trace` to receive those diagnostics.
 
 ### Per-module log levels
 

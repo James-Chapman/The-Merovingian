@@ -1,3 +1,15 @@
+## 0.12.8
+
+- Apply configured module/default log levels to direct logging macros as well
+  as structured diagnostics, including when console debugging is enabled.
+- Emit one diagnostic warning per client rate-limit rejection while preserving
+  both policy audit records and the HTTP 429 response with retry information.
+- Serve the Matrix v1.19 federation version endpoint without authentication,
+  avoiding spurious authorization warnings for ordinary version discovery.
+- Raise the built-in thumbnail-only rate limit from 20 to 60 requests per
+  minute for normal client rendering bursts, while retaining existing upload
+  and full-download limits, and document scoped operator tuning.
+
 ## 0.12.7
 
 Fixes the eight findings of the 0.12.6 security audit. All eight were verified

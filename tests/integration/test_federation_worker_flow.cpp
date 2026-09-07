@@ -636,16 +636,15 @@ SCENARIO("handle_membership_ingest_request persists a worker-relayed federated j
                              R"(","origin_server_ts":1000,"type":")" + std::string{type} + R"(","state_key":")" +
                              std::string{state_key} + R"(","content":)" + content_json + "}";
                 auto state = merovingian::database::PersistentStateEvent{room_id, std::string{type},
-                                                                        std::string{state_key}, std::string{event_id}};
+                                                                         std::string{state_key}, std::string{event_id}};
                 REQUIRE(merovingian::database::store_event_with_state(runtime.database.persistent_store,
-                                                                     std::move(event), state));
+                                                                      std::move(event), state));
             };
             // room_version must match the "room_version":"10" the ingest request
             // below declares, or the event is judged under the wrong rule set.
             seed_state("$seed-create:example.com", "m.room.create", "",
                        R"({"room_version":"10","creator":"@resident:example.com"})", 1U);
-            seed_state("$seed-creator-member:example.com", "m.room.member", creator,
-                       R"({"membership":"join"})", 2U);
+            seed_state("$seed-creator-member:example.com", "m.room.member", creator, R"({"membership":"join"})", 2U);
             seed_state("$seed-power-levels:example.com", "m.room.power_levels", "",
                        R"({"users":{"@resident:example.com":100},"users_default":0,"ban":50,"kick":50,"invite":0})",
                        3U);
@@ -1891,6 +1890,41 @@ SCENARIO("FederationProxy delegates outbound HTTP requests to the worker pool vi
             THEN("the proxy forwards the request through IPC and returns a network failure")
             {
                 REQUIRE_FALSE(result.ok);
+            }
+        }
+    }
+}
+
+SCENARIO("FederationProxy serves version discovery locally without authentication",
+         "[integration][federation-proxy][version][authentication]")
+{
+    GIVEN("a FederationProxy wrapping a healthy worker pool")
+    {
+        if (worker_binary_path().empty())
+        {
+            SKIP("MEROVINGIAN_TEST_FEDERATION_WORKER is not defined");
+        }
+
+        REQUIRE(sodium_init() >= 0);
+        auto const tmp_dir = unique_temp_dir("merovingian-fed-proxy-version");
+        auto config = make_federation_worker_config(tmp_dir);
+        auto const config_path = tmp_dir / "merovingian.conf";
+        write_worker_config(config_path, config);
+        auto started = start_runtime(config);
+        REQUIRE(started.started);
+        auto proxy = FederationProxy{config.federation_worker(), started.runtime, std::string{worker_binary_path()},
+                                     config_path.string()};
+        REQUIRE(wait_for_healthy(proxy, std::chrono::seconds{15}));
+
+        WHEN("an unsigned GET version request passes through the proxy")
+        {
+            auto const response = proxy.handle(make_fed_request("GET", "/_matrix/federation/v1/version"));
+
+            THEN("the main process returns the version response without consulting federation authorization")
+            {
+                REQUIRE(response.status == 200U);
+                REQUIRE(response.body.find("\"name\":\"Merovingian\"") != std::string::npos);
+                REQUIRE(response.body.find("\"version\":\"" MEROVINGIAN_VERSION "\"") != std::string::npos);
             }
         }
     }

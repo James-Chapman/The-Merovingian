@@ -41,4 +41,9 @@ namespace merovingian::homeserver
 // let an unrelated path bypass authorization verification.
 [[nodiscard]] auto is_federation_openid_userinfo_endpoint(std::string_view target) noexcept -> bool;
 
+// Returns true when the request target is exactly
+// `/_matrix/federation/v1/version` (optionally followed by a query string).
+// Matrix v1.19 marks this endpoint as unauthenticated.
+[[nodiscard]] auto is_federation_version_endpoint(std::string_view target) noexcept -> bool;
+
 } // namespace merovingian::homeserver

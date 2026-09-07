@@ -58,6 +58,8 @@
 * [0052 - Revocation of credentials is one-way](0052-revocation-of-credentials-is-one-way.md)
 * [0053 - The thumbnail decoder gets its own syscall profile](0053-the-thumbnail-decoder-gets-its-own-syscall-profile.md)
 * [0054 - TLS sockets stay non-blocking for the life of the connection](0054-tls-sockets-stay-non-blocking-for-the-life-of-the-connection.md)
+* [0055 - Filter all diagnostics and preserve audits](0055-filter-all-diagnostics-and-preserve-audits.md)
+* [0056 - Use a thumbnail-specific rate limit](0056-use-a-thumbnail-specific-rate-limit.md)
 
 ## Rejected Records
 
