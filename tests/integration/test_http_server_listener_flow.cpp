@@ -1457,10 +1457,21 @@ SCENARIO("merovingian-server drops a client that stalls part-way through a reque
 
             THEN("the connection is closed well inside the old per-read window, and the listener keeps serving")
             {
-                // Post-fix this is the 5s inter-byte cap. The old behaviour
-                // could not release the connection before the 15s per-read poll
-                // expired, so a 10s bound fails against the unfixed code.
-                REQUIRE(elapsed_ms < 10000);
+                // Post-fix this is the 5s inter-byte cap firing. The old
+                // behaviour could not release the connection before the 15s
+                // per-read poll expired, so the bound has to sit between the
+                // two to mean anything.
+                //
+                // Unlike the trickle scenario's deadline bound, this one CANNOT
+                // simply be made generous: widening it past the 15s per-read
+                // poll would make it pass against the unfixed code, which is the
+                // one thing it exists to catch. 12s leaves better than 2x
+                // headroom over the expected 5s while staying 3s clear of the
+                // old floor. If a loaded runner ever pushes past it, the fix is
+                // to make inter_byte_timeout injectable so the test can use a
+                // short value and a proportionate bound — not to widen this
+                // number toward 15s, which would quietly retire the assertion.
+                REQUIRE(elapsed_ms < 12000);
                 // Whether the server answers first or just hangs up, it must not
                 // still be holding the request open.
                 std::ignore = response;
@@ -1514,9 +1525,20 @@ SCENARIO("merovingian-server bounds a client that trickles a body indefinitely u
             auto const started = std::chrono::steady_clock::now();
             auto bytes_sent = std::size_t{0U};
             auto closed = false;
-            // Give up well after the deadline should have fired, so a failure
-            // reports a bounded elapsed time rather than hanging the binary.
-            auto constexpr give_up = std::chrono::seconds{50};
+            // What this scenario distinguishes is BOUNDED from UNBOUNDED, not
+            // one duration from another: without the overall deadline this
+            // client is followed until it finishes, which at one byte per 1.5s
+            // is over 100 minutes. So the bound can be enormously generous and
+            // still mean exactly what it is meant to mean, and generous is what
+            // it should be — a loaded CI runner adds scheduling delay on both
+            // sides of a ~30s wait, and a bound tuned close to the expected
+            // value buys nothing and flakes.
+            //
+            // give_up must stay ABOVE deadline_bound so that exceeding the
+            // bound is reported as a bound breach with a real elapsed time,
+            // rather than as the loop quietly running out first.
+            auto constexpr deadline_bound = std::chrono::milliseconds{120000};
+            auto constexpr give_up = std::chrono::seconds{150};
             // Pace the dribble with an explicit sleep rather than with a poll
             // timeout. Once the server answers, a poll returns instantly on the
             // response bytes, and a loop paced by it stops dribbling and starts
@@ -1551,12 +1573,15 @@ SCENARIO("merovingian-server bounds a client that trickles a body indefinitely u
             {
                 REQUIRE(closed);
                 // The deadline is the 30s base plus the declared length at the
-                // 16 KiB/s floor. Anything under 45s is the deadline firing;
-                // without it this client is followed for hours.
-                REQUIRE(elapsed_ms < 45000);
+                // 16 KiB/s floor, so ~30s is expected. Anything inside the
+                // two-minute bound is the deadline firing; without it this
+                // client is followed for over 100 minutes.
+                REQUIRE(elapsed_ms < deadline_bound.count());
                 // And it was cut off mid-body, not allowed to finish. At one
-                // byte per 1.5s the declared 4096 could not be reached inside
-                // the give-up window even if nothing bounded the request.
+                // byte per 1.5s the declared 4096 cannot be reached inside the
+                // give-up window even if nothing bounds the request, so this is
+                // a sanity check on the dribble rate rather than a second
+                // measure of the deadline.
                 REQUIRE(bytes_sent < 4096U);
             }
         }
