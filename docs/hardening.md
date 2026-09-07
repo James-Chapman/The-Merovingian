@@ -129,7 +129,7 @@ already open and it needs nothing else for the rest of its life.
 
 | Platform | Primitive |
 |---|---|
-| Linux | seccomp-bpf syscall allowlist |
+| Linux | seccomp-bpf syscall allowlist (`platform::apply_decoder_seccomp_filter()`) |
 | OpenBSD | `pledge("stdio")` |
 | FreeBSD | Capsicum capability mode (`cap_enter`) |
 | NetBSD | **rlimits only** — no equivalent in-process primitive |
@@ -137,6 +137,32 @@ already open and it needs nothing else for the rest of its life.
 NetBSD is the remaining gap. Until one exists, run the worker under whatever
 confinement the service manager provides; the rlimits (address space, CPU, file
 size, descriptor count) still apply.
+
+**The Linux profile is its own allowlist, not the general server filter or
+the federation worker's filter (fixed 0.12.7).** Before this fix, the
+decoder's `harden()` called `platform::apply_seccomp_filter()` — the general
+*server* allowlist, which permits `socket`, `connect`, `sendto`, `openat`,
+`unlinkat`, `execve`, and `clone` — so on the primary production platform the
+decoder was effectively unconfined, while its own source comment claimed a
+decoder exploit had "nothing to reach for". `apply_worker_seccomp_filter()`,
+added for the federation worker, is **not** a substitute either: it removes
+only `execve`/`execveat` and still permits sockets, `openat`, and `clone`,
+because the federation worker genuinely needs network and thread creation.
+`apply_decoder_seccomp_filter()` is a third, dedicated profile whose
+allowlist is the seccomp-bpf equivalent of `pledge("stdio")` — I/O on
+already-open descriptors, memory management, the per-thread syscalls glibc
+issues from inside `malloc`, signal return, clock reads, and exit — denying
+every socket call, every path-based filesystem call, `execve`/`execveat`,
+and `clone`/`clone3`/`fork`/`vfork`. All three platforms now confine the
+decoder equivalently. `tests/unit/test_seccomp_hardening.cpp` asserts the
+decoder profile is strictly tighter than the worker profile on sockets,
+`openat`, and `clone`, so a later "simplification" onto the shared filter
+fails the suite rather than silently reopening this gap. **The rule this
+sets for future code: sandbox profiles are named for the threat they
+contain, not for the kind of process that installs them** — a new isolated
+child process gets its own profile unless its syscall needs are genuinely
+identical to an existing one. See
+[ADR-0053](adr/0053-the-thumbnail-decoder-gets-its-own-syscall-profile.md).
 * These checks run in `src/main.cpp` before any listener is created.
 
 ### Signal handling and graceful shutdown
@@ -172,7 +198,11 @@ and `src/media/thumbnail_worker_main.cpp`):
   * `RLIMIT_CORE` = 0;
   * `RLIMIT_NOFILE` = 16;
   * `RLIMIT_AS` = 768 MiB in production builds (skipped under sanitizers);
-  * seccomp_bpf is installed in production builds (skipped under sanitizers).
+  * `platform::apply_decoder_seccomp_filter()` is installed in production
+    builds (skipped under sanitizers) — the decoder's own allowlist, not the
+    general server filter and not `apply_worker_seccomp_filter()`; see
+    "Thumbnail worker sandbox" above and
+    [ADR-0053](adr/0053-the-thumbnail-decoder-gets-its-own-syscall-profile.md).
 * The worker rejects images whose width or height exceeds 4096 and whose pixel
   count exceeds the request's `max_pixels`.
 

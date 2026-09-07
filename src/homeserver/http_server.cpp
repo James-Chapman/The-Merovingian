@@ -166,6 +166,20 @@ namespace
     //     for any non-attack traffic.
     constexpr auto request_head_deadline = std::chrono::seconds{30};
     constexpr auto inter_byte_timeout = std::chrono::seconds{5};
+    // M-06: the same two caps for the request BODY, which previously had
+    // neither — it relied solely on the per-read poll above, so each 4096-byte
+    // chunk got a fresh 15 s window and a client dribbling a declared
+    // Content-Length could hold a worker for (bytes / chunk) x 15 s without
+    // ever timing out. The head was hardened for this; the body was not.
+    //
+    // A flat deadline will not do here: a large media upload is legitimately
+    // slow. Instead the body deadline scales with the declared length at a
+    // minimum-throughput floor, which is what distinguishes a slow client from
+    // a dribbling one. The floor is deliberately far below any real connection
+    // (16 KiB/s), so honest uploads are never cut off, while a 1 MiB body gets
+    // ~94 s total rather than the ~65 minutes the old per-read window allowed.
+    constexpr auto request_body_base_deadline = std::chrono::seconds{30};
+    constexpr auto request_body_min_bytes_per_second = std::size_t{16U * 1024U};
     constexpr auto header_terminator = std::string_view{"\r\n\r\n"};
 
     class ConnectionStream
@@ -493,14 +507,30 @@ namespace
         return static_cast<std::size_t>(limits.max_body_bytes);
     }
 
-    [[nodiscard]] auto recv_with_timeout(ConnectionStream& stream, char* buffer, std::size_t capacity) noexcept
-        -> std::ptrdiff_t
+    // Returned by recv_with_timeout when the poll budget expired with no data,
+    // as distinct from -1 for a peer close or socket error. The caller loops on
+    // it so the slowloris caps below are re-evaluated and the specific one that
+    // expired is the thing that ends the request (and gets logged).
+    constexpr auto recv_budget_expired = std::ptrdiff_t{-2};
+
+    // `budget_ms` bounds this single poll. It must be the SMALLEST of the
+    // per-read timeout and the time left on any slowloris cap the caller is
+    // enforcing: the caps are only checked between reads, so a poll allowed to
+    // outlast one makes that cap unenforceable. That was a real defect — with a
+    // fixed 15s poll and a 5s inter-byte cap, a peer that stopped mid-body held
+    // the worker for the full 15s and the inter-byte cap never once fired.
+    [[nodiscard]] auto recv_with_timeout(ConnectionStream& stream, char* buffer, std::size_t capacity,
+                                         int budget_ms) noexcept -> std::ptrdiff_t
     {
         auto entry = pollfd{};
         entry.fd = stream.fd();
         entry.events = POLLIN;
-        auto const poll_result = ::poll(&entry, 1U, receive_timeout_milliseconds);
-        if (poll_result <= 0)
+        auto const poll_result = ::poll(&entry, 1U, budget_ms);
+        if (poll_result == 0)
+        {
+            return recv_budget_expired;
+        }
+        if (poll_result < 0)
         {
             return -1;
         }
@@ -509,6 +539,23 @@ namespace
             return -1;
         }
         return stream.read(buffer, capacity);
+    }
+
+    // The poll budget for one read: whichever of the per-read timeout, the
+    // overall deadline, and the inter-byte cap runs out first. Never negative —
+    // an already-expired cap yields a zero-length poll and the caller's loop-top
+    // check then ends the request.
+    [[nodiscard]] auto recv_budget_ms(std::chrono::steady_clock::time_point now,
+                                      std::chrono::steady_clock::time_point deadline,
+                                      std::chrono::steady_clock::time_point last_byte) noexcept -> int
+    {
+        auto const to_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        auto const to_inter_byte =
+            std::chrono::duration_cast<std::chrono::milliseconds>((last_byte + inter_byte_timeout) - now).count();
+        auto const smallest =
+            std::min({static_cast<std::int64_t>(receive_timeout_milliseconds), static_cast<std::int64_t>(to_deadline),
+                      static_cast<std::int64_t>(to_inter_byte)});
+        return smallest <= 0 ? 0 : static_cast<int>(smallest);
     }
 
     // Reads one full request head. `buffered` carries bytes read past the
@@ -538,7 +585,7 @@ namespace
             // bounds the worst-case worker hold time regardless of how
             // cleverly the client dribbles bytes.
             auto const now = std::chrono::steady_clock::now();
-            if (now - start > request_head_deadline)
+            if (now - start >= request_head_deadline)
             {
                 log_diagnostic(
                     "request.head_slowloris",
@@ -551,7 +598,7 @@ namespace
                 });
                 return {std::move(buffer), std::string::npos};
             }
-            if (now - last_byte > inter_byte_timeout)
+            if (now - last_byte >= inter_byte_timeout)
             {
                 log_diagnostic(
                     "request.head_slowloris",
@@ -570,7 +617,16 @@ namespace
             }
             auto const remaining_capacity = cap - buffer.size();
             auto const wanted = remaining_capacity < chunk.size() ? remaining_capacity : chunk.size();
-            auto const received = recv_with_timeout(stream, chunk.data(), wanted);
+            // Bound the poll by whichever cap expires first, so neither the
+            // overall deadline nor the inter-byte cap can be outlived by a
+            // single read. On expiry, loop so the check above names the cap.
+            auto const received =
+                recv_with_timeout(stream, chunk.data(), wanted, recv_budget_ms(now, start + request_head_deadline,
+                                                                              last_byte));
+            if (received == recv_budget_expired)
+            {
+                continue;
+            }
             if (received <= 0)
             {
                 return {std::move(buffer), std::string::npos};
@@ -610,16 +666,61 @@ namespace
             return {std::move(body), std::move(leftover), true};
         }
         auto chunk = std::array<char, 4096U>{};
+        // M-06: bound the total time this body may take, and the gap between any
+        // two bytes of it. Without both, a worker thread is held for as long as
+        // the client cares to dribble.
+        auto const start = std::chrono::steady_clock::now();
+        auto const deadline =
+            start + request_body_base_deadline +
+            std::chrono::seconds{static_cast<std::int64_t>(expected / request_body_min_bytes_per_second)};
+        auto last_byte = start;
         while (body.size() < expected)
         {
+            auto const now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+            {
+                log_diagnostic(
+                    "request.body_slowloris",
+                    {
+                        {"reason",         "overall_deadline",                                                       false},
+                        {"elapsed_ms",
+                         std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count()),
+                         false                                                                                            },
+                        {"bytes_received", std::to_string(body.size()),                                              false},
+                        {"bytes_expected", std::to_string(expected),                                                 false}
+                });
+                return {};
+            }
+            if (now - last_byte >= inter_byte_timeout)
+            {
+                log_diagnostic(
+                    "request.body_slowloris",
+                    {
+                        {"reason",         "inter_byte_timeout",                                                         false},
+                        {"elapsed_ms",
+                         std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now - last_byte).count()),
+                         false                                                                                                },
+                        {"bytes_received", std::to_string(body.size()),                                                  false},
+                        {"bytes_expected", std::to_string(expected),                                                     false}
+                });
+                return {};
+            }
             auto const remaining = expected - body.size();
             auto const wanted = remaining < chunk.size() ? remaining : chunk.size();
-            auto const received = recv_with_timeout(stream, chunk.data(), wanted);
+            // Same bounding as the head read above: a 15s poll would otherwise
+            // outlive the 5s inter-byte cap and make it unenforceable.
+            auto const received =
+                recv_with_timeout(stream, chunk.data(), wanted, recv_budget_ms(now, deadline, last_byte));
+            if (received == recv_budget_expired)
+            {
+                continue;
+            }
             if (received <= 0)
             {
                 return {};
             }
             body.append(chunk.data(), static_cast<std::size_t>(received));
+            last_byte = std::chrono::steady_clock::now();
         }
         return {std::move(body), {}, true};
     }

@@ -610,6 +610,109 @@ namespace
         __NR_sysinfo,
     };
 
+    // M-08: the decoder profile for the thumbnail worker child. This is the
+    // seccomp equivalent of the OpenBSD pledge("stdio") and FreeBSD cap_enter()
+    // calls in media/thumbnail_worker_main.cpp::harden() — it grants no
+    // filesystem namespace, no sockets, and no process creation.
+    //
+    // It is deliberately NOT k_worker_allowed_syscalls. That profile exists for
+    // the federation worker, which needs sockets for federation HTTP and threads
+    // for its pool; it removes only execve/execveat. A media decoder needs
+    // neither, and reusing it would leave a libpng/libjpeg-turbo compromise able
+    // to open files, connect out, and exfiltrate media — the exact containment
+    // the worker's isolation boundary is documented to provide.
+    //
+    // The worker is handed its request on stdin and writes the encoded thumbnail
+    // to stdout; both descriptors are already open when the filter is installed,
+    // so nothing here needs to name a file. Anything absent from this list is a
+    // decoder doing something a decoder has no reason to do.
+    constexpr int k_decoder_allowed_syscalls[] = {
+        // NOLINT(*-avoid-c-arrays)
+        // ── I/O on already-open descriptors ────────────────────────────────
+        __NR_read,
+        __NR_write,
+        __NR_readv,
+        __NR_writev,
+        __NR_pread64,
+        __NR_pwrite64,
+        __NR_lseek,
+        __NR_close,
+        // fstat only: the fd-based form. Every path-based stat is omitted, as
+        // are open/openat/openat2, unlink*, rename*, mkdirat, chdir and
+        // getdents64 — a decoder that names a file is already compromised.
+        __NR_fstat,
+#ifdef __NR_newfstatat
+        // glibc implements fstat() as newfstatat(fd, "", ..., AT_EMPTY_PATH),
+        // so this is required for fstat to work at all on modern glibc.
+        __NR_newfstatat,
+#endif
+#ifdef __NR_statx
+        __NR_statx,
+#endif
+        // stdio buffering probes the descriptor before its first write.
+        __NR_fcntl,
+        __NR_ioctl,
+        // ── Memory ─────────────────────────────────────────────────────────
+        // libpng and libjpeg-turbo allocate freely while decoding; RLIMIT_AS
+        // (set in harden() before this filter) is what bounds them, not seccomp.
+        __NR_mmap,
+        __NR_munmap,
+        __NR_mprotect,
+        __NR_brk,
+        __NR_mremap,
+        __NR_madvise,
+        // ── Threads and synchronisation ────────────────────────────────────
+        // No clone/clone3/fork/vfork: the decoder is single-threaded by the time
+        // the filter is installed and must not be able to spawn anything. futex
+        // and the per-thread syscalls below remain because glibc issues them
+        // from inside malloc, not because the worker creates threads.
+        __NR_futex,
+        __NR_set_robust_list,
+        __NR_get_robust_list,
+        __NR_set_tid_address,
+        __NR_sched_yield,
+#ifdef __NR_rseq
+        __NR_rseq,
+#elif defined(__x86_64__) || defined(__aarch64__)
+        334,
+#endif
+#ifdef __NR_membarrier
+        __NR_membarrier,
+#elif defined(__x86_64__) || defined(__aarch64__)
+        324,
+#endif
+#ifdef __NR_getcpu
+        __NR_getcpu,
+#elif defined(__x86_64__) || defined(__aarch64__)
+        309,
+#endif
+#ifdef __NR_futex_waitv
+        __NR_futex_waitv,
+#elif defined(__x86_64__) || defined(__aarch64__)
+        449,
+#endif
+        // ── Signals ────────────────────────────────────────────────────────
+        // rt_sigreturn is mandatory: without it the process cannot return from
+        // any signal handler, including the one seccomp itself may deliver.
+        __NR_rt_sigreturn,
+        __NR_rt_sigaction,
+        __NR_rt_sigprocmask,
+        __NR_sigaltstack,
+        __NR_restart_syscall,
+        // ── Time ───────────────────────────────────────────────────────────
+        __NR_clock_gettime,
+        __NR_clock_getres,
+        __NR_gettimeofday,
+        // ── Entropy and identity ───────────────────────────────────────────
+        // getrandom feeds glibc's malloc and stack-protector initialisation. It
+        // reads entropy; it opens no namespace and is not an escape route.
+        __NR_getrandom,
+        __NR_getpid,
+        // ── Exit ───────────────────────────────────────────────────────────
+        __NR_exit,
+        __NR_exit_group,
+    };
+
     // Builds a seccomp-bpf program for the given syscall allowlist with the
     // given default action. Used to install the worker filter from
     // k_worker_allowed_syscalls without duplicating the hand-written BPF
@@ -771,6 +874,25 @@ auto apply_worker_seccomp_filter_with_default([[maybe_unused]] std::uint32_t def
 #endif
 }
 
+auto apply_decoder_seccomp_filter() noexcept -> bool
+{
+#ifdef __linux__
+    return install_seccomp_program(build_seccomp_program(k_decoder_allowed_syscalls, k_seccomp_ret_kill_process),
+                                   k_seccomp_ret_kill_process);
+#else
+    return false;
+#endif
+}
+
+auto apply_decoder_seccomp_filter_with_default([[maybe_unused]] std::uint32_t default_action) noexcept -> bool
+{
+#ifdef __linux__
+    return install_seccomp_program(build_seccomp_program(k_decoder_allowed_syscalls, default_action), default_action);
+#else
+    return false;
+#endif
+}
+
 auto probe_seccomp_status() -> SeccompProbeResult
 {
 #ifdef __linux__
@@ -827,6 +949,24 @@ auto worker_seccomp_is_syscall_allowed(int const syscall_number) noexcept -> boo
 {
     // The worker allowlist is a plain syscall-number array (no BPF to scan).
     for (auto const nr : k_worker_allowed_syscalls)
+    {
+        if (nr == syscall_number)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto decoder_seccomp_default_action() noexcept -> std::uint32_t
+{
+    return k_seccomp_ret_kill_process;
+}
+
+auto decoder_seccomp_is_syscall_allowed(int const syscall_number) noexcept -> bool
+{
+    // Same plain-array scan as the worker predicate above.
+    for (auto const nr : k_decoder_allowed_syscalls)
     {
         if (nr == syscall_number)
         {

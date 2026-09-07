@@ -65,10 +65,23 @@ public:
     [[nodiscard]] auto write(std::string_view data) noexcept -> std::ptrdiff_t;
 
 private:
-    TlsConnection(ssl_st& connection, int file_descriptor) noexcept;
+    TlsConnection(ssl_st& connection, int file_descriptor, int io_timeout_milliseconds) noexcept;
+
+    // Shared retry loop behind read() and write(). `reading` selects SSL_read_ex
+    // or SSL_write_ex; both need identical WANT_READ/WANT_WRITE handling against
+    // a deadline, and duplicating it invites the two paths to drift.
+    [[nodiscard]] auto pump(bool reading, void* buffer, std::size_t length, std::size_t& transferred) noexcept
+        -> std::ptrdiff_t;
 
     ssl_st* m_connection;
     int m_fd;
+    // M-07: the socket stays non-blocking for the life of the connection, so
+    // read() and write() drive OpenSSL's WANT_READ/WANT_WRITE themselves and
+    // must carry their own deadline. Previously the fd was restored to blocking
+    // after the handshake, which let a partial TLS record park a worker thread
+    // inside SSL_read indefinitely — the caller's poll() only proves that TCP
+    // bytes arrived, never that a whole TLS record did.
+    int m_io_timeout_ms;
 
     friend struct TlsConnectionResult;
     friend auto accept_tls_connection(TlsServerContext& context, int client_fd, int timeout_milliseconds)

@@ -131,9 +131,18 @@ auto harden() -> void
     // which need syscalls (e.g. for shadow memory, error reporting, and
     // /proc access) that the production worker does not require. Skip it
     // in sanitizer builds so the worker can run under ASan/UBSan/TSan.
+    //
+    // M-08: this installs the DECODER profile, not the general server filter
+    // and not the federation-worker filter. The server filter permits sockets,
+    // path-based filesystem access and exec; the federation-worker filter drops
+    // only exec and still permits sockets and openat, because that worker does
+    // federation HTTP. Either would leave a libpng/libjpeg-turbo compromise able
+    // to read arbitrary files and connect out, which is exactly what the
+    // pledge("stdio") and cap_enter() branches below prevent on the BSDs. The
+    // decoder profile is the Linux equivalent of those two calls.
     if (!sanitizer_build)
     {
-        std::ignore = merovingian::platform::apply_seccomp_filter();
+        std::ignore = merovingian::platform::apply_decoder_seccomp_filter();
     }
 #elif defined(__OpenBSD__)
     // "stdio" covers read/write on already-open descriptors, memory allocation

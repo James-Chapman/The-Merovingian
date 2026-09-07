@@ -908,56 +908,58 @@ namespace
     return revoked;
 }
 
-// Un-revokes the access and refresh tokens belonging to one device. Used by the
-// password-change flow (logout_devices): revoke_access_tokens_for_user /
-// revoke_refresh_tokens_for_user flip every token for the user, then this
-// restores the caller's own device so its session survives the change. Mirrors
-// the per-device revoke helpers with the inverted revoked flag.
-[[nodiscard]] auto restore_tokens_for_device(PersistentStore& store, std::string_view user_id,
-                                             std::string_view device_id) -> std::size_t
-{
-    auto restored = std::size_t{0U};
-    if (record_and_persist(
-            store,
-            record_statement("restore_device_access_tokens",
-                             "UPDATE access_tokens SET revoked = $1 WHERE user_id = $2 AND "
-                             "device_id = $3",
-                             {
-                                 {"false",                false},
-                                 {std::string{user_id},   false},
-                                 {std::string{device_id}, false}
-    })))
-    {
-        for (auto& token : store.access_tokens)
-        {
-            if (token.user_id == user_id && token.device_id == device_id && token.revoked)
-            {
-                token.revoked = false;
-                ++restored;
-            }
-        }
+// M-05: revokes every access and refresh token belonging to `user_id` EXCEPT
+// those of `keep_device_id`.
+//
+// This replaces an earlier revoke-everything-then-restore-one-device pair. That
+// approach could not distinguish the tokens it had just revoked from tokens
+// revoked days earlier by a logout, an admin action, or a previous password
+// change, so restoring the caller's device un-revoked all of them. A password
+// change is precisely the action a user takes after a compromise, and it
+// resurrected the attacker's token for that device.
+//
+// There is deliberately no inverse "restore" helper: no code path should be
+// able to un-revoke a credential. Revocation is one-way, so that a token which
+// has ever been revoked can never authenticate again.
+[[nodiscard]] auto revoke_tokens_for_user_except_device(
+    PersistentStore &store, std::string_view user_id,
+    std::string_view keep_device_id) -> std::size_t {
+  auto revoked = std::size_t{0U};
+  if (record_and_persist(
+          store,
+          record_statement(
+              "revoke_user_access_tokens_except_device",
+              "UPDATE access_tokens SET revoked = $1 WHERE user_id = $2 AND "
+              "device_id <> $3",
+              {{"true", false},
+               {std::string{user_id}, false},
+               {std::string{keep_device_id}, false}}))) {
+    for (auto &token : store.access_tokens) {
+      if (token.user_id == user_id && token.device_id != keep_device_id &&
+          !token.revoked) {
+        token.revoked = true;
+        ++revoked;
+      }
     }
-    if (record_and_persist(
-            store,
-            record_statement("restore_device_refresh_tokens",
-                             "UPDATE refresh_tokens SET revoked = $1 WHERE user_id = $2 AND "
-                             "device_id = $3",
-                             {
-                                 {"false",                false},
-                                 {std::string{user_id},   false},
-                                 {std::string{device_id}, false}
-    })))
-    {
-        for (auto& token : store.refresh_tokens)
-        {
-            if (token.user_id == user_id && token.device_id == device_id && token.revoked)
-            {
-                token.revoked = false;
-                ++restored;
-            }
-        }
+  }
+  if (record_and_persist(
+          store,
+          record_statement(
+              "revoke_user_refresh_tokens_except_device",
+              "UPDATE refresh_tokens SET revoked = $1 WHERE user_id = $2 AND "
+              "device_id <> $3",
+              {{"true", false},
+               {std::string{user_id}, false},
+               {std::string{keep_device_id}, false}}))) {
+    for (auto &token : store.refresh_tokens) {
+      if (token.user_id == user_id && token.device_id != keep_device_id &&
+          !token.revoked) {
+        token.revoked = true;
+        ++revoked;
+      }
     }
-    return restored;
+  }
+  return revoked;
 }
 
 [[nodiscard]] auto update_device_display_name(PersistentStore& store, std::string_view user_id,

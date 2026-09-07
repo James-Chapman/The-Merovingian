@@ -46,9 +46,34 @@ production-gated.
   `sid` (migration `007`) needed to drive a mode-2 remote unbind.
 - Access-token hashes are durable and hydrate back into runtime sessions after
   restart.
-- Refresh-token hashes are persisted, rotated, and revoked on global logout,
-  device deletion, or password change with `logout_devices: true` (spec default)
-  without storing plaintext token material; the caller's own device is preserved.
+- Refresh-token hashes are persisted, rotated, and revoked on single-device
+  logout, global logout, device deletion, or password change with
+  `logout_devices: true` (spec default) without storing plaintext token
+  material; the caller's own device is preserved.
+  **Single-device `POST /logout` revokes the device's refresh token as well
+  as its access token (fixed 0.12.7).** Before that fix, logout revoked only
+  the access token and flipped the in-memory session, leaving the refresh
+  token usable — `refresh_local_session` admits any refresh row that is
+  merely unrevoked, so the client that had just logged out, or anyone holding
+  a stolen refresh token, could immediately mint a fresh access token and
+  logout was cosmetic. `logout_all`, device deletion, and password change
+  already revoked refresh tokens; single-device logout was the one path that
+  did not.
+  **Password change with `logout_devices: true` revokes every other device
+  directly, rather than revoking everything and restoring one (fixed
+  0.12.7).** The prior sequence — revoke every token for the user, then
+  `UPDATE access_tokens SET revoked = false WHERE user_id AND device_id` for
+  the caller's own device — could not distinguish a token it had just revoked
+  from one revoked days earlier by a logout, an admin action, or a previous
+  password change, so it resurrected all of them. A password change is
+  precisely the action a user takes after discovering a compromise, so this
+  handed the attacker's revoked token back. `database::revoke_tokens_for_
+  user_except_device` replaces the revoke-then-restore pair: the caller's
+  device is never revoked in the first place, so there is nothing to
+  reinstate. See [ADR-0052](adr/0052-revocation-of-credentials-is-one-way.md)
+  and `docs/database-persistence.md` — **a credential that has ever been
+  revoked must never authenticate again**, and no store function may clear a
+  `revoked` flag to make that true.
 - Account lock/suspend admin endpoints `GET/PUT /_matrix/client/v1/admin/lock/{userId}`
   and `/_matrix/client/v1/admin/suspend/{userId}` (admin-gated, anti-enumeration,
   locality and self/other-admin guards) set the persisted and in-memory account
@@ -465,6 +490,9 @@ The boundary establishes these guarantees:
   both access and refresh tokens via the configurable lifetimes above, distinct from
   revocation: an expired-but-not-revoked session is rejected with audit reason
   `token expired`.
+- Revocation is one-way: a credential that has ever been revoked never
+  authenticates again, and no database function may clear a `revoked` flag
+  once set. See [ADR-0052](adr/0052-revocation-of-credentials-is-one-way.md).
 - Locked accounts cannot pass the login policy gate; suspended accounts may
   still log in, and their new session is itself suspended and gated by the
   request-path `M_USER_SUSPENDED` check.

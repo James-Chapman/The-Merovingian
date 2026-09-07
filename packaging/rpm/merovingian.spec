@@ -1,5 +1,5 @@
 Name:           merovingian
-Version:        0.12.6
+Version:        0.12.7
 Release:        1%{?dist}
 Summary:        Secure Matrix Protocol homeserver
 
@@ -101,7 +101,9 @@ fi
 %{_sysconfdir}/merovingian/merovingian.conf.example
 
 %changelog
-* Sat Sep 05 2026 James Chapman <claude@ping.me.uk> - 0.12.6-1
+* Sun Sep 06 2026 James Chapman <claude@ping.me.uk> - 0.12.7-1
+- fix(security): 0.12.6 security audit - all 8 findings fixed. Federation send_join/send_leave/send_knock ran signature and content-hash checks but never the room authorization rules before persisting, so any remote server with a valid signing key could join a user into an invite-only room (M-01, critical); SRV delegation moved the TLS identity to the SRV target, letting unsigned DNS choose which certificate is trusted for a server's keys (M-02); GET /rooms/{roomId}/state/{eventType}/{stateKey} returned state to any authenticated user with no membership check (M-03); single-device logout left the paired refresh token usable (M-04); password change revoked all tokens then restored the caller's device with an unfiltered UPDATE, resurrecting previously revoked tokens (M-05); request bodies had no total deadline or throughput floor (M-06); TLS sockets returned to blocking mode after the handshake so a partial TLS record could park a worker thread past every deadline (M-07); the thumbnail decoder ran under the general server seccomp filter, which permits sockets, exec and path-based filesystem access, while the BSDs confined it with pledge/cap_enter (M-08). M-06 and M-07 ship together - the body deadline is inert on TLS listeners without the TLS fix. ADR-0052, ADR-0053, ADR-0054 recorded.
+* Sat Sep 05 2026 James Chapman <claude@ping.me.uk> - 0.12.7-1
 - fix(locking): remove the recursive-mutex release defect class (issue #487) - runtime.mutex is now a RuntimeMutex that records its owning thread; NetworkIoUnlock and ScopedGuardRelease collapse into one RuntimeLockRelease that drains every recursion level the calling thread holds and restores exactly that many on exit, throwing paths included; a third live instance of the stall is fixed in invite_user_by_threepid, where the identity-server store-invite round trip ran with the dispatcher's guard still held; join_room's ~350-line released region is extracted into perform_federated_join so the lock boundary is a function boundary; no hand-written release of the runtime mutex remains in include/ or src/, and reject-unsafe.sh now matches ->unlock() as well as .unlock()
 
 * Fri Sep 04 2026 James Chapman <claude@ping.me.uk> - 0.12.5-1

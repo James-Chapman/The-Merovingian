@@ -840,3 +840,159 @@ SCENARIO("an ordinary access token is rejected by federation_openid_userinfo", "
         }
     }
 }
+
+// --- M-04: logout must invalidate the device's refresh token -----------------
+// Spec: docs/matrix-v1.19-spec/client-server-api.md
+//       #post_matrixclientv3logout — logout invalidates the access token and
+//       the refresh token issued alongside it.
+//
+// The bug: logout_local_user revoked the access token and flipped the in-memory
+// session, but never touched the refresh_tokens table. refresh_local_session
+// admits any refresh row that is merely unrevoked, so the "logged out" client
+// could mint a brand-new access token immediately afterwards and carry on.
+// logout_all, device deletion and password change all revoked refresh tokens
+// already; single-device logout was the one path that did not.
+SCENARIO("logout_local_user revokes the device's refresh token, not just the access token",
+         "[homeserver][auth][logout][security][m04]")
+{
+    GIVEN("a logged-in session that also holds a refresh token")
+    {
+        REQUIRE(sodium_init() >= 0);
+        auto started = merovingian::homeserver::start_runtime(registration_enabled_config());
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        auto const reg = merovingian::homeserver::register_local_user(runtime, "alice", "CorrectHorse7!",
+                                                                      merovingian::tests::registration_token);
+        REQUIRE(reg.ok);
+        auto const login = merovingian::homeserver::login_local_user(runtime, reg.value, "CorrectHorse7!", "DEVICE_A");
+        REQUIRE(login.ok);
+        auto const refresh_issued =
+            merovingian::homeserver::issue_refresh_token_for_session(runtime, reg.value, "DEVICE_A");
+        REQUIRE(refresh_issued.ok);
+
+        WHEN("the session is logged out")
+        {
+            auto const logout = merovingian::homeserver::logout_local_user(runtime, login.value);
+            REQUIRE(logout.ok);
+
+            THEN("the access token is rejected and the refresh token can no longer mint a new one")
+            {
+                REQUIRE_FALSE(merovingian::homeserver::authenticated_user(runtime, login.value).has_value());
+
+                // The assertion that matters: a logout that leaves the refresh
+                // token alive is cosmetic, because this call hands back a fresh
+                // access token for the session the user just ended.
+                auto const refreshed = merovingian::homeserver::refresh_local_session(runtime, refresh_issued.value);
+                REQUIRE_FALSE(refreshed.ok);
+                REQUIRE(refreshed.access_token.empty());
+            }
+        }
+    }
+}
+
+// --- M-05: a password change must never resurrect a revoked token ------------
+// Spec: docs/matrix-v1.19-spec/client-server-api.md
+//       #post_matrixclientv3accountpassword — with logout_devices (the default)
+//       the server invalidates the access tokens of the user's OTHER devices.
+//
+// The bug: the implementation revoked every token for the user and then called
+// restore_tokens_for_device for the caller's own device. That restore was an
+// unfiltered "SET revoked = false WHERE user_id AND device_id", so it could not
+// distinguish tokens it had revoked microseconds earlier from tokens revoked
+// days earlier by a logout or an admin action — and it un-revoked all of them.
+//
+// A password change is the action a user performs *after* discovering a
+// compromise, so the remediation handed a previously-revoked token back to
+// whoever held it. The fix revokes the other devices directly and deletes the
+// restore path entirely, so no code can un-revoke a credential.
+SCENARIO("change_local_user_password does not resurrect a previously revoked token on the caller's device",
+         "[homeserver][auth][password_change][security][m05]")
+{
+    GIVEN("a device whose earlier session was logged out, and a current session on that same device")
+    {
+        REQUIRE(sodium_init() >= 0);
+        auto started = merovingian::homeserver::start_runtime(registration_enabled_config());
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        auto const reg = merovingian::homeserver::register_local_user(runtime, "alice", "OldPassword7!",
+                                                                      merovingian::tests::registration_token);
+        REQUIRE(reg.ok);
+
+        // The stolen-and-revoked credential: a session on DEVICE1 that was
+        // explicitly logged out. Nothing may ever make this token valid again.
+        auto const stolen = merovingian::homeserver::login_local_user(runtime, reg.value, "OldPassword7!", "DEVICE1");
+        REQUIRE(stolen.ok);
+        auto const stolen_logout = merovingian::homeserver::logout_local_user(runtime, stolen.value);
+        REQUIRE(stolen_logout.ok);
+        REQUIRE_FALSE(merovingian::homeserver::authenticated_user(runtime, stolen.value).has_value());
+
+        // The user then signs in again on the same device and changes their
+        // password, which is exactly what someone does after a compromise.
+        auto const current = merovingian::homeserver::login_local_user(runtime, reg.value, "OldPassword7!", "DEVICE1");
+        REQUIRE(current.ok);
+
+        WHEN("the password is changed from that device with logout_devices enabled")
+        {
+            auto const change =
+                merovingian::homeserver::change_local_user_password(runtime, current.value, "NewPassword99!");
+            REQUIRE(change.ok);
+
+            THEN("the previously revoked token on that device stays revoked")
+            {
+                // This is the finding: the old revoke-then-restore reinstated it.
+                REQUIRE_FALSE(merovingian::homeserver::authenticated_user(runtime, stolen.value).has_value());
+            }
+
+            AND_THEN("the session that performed the change still works")
+            {
+                // The whole point of keeping the caller's device is that the user
+                // is not logged out of the device they are sitting at.
+                REQUIRE(merovingian::homeserver::authenticated_user(runtime, current.value).has_value());
+            }
+        }
+    }
+}
+
+// A password change must still drop the user's other devices — the behaviour the
+// revoke-then-restore pair was written to provide. Asserting it here means the
+// M-05 fix cannot be "achieved" by simply not revoking anything.
+SCENARIO("change_local_user_password still revokes other devices after the M-05 fix",
+         "[homeserver][auth][password_change][security][m05]")
+{
+    GIVEN("a user signed in on two devices")
+    {
+        REQUIRE(sodium_init() >= 0);
+        auto started = merovingian::homeserver::start_runtime(registration_enabled_config());
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        auto const reg = merovingian::homeserver::register_local_user(runtime, "alice", "OldPassword7!",
+                                                                      merovingian::tests::registration_token);
+        REQUIRE(reg.ok);
+        auto const caller = merovingian::homeserver::login_local_user(runtime, reg.value, "OldPassword7!", "DEVICE1");
+        REQUIRE(caller.ok);
+        auto const other = merovingian::homeserver::login_local_user(runtime, reg.value, "OldPassword7!", "DEVICE2");
+        REQUIRE(other.ok);
+        auto const other_refresh =
+            merovingian::homeserver::issue_refresh_token_for_session(runtime, reg.value, "DEVICE2");
+        REQUIRE(other_refresh.ok);
+
+        WHEN("the password is changed from the first device")
+        {
+            auto const change =
+                merovingian::homeserver::change_local_user_password(runtime, caller.value, "NewPassword99!");
+            REQUIRE(change.ok);
+
+            THEN("the other device loses both its access token and its refresh token")
+            {
+                REQUIRE_FALSE(merovingian::homeserver::authenticated_user(runtime, other.value).has_value());
+                // A revoked access token with a live refresh token is not a
+                // revoked session, which is the same mistake as M-04.
+                auto const refreshed = merovingian::homeserver::refresh_local_session(runtime, other_refresh.value);
+                REQUIRE_FALSE(refreshed.ok);
+            }
+        }
+    }
+}

@@ -109,9 +109,10 @@ auto TlsServerContextResult::ok() const noexcept -> bool
     return context.has_value();
 }
 
-TlsConnection::TlsConnection(ssl_st& connection, int file_descriptor) noexcept
+TlsConnection::TlsConnection(ssl_st& connection, int file_descriptor, int io_timeout_milliseconds) noexcept
     : m_connection{&connection}
     , m_fd{file_descriptor}
+    , m_io_timeout_ms{io_timeout_milliseconds}
 {
 }
 
@@ -123,6 +124,7 @@ TlsConnection::~TlsConnection()
 TlsConnection::TlsConnection(TlsConnection&& other) noexcept
     : m_connection{std::exchange(other.m_connection, nullptr)}
     , m_fd{std::exchange(other.m_fd, -1)}
+    , m_io_timeout_ms{std::exchange(other.m_io_timeout_ms, 0)}
 {
 }
 
@@ -133,6 +135,7 @@ auto TlsConnection::operator=(TlsConnection&& other) noexcept -> TlsConnection&
         SSL_free(m_connection);
         m_connection = std::exchange(other.m_connection, nullptr);
         m_fd = std::exchange(other.m_fd, -1);
+        m_io_timeout_ms = std::exchange(other.m_io_timeout_ms, 0);
     }
     return *this;
 }
@@ -142,24 +145,58 @@ auto TlsConnection::fd() const noexcept -> int
     return m_fd;
 }
 
+// M-07: the socket is non-blocking for the connection's whole life, so an
+// incomplete TLS record surfaces as SSL_ERROR_WANT_READ rather than blocking
+// inside OpenSSL. Both I/O paths therefore pump the same wait loop: retry the
+// SSL call, and when it wants more socket readiness, poll for it against a
+// deadline. Returning -1 on expiry means a peer that opens a record and stops
+// costs one bounded timeout instead of a permanently parked worker thread.
+//
+// OpenSSL requires that a retried call use the SAME arguments as the call that
+// returned WANT_READ/WANT_WRITE, which is why the buffer and length are hoisted
+// out of the loop rather than advanced across iterations.
+auto TlsConnection::pump(bool const reading, void* const buffer, std::size_t const length,
+                         std::size_t& transferred) noexcept -> std::ptrdiff_t
+{
+    auto const started = std::chrono::steady_clock::now();
+    while (true)
+    {
+        transferred = 0U;
+        auto const result = reading ? SSL_read_ex(m_connection, buffer, length, &transferred)
+                                    : SSL_write_ex(m_connection, buffer, length, &transferred);
+        if (result == 1)
+        {
+            return static_cast<std::ptrdiff_t>(transferred);
+        }
+
+        auto const ssl_error = SSL_get_error(m_connection, result);
+        if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE)
+        {
+            // A clean shutdown or a real protocol error: nothing to wait for.
+            return -1;
+        }
+
+        auto const elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+        auto const remaining = m_io_timeout_ms - static_cast<int>(elapsed.count());
+        if (remaining <= 0 || !poll_for_tls(m_fd, ssl_error, remaining))
+        {
+            return -1;
+        }
+    }
+}
+
 auto TlsConnection::read(char* buffer, std::size_t capacity) noexcept -> std::ptrdiff_t
 {
     auto received = std::size_t{0U};
-    if (SSL_read_ex(m_connection, buffer, capacity, &received) != 1)
-    {
-        return -1;
-    }
-    return static_cast<std::ptrdiff_t>(received);
+    return pump(true, buffer, capacity, received);
 }
 
 auto TlsConnection::write(std::string_view data) noexcept -> std::ptrdiff_t
 {
     auto written = std::size_t{0U};
-    if (SSL_write_ex(m_connection, data.data(), data.size(), &written) != 1)
-    {
-        return -1;
-    }
-    return static_cast<std::ptrdiff_t>(written);
+    // SSL_write_ex takes a non-const pointer but does not modify the buffer.
+    return pump(false, const_cast<char*>(data.data()), data.size(), written); // NOLINT(*-const-cast)
 }
 
 auto TlsConnectionResult::ok() const noexcept -> bool
@@ -233,7 +270,7 @@ auto accept_tls_connection(TlsServerContext& context, int client_fd, int timeout
         return {{}, openssl_error_string("unable to create TLS connection")};
     }
 
-    auto connection = TlsConnection{*raw_connection, client_fd};
+    auto connection = TlsConnection{*raw_connection, client_fd, timeout_milliseconds};
     if (SSL_set_fd(connection.m_connection, client_fd) != 1)
     {
         return {{}, openssl_error_string("unable to attach socket to TLS connection")};
@@ -251,7 +288,14 @@ auto accept_tls_connection(TlsServerContext& context, int client_fd, int timeout
         auto const accept_result = SSL_accept(connection.m_connection);
         if (accept_result == 1)
         {
-            restore_flags(client_fd, original_flags);
+            // M-07: deliberately do NOT restore blocking mode here. The socket
+            // stays non-blocking for the life of the connection so that
+            // TlsConnection::pump() can bound every read and write by its own
+            // deadline. Restoring blocking mode was the defect: the HTTP layer's
+            // poll() proves only that TCP bytes are available, not that a
+            // complete TLS record is, so SSL_read on a blocking socket could
+            // park a worker thread indefinitely on a record the peer never
+            // finished sending — entirely outside the server's request timeouts.
             log_diagnostic("handshake.accepted", {
                                                      {"fd", std::to_string(client_fd), false}
             });

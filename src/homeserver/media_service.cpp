@@ -538,6 +538,8 @@ namespace
         auto call = federation::OutboundCall{};
         call.transaction = transaction;
         call.resolved_host = resolution.resolved_host;
+        // M-02: carry the certificate identity alongside the resolved target.
+        call.tls_server_name = resolution.tls_server_name;
         call.resolved_port = resolution.resolved_port;
         call.pinned_addresses = resolution.pinned_addresses;
         call.key_id = signing_key->key_id;
@@ -727,6 +729,8 @@ namespace
         {
             resolution.discovery_allowed = true;
             resolution.resolved_host = forced_it->second.resolved_host;
+            // The forced host is itself the authoritative name in this test seam.
+            resolution.tls_server_name = forced_it->second.resolved_host;
             resolution.resolved_port = forced_it->second.resolved_port;
             resolution.pinned_addresses = forced_it->second.pinned_addresses;
             trusted_ca_pem = forced_it->second.trusted_ca_pem;
@@ -767,8 +771,11 @@ namespace
             return std::move(*federated);
         }
 
-        auto url =
-            remote_media_download_url(resolution.resolved_host, resolution.resolved_port, origin_server, media_id);
+        // M-02: build the URL from the certificate identity, not the resolved
+        // target; pinned addresses still route the connection to the latter.
+        auto url = remote_media_download_url(resolution.tls_server_name.empty() ? resolution.resolved_host
+                                                                                 : resolution.tls_server_name,
+                                             resolution.resolved_port, origin_server, media_id);
         // Mandatory per spec when falling back to the deprecated endpoint: tells
         // the remote server not to itself recurse into fetching the media from
         // yet another remote, since we are already the fallback path.

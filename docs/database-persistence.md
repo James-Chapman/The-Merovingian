@@ -77,10 +77,22 @@ remaining work before PostgreSQL-backed production operation.
 - `set_user_account_state` updates the `users` table `suspended`/`locked`
   columns and mirrors the new state into the in-memory `PersistentUser`, used by
   the admin lock/suspend endpoints.
-- `restore_tokens_for_device` re-activates a single device's access and refresh
-  tokens (setting `revoked = false`) after a user-wide revocation, so a password
-  change with `logout_devices: true` can revoke every other device while keeping
-  the caller's session.
+- `database::revoke_tokens_for_user_except_device` (0.12.7) revokes every
+  access and refresh token for a user *except* one named device, in a single
+  `UPDATE ... WHERE user_id = $1 AND device_id <> $2` per token table — so a
+  password change with `logout_devices: true` can revoke every other device
+  without the caller's own tokens ever being revoked, and therefore without
+  anything to restore afterward. This replaces the prior
+  revoke-then-restore pair: `restore_tokens_for_device`, which re-activated a
+  device's tokens by setting `revoked = false`, is **removed** from both the
+  header and the implementation. That `UPDATE` could not distinguish a token
+  it had revoked microseconds earlier from one revoked days earlier by an
+  unrelated logout or admin action, so it resurrected all of them — handing
+  back a token the very password change was meant to invalidate. **No
+  function in the database layer may clear a `revoked` flag; revocation is a
+  one-way transition.** A requirement of the shape "revoke some subset" must
+  be expressed as a narrower revoke, never as a broad revoke followed by a
+  restore. See [ADR-0052](adr/0052-revocation-of-credentials-is-one-way.md).
 - Access and refresh token rows carry an `expires_at` column (`TEXT NOT NULL
   DEFAULT ''`, empty = no expiry / legacy) folded into the version-1 initial
   schema. `store_access_token`, `store_refresh_token`, and
@@ -501,6 +513,10 @@ The boundary provides these guarantees:
   key/value form, and password material is redacted from summaries.
 - Runtime startup requires `database.role=runtime`; offline migration planning
   requires `database.role=migration`.
+- No store function may clear a `revoked` flag once set — revocation is a
+  one-way transition, enforced by the store's API surface rather than by
+  caller discipline (see `revoke_tokens_for_user_except_device` above and
+  [ADR-0052](adr/0052-revocation-of-credentials-is-one-way.md)).
 
 ## Deliberately not included
 

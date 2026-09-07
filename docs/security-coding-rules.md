@@ -471,6 +471,18 @@ quickly finding everything a given `AGENTS.md` file contributed.
   borrows a span into the runtime's `SecretBuffer`.
   Source: `src/homeserver/AGENTS.md`.
 
+- **Nothing may put a TLS client socket back into blocking mode after the handshake, and
+  no code below the HTTP layer may perform a blocking I/O call on a connection
+  descriptor.** Drive `SSL_read`/`SSL_write` through a non-blocking retry loop
+  (`WANT_READ`/`WANT_WRITE`) against an explicit deadline instead of a raw blocking call.
+  Why: every timeout in the HTTP layer is expressed as `poll()` on the raw descriptor,
+  which is only a real timeout if nothing beneath it can block. `poll(POLLIN)` proves TCP
+  bytes arrived, never that a complete TLS record did — a blocking `SSL_read` entered on a
+  socket holding a partial record can hang in the kernel indefinitely, past every deadline
+  the server believes it is enforcing, parking one worker thread for as long as the
+  attacker holds the connection open.
+  Source: [ADR-0054](adr/0054-tls-sockets-stay-non-blocking-for-the-life-of-the-connection.md).
+
 ## Database
 
 - **Never interpolate values into SQL strings — always use prepared statements with bound
@@ -510,6 +522,20 @@ quickly finding everything a given `AGENTS.md` file contributed.
   environments). A `NOT NULL` column with no default fails the migration outright on
   existing rows, and dropping data is irreversible.
   Source: `migrations/AGENTS.md`.
+
+- **Revocation is one-way: no function in the database layer may clear a `revoked`
+  flag.** A requirement of the shape "revoke every token except this one" must be
+  expressed as a narrower revoke (e.g. `revoke_tokens_for_user_except_device`), never
+  as a broad revoke followed by a restore.
+  Why: a restore primitive that exists to undo a revoke is indistinguishable, at the
+  call site, from one that undoes an *intentional* one — a revoke-then-restore-the-
+  caller's-device sequence used by password change once un-revoked every token ever
+  revoked for that device, including ones revoked days earlier by an unrelated logout
+  or admin action, handing an attacker's already-revoked token back at the exact
+  moment (a password change after a compromise) the user is trying to invalidate it.
+  Making the unsafe sequence unrepresentable, rather than merely unused, is what closes
+  the class rather than the one instance.
+  Source: [ADR-0052](adr/0052-revocation-of-credentials-is-one-way.md).
 
 ## Media
 
@@ -560,6 +586,17 @@ quickly finding everything a given `AGENTS.md` file contributed.
   Why: disabling the sandbox to unblock a syscall reopens the entire kernel attack surface
   seccomp was closing, for the sake of one syscall that could instead be added narrowly.
   Source: `src/platform/AGENTS.md`.
+
+- **Sandbox profiles are named for the threat they contain, not for the kind of process
+  that installs them. A new isolated child process gets its own profile unless its
+  syscall needs are genuinely identical to an existing one.**
+  Why: a profile named after a role (e.g. "worker") invites the next similar-sounding
+  process to reuse it by analogy rather than by actually matching syscall needs. That is
+  exactly how the thumbnail decoder — whose entire job is a pure function from bytes on
+  stdin to bytes on stdout — ended up confined by the general server allowlist (sockets,
+  `openat`, `execve`, `clone` all permitted) on Linux while the equivalent BSD sandboxes
+  granted none of that. "It is also a worker" is not a reason to share `k_worker_*`.
+  Source: [ADR-0053](adr/0053-the-thumbnail-decoder-gets-its-own-syscall-profile.md).
 
 - **File paths from config must be validated before use — never pass a user-supplied path
   to `open()`/`stat()` without validation.**

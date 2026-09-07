@@ -1908,8 +1908,7 @@ namespace
     // `guard` is the dispatch-wide runtime lock; it is dropped around the
     // outbound call and reacquired before touching the store again, per
     // src/homeserver/AGENTS.md "The runtime lock and blocking calls".
-    [[nodiscard]] auto unbind_threepid_for_deactivation(ClientServerRuntime& rt,
-                                                        std::unique_lock<RuntimeMutex>& guard,
+    [[nodiscard]] auto unbind_threepid_for_deactivation(ClientServerRuntime& rt, std::unique_lock<RuntimeMutex>& guard,
                                                         std::string_view user_id, std::string_view medium,
                                                         std::string_view address,
                                                         std::optional<std::string> const& requested_id_server) -> bool
@@ -10301,8 +10300,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             }
         }
         return dispatch_resp(
-            req, rt, 200U,
-            json_serialize(json_obj({json_member("id_server_unbind_result", json_str(unbind_result))})));
+            req, rt, 200U, json_serialize(json_obj({json_member("id_server_unbind_result", json_str(unbind_result))})));
     }
     if (req.method == "GET" && req.target == "/_matrix/client/v3/account/3pid")
     {
@@ -12210,29 +12208,101 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         }
         // GET /rooms/{roomId}/state/{eventType}/{stateKey}
         // Spec: ../../docs/matrix-v1.19-spec/client-server-api.md#get_matrixclientv3roomsroomidstateeventtypestatekey
-        // Returns the content object of a single named state event.
+        // Returns the content object of a single named state event. Spec
+        // (client-server-api.md, "Looks up the contents of a state event in
+        // a room"): "If the user is joined to the room then the state is
+        // taken from the current state of the room. If the user has left
+        // the room then the state is taken from the state of the room when
+        // they left." Anyone else - no membership row at all, an
+        // invite/knock membership, or a room that does not exist - gets the
+        // identical 403 below: a non-member must not be able to tell "no
+        // such room" apart from "room I am not in".
         if (req.method == "GET")
         {
             if (auto const path = room_state_path_parts(req.target); path.has_value())
             {
                 auto const& store = rt.homeserver.database.persistent_store;
-                auto const room_it = std::ranges::find_if(store.rooms, [&](auto const& r) {
-                    return r.room_id == path->room_id;
-                });
-                if (room_it == store.rooms.end())
+                auto const membership_it =
+                    std::ranges::find_if(store.memberships, [&](database::PersistentMembership const& membership) {
+                        return membership.room_id == path->room_id && membership.user_id == *user;
+                    });
+                // "join" and "leave" only. The spec sentence quoted above names
+                // exactly those two states, and a ban is not a leave: a banned
+                // user is ejected rather than departing, and giving them a
+                // readable snapshot of the room they were banned from would hand
+                // back more than the endpoint that returns the room's full state,
+                // which admits joined members alone. Invite and knock are also
+                // excluded — neither has ever conferred read access to state.
+                auto const readable = membership_it != store.memberships.end() &&
+                                      (membership_it->membership == "join" || membership_it->membership == "leave");
+                if (!readable)
                 {
                     return dispatch_err(req, rt, 403U, "M_FORBIDDEN", "not a member of this room");
                 }
-                auto const state_it = std::ranges::find_if(store.state, [&](database::PersistentStateEvent const& s) {
-                    return s.room_id == path->room_id && s.event_type == path->event_type &&
-                           s.state_key == path->state_key;
-                });
-                if (state_it == store.state.end())
+
+                auto resolved_event_id = std::string{};
+                if (membership_it->membership == "join")
                 {
-                    return dispatch_err(req, rt, 404U, "M_NOT_FOUND", "state event not found");
+                    auto const state_it =
+                        std::ranges::find_if(store.state, [&](database::PersistentStateEvent const& s) {
+                            return s.room_id == path->room_id && s.event_type == path->event_type &&
+                                   s.state_key == path->state_key;
+                        });
+                    if (state_it == store.state.end())
+                    {
+                        return dispatch_err(req, rt, 404U, "M_NOT_FOUND", "state event not found");
+                    }
+                    resolved_event_id = state_it->event_id;
                 }
+                else
+                {
+                    // Left or banned: the live PersistentStateEvent pointer
+                    // tracks *current* state, which may postdate the
+                    // caller's departure and would leak room history they
+                    // never had access to. There is no historical-state
+                    // index, so scan this room's events for the requested
+                    // type/state_key at or before the leave point and keep
+                    // the newest match - that is the state that was in
+                    // force when the caller left.
+                    auto const leave_point = membership_it->stream_ordering;
+                    auto best_it = store.events.end();
+                    for (auto it = store.events.begin(); it != store.events.end(); ++it)
+                    {
+                        if (it->room_id != path->room_id || it->stream_ordering > leave_point)
+                        {
+                            continue;
+                        }
+                        auto const parsed = canonicaljson::parse_lossless(it->json);
+                        if (parsed.error != canonicaljson::ParseError::none)
+                        {
+                            continue;
+                        }
+                        auto const* obj = std::get_if<canonicaljson::Object>(&parsed.value.storage());
+                        if (obj == nullptr)
+                        {
+                            continue;
+                        }
+                        auto const* type_str = string_member(*obj, "type");
+                        auto const* state_key_str = string_member(*obj, "state_key");
+                        if (type_str == nullptr || *type_str != path->event_type || state_key_str == nullptr ||
+                            *state_key_str != path->state_key)
+                        {
+                            continue;
+                        }
+                        if (best_it == store.events.end() || it->stream_ordering > best_it->stream_ordering)
+                        {
+                            best_it = it;
+                        }
+                    }
+                    if (best_it == store.events.end())
+                    {
+                        return dispatch_err(req, rt, 404U, "M_NOT_FOUND", "state event not found");
+                    }
+                    resolved_event_id = best_it->event_id;
+                }
+
                 auto const event_it = std::ranges::find_if(store.events, [&](database::PersistentEvent const& e) {
-                    return e.event_id == state_it->event_id;
+                    return e.event_id == resolved_event_id;
                 });
                 if (event_it == store.events.end())
                 {

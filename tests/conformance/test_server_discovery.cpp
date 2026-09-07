@@ -1025,3 +1025,124 @@ SCENARIO("TLS origin validation rejects disallowed discovery destinations", "[fe
         }
     }
 }
+
+// --- M-02: SRV delegation must not move the TLS identity ---------------------
+// Spec: Matrix Server-Server API v1.19, Sec. 2 Resolving server names, steps
+// 4-6 URL:
+// ../../docs/matrix-v1.19-spec/server-server-api.md#resolving-server-names
+//
+// Steps 4 and 5, verbatim: "Requests are made to the resolved IP address and
+// port, with a `Host` header of `<hostname>`. The target server must present a
+// valid certificate for `<hostname>`." `<hostname>` is the ORIGINAL server
+// name, never the SRV target. The spec goes on to give its reasons in the
+// section beginning "The reasons we require `<hostname>` rather than
+// `<delegated_hostname>` for SRV delegation are".
+//
+// This matters because SRV records are ordinary unsigned DNS. If the SRV target
+// were also the TLS identity, anyone able to forge a DNS response could point a
+// homeserver at a host that presents a certificate for a name it legitimately
+// controls, and that host would then be trusted as the origin server —
+// including for /_matrix/key/v2/server, which is the root of trust for every
+// signature that server makes.
+SCENARIO("SRV delegation does not move the TLS identity away from the origin "
+         "server name",
+         "[federation][discovery][dns][srv][security][m02]")
+{
+    GIVEN("a server name whose SRV record points at an unrelated target host")
+    {
+        auto network = FakeDiscoveryNetwork{};
+        network.srv_records = {
+            {"srv.attacker-controlled.net", 9449U, 10U, 0U},
+        };
+        network.addresses.emplace("srv.attacker-controlled.net", std::vector<std::string>{"198.51.100.22"});
+
+        WHEN("the server is discovered")
+        {
+            auto const result = merovingian::federation::discover_server("example.org", network, 5U);
+
+            THEN("the connection targets the SRV host but the certificate identity "
+                 "stays the origin server name")
+            {
+                REQUIRE(result.discovery_allowed);
+                // The packets still go to the SRV target: SRV selection is honoured.
+                // Do NOT remove/change - ignoring SRV breaks federation to
+                // SRV-advertised servers.
+                REQUIRE(result.resolved_host == "srv.attacker-controlled.net");
+                REQUIRE(result.resolved_port == 9449U);
+                // Spec MUST: the certificate must be valid for <hostname>, the original
+                // server name — NOT the SRV target.
+                // Do NOT remove/change - equating these two lets unsigned DNS choose
+                // which certificate is accepted, defeating server-key provenance
+                // entirely.
+                REQUIRE(result.tls_server_name == "example.org");
+                REQUIRE(result.tls_server_name != result.resolved_host);
+            }
+        }
+    }
+}
+
+// Spec: Matrix Server-Server API v1.19, Sec. 2 Resolving server names, step 3c.
+//
+// When /.well-known/matrix/server delegates to a hostname with no port, an SRV
+// lookup is performed on the DELEGATED host. The certificate must then match
+// `<delegated_hostname>` — still not the SRV target.
+SCENARIO("SRV under well-known delegation keeps the delegated hostname as the "
+         "TLS identity",
+         "[federation][discovery][dns][srv][well-known][security][m02]")
+{
+    GIVEN("a well-known delegation to a host whose SRV record points elsewhere")
+    {
+        auto network = FakeDiscoveryNetwork{};
+        network.well_known = {true, true, R"({"m.server":"delegated.example.net"})", {}};
+        network.srv_records = {
+            {"srv.elsewhere.net", 7777U, 10U, 0U},
+        };
+        network.addresses.emplace("srv.elsewhere.net", std::vector<std::string>{"198.51.100.30"});
+
+        WHEN("the server is discovered")
+        {
+            auto const result = merovingian::federation::discover_server("example.org", network, 5U);
+
+            THEN("the TLS identity is the delegated hostname, not the SRV target and "
+                 "not the origin")
+            {
+                REQUIRE(result.discovery_allowed);
+                REQUIRE(result.resolved_host == "srv.elsewhere.net");
+                // Spec MUST: under well-known delegation the certificate must be valid
+                // for <delegated_hostname>. Do NOT remove/change - see the step 3
+                // rules.
+                REQUIRE(result.tls_server_name == "delegated.example.net");
+                REQUIRE(result.tls_server_name != result.resolved_host);
+            }
+        }
+    }
+}
+
+// Spec: Matrix Server-Server API v1.19, Sec. 2 Resolving server names, step 6.
+//
+// With no well-known and no SRV record, the name resolves directly by A/AAAA
+// and the certificate must match `<hostname>`. Here resolved_host and the TLS
+// identity legitimately coincide; the test pins that they do, so a future
+// change cannot leave tls_server_name empty and silently reintroduce a fallback
+// to whatever resolved_host happens to hold.
+SCENARIO("Direct A/AAAA resolution keeps the origin server name as the TLS identity",
+         "[federation][discovery][security][m02]")
+{
+    GIVEN("a server name with neither well-known delegation nor SRV records")
+    {
+        auto network = FakeDiscoveryNetwork{};
+        network.addresses.emplace("example.org", std::vector<std::string>{"198.51.100.40"});
+
+        WHEN("the server is discovered")
+        {
+            auto const result = merovingian::federation::discover_server("example.org", network, 5U);
+
+            THEN("the TLS identity is populated and equals the origin server name")
+            {
+                REQUIRE(result.discovery_allowed);
+                REQUIRE(result.resolved_host == "example.org");
+                REQUIRE(result.tls_server_name == "example.org");
+            }
+        }
+    }
+}

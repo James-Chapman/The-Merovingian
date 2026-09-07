@@ -362,8 +362,8 @@ namespace
     // the authority, `?` and `#` end the path, and end-of-string is the bare
     // origin itself. An entry that already ends in a delimiter (e.g. a
     // trailing `/`) has consumed its own boundary and needs no further check.
-    [[nodiscard]] auto redirect_url_boundary_is_valid(std::string_view allowed,
-                                                      std::string_view redirect_url) noexcept -> bool
+    [[nodiscard]] auto redirect_url_boundary_is_valid(std::string_view allowed, std::string_view redirect_url) noexcept
+        -> bool
     {
         constexpr auto delimiters = std::string_view{"/?#"};
         if (!allowed.empty() && delimiters.find(allowed.back()) != std::string_view::npos)
@@ -1463,6 +1463,17 @@ auto logout_local_user(HomeserverRuntime& runtime, std::string_view access_token
     {
         return make_operation_result(false, {}, "token revocation persistence failed", 500U);
     }
+    // M-04: revoke the device's refresh token too. Revoking only the access
+    // token left the paired refresh token valid, and refresh_local_session()
+    // admits any refresh row that is merely unrevoked — so a logged-out client
+    // (or anyone holding a stolen refresh token) could mint a fresh access token
+    // immediately after logout, making logout cosmetic. logout_all, device
+    // deletion, and password change all already revoke refresh tokens; this was
+    // the one path that did not.
+    //
+    // Spec: docs/matrix-v1.19-spec/client-server-api.md#post_matrixclientv3logout
+    // — the device's access token and refresh token are both invalidated.
+    std::ignore = database::revoke_refresh_tokens_for_device(runtime.database.persistent_store, user_id, device_id);
     for (auto& session : runtime.database.sessions)
     {
         if (matches_any_token_hash(session.access_token_hash, token_hashes))
@@ -1559,15 +1570,14 @@ auto deactivate_local_user(HomeserverRuntime& runtime, std::string_view access_t
     // store to make the outcome, not the return count, the thing that decides.
     std::ignore = database::revoke_access_tokens_for_user(runtime.database.persistent_store, session->user_id);
     std::ignore = database::revoke_refresh_tokens_for_user(runtime.database.persistent_store, session->user_id);
-    auto const credentials_remain =
-        std::ranges::any_of(runtime.database.persistent_store.access_tokens,
-                            [&session](database::PersistentAccessToken const& token) {
-                                return token.user_id == session->user_id && !token.revoked;
-                            }) ||
-        std::ranges::any_of(runtime.database.persistent_store.refresh_tokens,
-                            [&session](database::PersistentRefreshToken const& token) {
-                                return token.user_id == session->user_id && !token.revoked;
-                            });
+    auto const credentials_remain = std::ranges::any_of(runtime.database.persistent_store.access_tokens,
+                                                        [&session](database::PersistentAccessToken const& token) {
+                                                            return token.user_id == session->user_id && !token.revoked;
+                                                        }) ||
+                                    std::ranges::any_of(runtime.database.persistent_store.refresh_tokens,
+                                                        [&session](database::PersistentRefreshToken const& token) {
+                                                            return token.user_id == session->user_id && !token.revoked;
+                                                        });
     if (credentials_remain)
     {
         return make_operation_result(false, {}, "token revocation failed during deactivation", 500U);
@@ -1656,12 +1666,16 @@ auto change_local_user_password(HomeserverRuntime& runtime, std::string_view acc
         // Spec §5.5 (POST /account/password, logout_devices defaults to true): the
         // server MUST revoke the access tokens of all the user's OTHER devices. A
         // token stolen from another device must not survive a password change.
-        // Revoke every token for the user, then restore the caller's own device so
-        // its session survives, and flip the in-memory sessions of the other devices.
-        std::ignore = database::revoke_access_tokens_for_user(runtime.database.persistent_store, user_id);
-        std::ignore = database::revoke_refresh_tokens_for_user(runtime.database.persistent_store, user_id);
-        std::ignore =
-            database::restore_tokens_for_device(runtime.database.persistent_store, user_id, session->device_id);
+        //
+        // M-05: revoke the other devices directly rather than revoking everything
+        // and restoring this one. The restore step could not distinguish tokens it
+        // had just revoked from tokens revoked earlier — by a logout, an admin
+        // action, or a previous password change — so it un-revoked those too. A
+        // password change is the action a user takes *after* a compromise, and it
+        // was handing the attacker's revoked token back. This call never touches
+        // the caller's device, so no revoked credential is ever reinstated.
+        std::ignore = database::revoke_tokens_for_user_except_device(runtime.database.persistent_store, user_id,
+                                                                     session->device_id);
         for (auto& candidate : runtime.database.sessions)
         {
             if (candidate.user_id == user_id && candidate.device_id != session->device_id)

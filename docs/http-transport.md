@@ -14,6 +14,9 @@ Implemented now:
 - method token validation
 - request target validation
 - bounded HTTP/1.1 request-head parsing
+- bounded HTTP/1.1 request-body reads: a total deadline scaled to the
+  declared `Content-Length` at a 16 KiB/s floor, on top of the existing
+  per-chunk poll timeout (see "Slowloris policy" below)
 - structured request error codes
 - content-length validation
 - transfer-encoding rejection until streaming support exists
@@ -297,6 +300,23 @@ certificate. Handshakes use a bounded timeout aligned with the current
 per-connection read deadline. The server currently enforces TLS 1.2 or newer and
 keeps connection lifetime to a single HTTP request.
 
+**The client socket stays non-blocking for the life of the connection**, not
+just for the handshake (fixed in 0.12.7 — previously `accept_tls_connection`
+restored blocking mode on the success path, and `TlsConnection::read` called
+`SSL_read_ex` directly on the now-blocking socket). `TlsConnection::read` and
+`TlsConnection::write` both route through one private `pump()` that retries
+the SSL call and, on `SSL_ERROR_WANT_READ`/`WANT_READ`, polls for readiness
+against the connection's own deadline (inherited from the handshake timeout),
+returning failure once that deadline expires rather than letting the
+underlying `recv`/`send` block in the kernel. `pump()` retries with the same
+buffer and length across iterations, as OpenSSL requires after
+`WANT_READ`/`WANT_WRITE` — advancing the buffer would be a protocol
+violation. See
+[ADR-0054](adr/0054-tls-sockets-stay-non-blocking-for-the-life-of-the-connection.md)
+for the full rationale and the rule this sets for future code: nothing may
+put a TLS client socket back into blocking mode, and no code below the HTTP
+layer may perform a blocking I/O call on a connection descriptor.
+
 OpenSSL is the selected TLS provider for this boundary. The project-owned
 wrapper keeps OpenSSL-specific types out of higher-level transport code, which
 contains provider maintenance without making provider replacement part of the
@@ -329,6 +349,41 @@ The slowloris guard tracks bytes received versus elapsed time using:
 - header deadline
 
 The request-head read applies the equivalent deadlines inline (`request_head_deadline`, inter-byte cap, per-`recv` poll timeout in `http_server.cpp`); a request head that dribbles bytes is dropped with a 408 once any bound is exceeded.
+
+Request-**body** reads carry the same shape of protection, added in 0.12.7.
+Before that fix, a body read enforced only a fresh 15-second poll per
+4096-byte chunk with no overall deadline and no inter-byte cap, so a client
+dribbling a declared `Content-Length` could hold a worker thread for roughly
+`(bytes / chunk) x 15s` — a 1 MiB body could park a thread for 65 minutes
+without ever timing out. The body now carries both an inter-byte cap and a
+total deadline, with the deadline scaled by the declared length at a
+**16 KiB/s floor** so large, honestly-paced media uploads are unaffected
+while a dribbled 1 MiB body is cut at roughly 94 seconds.
+
+**Every cap must bound the poll that waits on it.** The caps above are
+evaluated between reads, so a `recv` allowed to outlast one makes that cap
+unenforceable. `recv_with_timeout` therefore takes a poll budget, and both the
+head and body loops pass the smallest of the per-read timeout, the overall
+deadline, and the remaining inter-byte allowance; budget expiry is reported
+distinctly from a peer close so the loop re-checks and the cap that actually
+expired ends the request and is the one logged. This was not a hypothetical:
+until 0.12.7 the poll was a fixed 15 seconds while the inter-byte cap was 5, so
+the inter-byte cap could never fire on either the head or the body, and a client
+stalling mid-request was still released only at the 15-second poll. When adding
+a new cap to either loop, add it to the budget as well or it will not take
+effect.
+
+**A body deadline is inert on a TLS listener unless the socket beneath it
+cannot block.** `poll(POLLIN)` proves that TCP bytes are available, never
+that a complete TLS record is: a peer that sends part of a record and stops
+makes the socket readable, so `poll` returns immediately, the TLS read is
+entered, and — on a socket restored to blocking mode after the handshake —
+the call can block in the kernel indefinitely, past every deadline the
+request-head and request-body logic believe they are enforcing. This is why
+the request-body deadline above shipped together with the change described
+in "TLS listener boundary" below: fixing one without the other leaves the
+fixed one meaningless on TLS listeners. See
+[ADR-0054](adr/0054-tls-sockets-stay-non-blocking-for-the-life-of-the-connection.md).
 
 Keep-alive parking composes with the guard phase-aware
 (`connection_should_close`): a connection `awaiting_request` (parked, no
