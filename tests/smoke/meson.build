@@ -1,5 +1,6 @@
 smoke_test = find_program('sh')
 server_executable = meson.project_build_root() / 'src' / 'merovingian-server'
+db_migrate_executable = meson.project_build_root() / 'src' / 'merovingian-db-migrate'
 setup_dev_env_script = meson.project_source_root() / 'scripts' / 'setup-dev-env.sh'
 build_linux_script = meson.project_source_root() / 'scripts' / 'build-linux.sh'
 example_config = meson.project_source_root() / 'config' / 'merovingian.conf.example'
@@ -459,5 +460,46 @@ test(
       + ' --dry-run --config "$redaction_config"'
       + ' 2>&1 ) && echo "$output" | grep -q "Database URI source file configured; pool_size=16" && ! echo "$output" | grep -q "topsecret" && ! echo "$output" | grep -q "postgresql://" && ! echo "$output" | grep -q "'
       + '$redaction_secret"',
+  ],
+)
+
+# L-08 (security audit 2026-09): parse_u32 folded empty input, non-numeric text
+# and overflow all into 0, so `--plan abc def` built a current=0 target=0 plan
+# with no steps and exited 0 -- telling an operator that a migration they
+# mistyped had nothing to do. These assert the exit codes, because the exit code
+# is the only thing a deployment script reads.
+test(
+  'db-migrate-rejects-non-numeric-versions-smoke-test',
+  smoke_test,
+  args: [
+    '-c',
+    db_migrate_executable + ' --plan abc def > /dev/null 2>&1; test $? -eq 64',
+  ],
+)
+
+test(
+  'db-migrate-rejects-empty-version-smoke-test',
+  smoke_test,
+  args: [
+    '-c',
+    db_migrate_executable + ' --plan "" 3 > /dev/null 2>&1; test $? -eq 64',
+  ],
+)
+
+test(
+  'db-migrate-rejects-out-of-range-version-smoke-test',
+  smoke_test,
+  args: [
+    '-c',
+    db_migrate_executable + ' --plan 1 99999999999999999999 > /dev/null 2>&1; test $? -eq 64',
+  ],
+)
+
+test(
+  'db-migrate-accepts-valid-versions-smoke-test',
+  smoke_test,
+  args: [
+    '-c',
+    db_migrate_executable + ' --plan 1 1 > /dev/null 2>&1',
   ],
 )

@@ -1343,15 +1343,29 @@ namespace
     [[nodiscard]] auto apply_pending_migrations(PostgresqlConnection& connection, SchemaState state)
         -> std::optional<SchemaState>
     {
+        // Taken before the plan is computed and released only after it is
+        // complete (this object outlives every return path below).
+        auto const lease = PostgresqlMigrationLease{connection};
+
+        // The plan MUST be computed from a ledger read taken while holding the
+        // lease, never from the caller's earlier snapshot. Waiting for the lock
+        // is precisely the window in which another process finishes the same
+        // plan: a plan computed before the wait sends the loser of the race
+        // back through DDL the winner already applied, which fails and strands
+        // the schema part-way. Re-reading here is what turns "we both migrated"
+        // into "one migrated, the other found nothing to do".
+        auto const current = lease.held() ? load_schema_state(connection) : std::optional<SchemaState>{state};
+        if (!current.has_value())
+        {
+            return std::nullopt;
+        }
+        state = *current;
         auto const plan = migration_plan_for(state);
         auto const validation = migration_plan_is_valid(plan);
         if (!validation.valid)
         {
             return std::nullopt;
         }
-        // Taken before the first step and released only after the plan is
-        // complete (this object outlives every return path below).
-        auto const lease = PostgresqlMigrationLease{connection};
         if (!lease.held() && !plan.steps.empty())
         {
             // Fail closed: running an unserialised plan is the defect this
