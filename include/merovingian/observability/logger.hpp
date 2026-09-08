@@ -124,6 +124,54 @@ private:
     std::optional<Clock::time_point> m_next_deadline{};
 };
 
+// L-10 / L-13 (security-audit-report-2026-09.md): tracks bounded-resource
+// drop episodes so a caller can emit exactly one warning per contiguous run
+// of drops rather than one per dropped item -- flooding a log/audit sink
+// during an incident must not itself become the flood. Shared by
+// `SingleLog::console_log`/`file_log` (a bounded queue silently discarding
+// entries once full) and `local_audit_sink` in
+// `src/homeserver/local_services.cpp` (silently no-opping while the
+// thread-local database is unset/closed): both are "keep working, but tell
+// the operator once" backpressure signals.
+class DropEpisodePolicy final
+{
+public:
+    // Call once per attempt. `accepted` is whether the attempt succeeded
+    // (the queue had room / the audit sink persisted the event). Returns
+    // true exactly once per drop episode: the first failed attempt after a
+    // run of successes (or since construction). Every subsequent failed
+    // attempt in the same episode returns false, so the caller emits at
+    // most one warning per flood; a later success resets the episode so a
+    // fresh flood warns again.
+    [[nodiscard]] auto observe(bool accepted) noexcept -> bool
+    {
+        if (accepted)
+        {
+            m_in_drop_episode = false;
+            return false;
+        }
+
+        ++m_dropped_total;
+        auto const entering_episode = !m_in_drop_episode;
+        m_in_drop_episode = true;
+        return entering_episode;
+    }
+
+    [[nodiscard]] auto dropped_total() const noexcept -> std::size_t
+    {
+        return m_dropped_total;
+    }
+
+    [[nodiscard]] auto in_drop_episode() const noexcept -> bool
+    {
+        return m_in_drop_episode;
+    }
+
+private:
+    std::size_t m_dropped_total{0U};
+    bool m_in_drop_episode{false};
+};
+
 class SingleLog final
 {
 public:
@@ -261,6 +309,21 @@ public:
         log(LogLevel::critical, module, make_log_line("CRITICAL", module, message));
     }
 
+    // L-13: total messages discarded because the console/file queue was at
+    // `max_log_queue_size` when the entry arrived. An operator-visible
+    // counter for the backpressure that used to be silent.
+    [[nodiscard]] auto console_dropped_message_count() -> std::size_t
+    {
+        auto lock = std::lock_guard<std::mutex>{m_console_queue_lock};
+        return m_console_drop_policy.dropped_total();
+    }
+
+    [[nodiscard]] auto file_dropped_message_count() -> std::size_t
+    {
+        auto lock = std::lock_guard<std::mutex>{m_file_queue_lock};
+        return m_file_drop_policy.dropped_total();
+    }
+
 private:
     struct LogEntry final
     {
@@ -302,8 +365,8 @@ private:
         return std::string{result.data()};
     }
 
-    static auto make_log_line(std::string const& level, std::string const& module,
-                              std::string const& message) -> std::string
+    static auto make_log_line(std::string const& level, std::string const& module, std::string const& message)
+        -> std::string
     {
         auto stream = std::ostringstream{};
         stream << current_date_time() << "  <" << level << ">  " << module << ":  " << message << '\n';
@@ -317,37 +380,63 @@ private:
             return;
         }
 
+        // M-11: every named method (and therefore every LOG_* macro, which
+        // calls straight through to these) routes its composed line through
+        // the same redaction helper the structured `log_diagnostic` path
+        // uses, so a call site cannot bypass redaction by building a plain
+        // std::string instead of a StructuredLogField.
+        auto const redacted = redact_log_message(line);
         auto const flush = level >= LogLevel::notice;
         if (m_console_log_level.load() <= level)
         {
-            console_log(line, flush);
+            console_log(redacted, flush);
         }
         if (m_file_log_level.load() <= level)
         {
-            file_log(line, flush);
+            file_log(redacted, flush);
         }
     }
 
     auto console_log(std::string const& message, bool flush) -> void
     {
+        auto warn = false;
         {
             auto lock = std::lock_guard<std::mutex>{m_console_queue_lock};
-            if (m_console_queue.size() < max_log_queue_size)
+            auto const accepted = m_console_queue.size() < max_log_queue_size;
+            if (accepted)
             {
                 m_console_queue.push_back(LogEntry{message, flush});
             }
+            warn = m_console_drop_policy.observe(accepted);
         }
         m_console_cv.notify_one();
+        if (warn)
+        {
+            // L-13: emitted synchronously on stderr, bypassing the (already
+            // full) bounded queue -- routing this warning through the same
+            // queue it is reporting as full risks the warning itself being
+            // dropped, silently defeating the purpose.
+            std::cerr << "WARNING  console log queue full (" << max_log_queue_size
+                      << " entries); dropping messages until it drains\n";
+        }
     }
 
     auto file_log(std::string const& message, bool flush) -> void
     {
+        auto warn = false;
         {
             auto lock = std::lock_guard<std::mutex>{m_file_queue_lock};
-            if (m_file_queue.size() < max_log_queue_size)
+            auto const accepted = m_file_queue.size() < max_log_queue_size;
+            if (accepted)
             {
                 m_file_queue.push_back(LogEntry{message, flush});
             }
+            warn = m_file_drop_policy.observe(accepted);
+        }
+        if (warn)
+        {
+            std::cerr << "WARNING  file log queue full (" << max_log_queue_size
+                      << " entries); dropping messages until it drains\n";
         }
         m_file_cv.notify_one();
     }
@@ -526,6 +615,13 @@ private:
     std::deque<LogEntry> m_console_queue{};
     std::deque<LogEntry> m_file_queue{};
 
+    // L-13: guarded by the same mutex as the queue they describe
+    // (m_console_queue_lock / m_file_queue_lock respectively) -- every
+    // access happens from inside console_log()/file_log() while that lock
+    // is held, so these need no synchronization of their own.
+    DropEpisodePolicy m_console_drop_policy{};
+    DropEpisodePolicy m_file_drop_policy{};
+
     bool m_console_exit{false};
     bool m_file_exit{false};
 
@@ -559,21 +655,6 @@ public:
 private:
     std::string m_function_name{};
 };
-
-template <typename... Args>
-auto string_format(std::string const& format, Args&&... args) -> std::string
-{
-    auto const required = std::snprintf(nullptr, 0, format.c_str(), std::forward<Args>(args)...);
-    if (required < 0)
-    {
-        return {};
-    }
-
-    auto buffer = std::vector<char>(static_cast<std::size_t>(required) + 1U);
-    std::ignore = std::snprintf(buffer.data(), buffer.size(), format.c_str(), std::forward<Args>(args)...);
-
-    return std::string{buffer.data(), static_cast<std::size_t>(required)};
-}
 
 // +-------------------------------------------------------------------------+
 // |  log_diagnostic (0.5.0)                                                    |
@@ -619,8 +700,8 @@ auto string_format(std::string const& format, Args&&... args) -> std::string
 // Build the message body for a diagnostic log line: "event=<event> key=value ...".
 // The module name and level header are added by the SingleLog named methods via
 // make_log_line, so they must not be included here.
-[[nodiscard]] inline auto diagnostic_message(std::string_view event,
-                                             std::vector<StructuredLogField> const& fields) -> std::string
+[[nodiscard]] inline auto diagnostic_message(std::string_view event, std::vector<StructuredLogField> const& fields)
+    -> std::string
 {
     auto msg = std::string{"event="} + std::string{event};
     for (auto const& field : fields)
@@ -700,15 +781,23 @@ inline auto default_audit_sink(AuditSinkFields const& /*fields*/) -> void
 {
 }
 
-inline auto the_audit_sink() noexcept -> AuditSink&
+// L-09 (security-audit-report-2026-09.md): `set_audit_sink()` writes during
+// thread startup while `log_diagnostic_audit()` reads from arbitrary
+// threads, with no `std::atomic`/mutex/happens-before edge between them.
+// A plain function pointer is a trivially-copyable pointer-sized value, so
+// `std::atomic<AuditSink>` is lock-free on every platform this project
+// targets -- the read path (`log_diagnostic_audit`, on the hot path of
+// every warning-or-above diagnostic) stays a single relaxed-cost atomic
+// load, no lock acquired.
+inline auto the_audit_sink() noexcept -> std::atomic<AuditSink>&
 {
-    static auto sink = AuditSink{&default_audit_sink};
+    static auto sink = std::atomic<AuditSink>{&default_audit_sink};
     return sink;
 }
 
 inline auto set_audit_sink(AuditSink sink) noexcept -> void
 {
-    the_audit_sink() = sink;
+    the_audit_sink().store(sink, std::memory_order_release);
 }
 
 inline auto log_diagnostic_audit(std::string_view logger, std::string_view event,
@@ -718,7 +807,7 @@ inline auto log_diagnostic_audit(std::string_view logger, std::string_view event
     log_diagnostic(logger, event, fields, severity);
     if (static_cast<int>(severity) >= static_cast<int>(LogEventSeverity::warning))
     {
-        the_audit_sink()(audit_fields);
+        the_audit_sink().load(std::memory_order_acquire)(audit_fields);
     }
 }
 
@@ -742,30 +831,11 @@ inline auto log_diagnostic_audit(std::string_view logger, std::string_view event
 
 #define LOG_CRITICAL(message) ::merovingian::observability::SingleLog::instance().critical(__func__, message)
 
-#define LOGF_TRACE(format, ...)                                                                                        \
-    ::merovingian::observability::SingleLog::instance().trace(                                                         \
-        __func__, ::merovingian::observability::string_format(format, __VA_ARGS__))
-
-#define LOGF_DEBUG(format, ...)                                                                                        \
-    ::merovingian::observability::SingleLog::instance().debug(                                                         \
-        __func__, ::merovingian::observability::string_format(format, __VA_ARGS__))
-
-#define LOGF_INFO(format, ...)                                                                                         \
-    ::merovingian::observability::SingleLog::instance().info(                                                          \
-        __func__, ::merovingian::observability::string_format(format, __VA_ARGS__))
-
-#define LOGF_NOTICE(format, ...)                                                                                       \
-    ::merovingian::observability::SingleLog::instance().notice(                                                        \
-        __func__, ::merovingian::observability::string_format(format, __VA_ARGS__))
-
-#define LOGF_WARNING(format, ...)                                                                                      \
-    ::merovingian::observability::SingleLog::instance().warning(                                                       \
-        __func__, ::merovingian::observability::string_format(format, __VA_ARGS__))
-
-#define LOGF_ERROR(format, ...)                                                                                        \
-    ::merovingian::observability::SingleLog::instance().error(                                                         \
-        __func__, ::merovingian::observability::string_format(format, __VA_ARGS__))
-
-#define LOGF_CRITICAL(format, ...)                                                                                     \
-    ::merovingian::observability::SingleLog::instance().critical(                                                      \
-        __func__, ::merovingian::observability::string_format(format, __VA_ARGS__))
+// L-12 (security-audit-report-2026-09.md): the LOGF_* macros and the
+// `string_format` helper they built on (a `std::string const&` forwarded
+// straight into `std::snprintf` as the format argument -- CWE-134, a
+// type-unsafe/format-string API) were unused anywhere in `src/`. Deleted
+// outright rather than deprecated: there is no call site to migrate, and a
+// deleted API cannot be reintroduced by accident the way a `[[deprecated]]`
+// one can. Use `LOG_*` (plain std::string, redacted via M-11's
+// `redact_log_message`) or `log_diagnostic`/`StructuredLogField` instead.

@@ -376,8 +376,7 @@ auto make_audit_event(AuditCategory category, std::string_view event_type, std::
             std::string{actor},
             std::string{target},
             std::string{reason_code},
-            std::string{request_id},
-            true};
+            std::string{request_id}};
 }
 
 auto audit_log_insert_statement(AuditLogEvent const& event) -> database::PreparedStatement
@@ -424,6 +423,53 @@ auto sanitized_http_target(std::string_view target) -> std::string
 auto redact_log_value(StructuredLogField const& field) -> std::string
 {
     return field.sensitive || log_field_is_sensitive(field.key) ? "<redacted>" : field.value;
+}
+
+// M-11: applies the same sensitivity rule as `log_field_is_sensitive` to a
+// freeform message, so the legacy LOG_*/LOGF_* macros (which build a plain
+// std::string rather than a std::vector<StructuredLogField>) cannot bypass
+// redaction. Scans whitespace-delimited "key=value" tokens; a token whose
+// key matches a sensitive marker is rewritten to "key=<redacted>", every
+// other token (including plain words with no '=') passes through unchanged.
+auto redact_log_message(std::string_view message) -> std::string
+{
+    auto output = std::string{};
+    output.reserve(message.size());
+
+    auto pos = std::size_t{0U};
+    while (pos < message.size())
+    {
+        auto const space = message.find(' ', pos);
+        auto const token_end = space == std::string_view::npos ? message.size() : space;
+        auto const token = message.substr(pos, token_end - pos);
+
+        if (auto const equals = token.find('='); equals != std::string_view::npos && equals > 0U)
+        {
+            auto const key = token.substr(0U, equals);
+            if (log_field_is_sensitive(key))
+            {
+                output.append(key);
+                output.append("=<redacted>");
+            }
+            else
+            {
+                output.append(token);
+            }
+        }
+        else
+        {
+            output.append(token);
+        }
+
+        if (space == std::string_view::npos)
+        {
+            break;
+        }
+        output.push_back(' ');
+        pos = space + 1U;
+    }
+
+    return output;
 }
 
 auto structured_log_summary(StructuredLogEvent const& event) -> std::string
