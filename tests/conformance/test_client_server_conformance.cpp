@@ -4273,6 +4273,102 @@ SCENARIO("A suspended account cannot reach a blocked action by naming a path seg
     }
 }
 
+// --- Account suspension: the key endpoints match the spec's list exactly -----
+// Spec: Matrix Client-Server API v1.19
+// Section: Account suspension
+// URL: ../../docs/matrix-v1.19-spec/client-server-api.md#account-suspension
+//
+// The permitted actions the spec SHOULD-lists for a suspended account name two
+// key-related capabilities, each linking to a specific section:
+//
+//   "Verify other devices and write associated cross-signing data"
+//        -> §Device verification and §Cross-signing, which between them name
+//           POST /keys/query, POST /keys/device_signing/upload and
+//           POST /keys/signatures/upload.
+//   "Populate their key backup"
+//        -> §Server-side key backups, i.e. the /room_keys/ subtree.
+//
+// Admitting the whole `/keys` prefix went further than that: it also permitted
+// POST /keys/upload (publishing this account's own device and one-time keys),
+// POST /keys/claim (claiming one-time keys to open an Olm session) and
+// GET /keys/changes. None appear in the spec's permitted list.
+SCENARIO("A suspended account may use only the key endpoints the spec permits",
+         "[conformance][client-server][server-admin][account][security]")
+{
+    GIVEN("a running client-server with a suspended user holding a valid token")
+    {
+        auto started = merovingian::homeserver::start_client_server(conformance_config());
+        REQUIRE(started.started);
+        auto const token = logged_in_token(started.runtime); // alice, DEVICE1
+        auto const admin = admin_token(started.runtime, "admin");
+        REQUIRE(merovingian::homeserver::handle_client_server_request(
+                    started.runtime,
+                    {"PUT", "/_matrix/client/v1/admin/suspend/%40alice%3Aexample.org", admin, R"({"suspended":true})"})
+                    .response.status == 200U);
+
+        // The gate's only job is to decide M_USER_SUSPENDED or not; a permitted
+        // endpoint may still answer 400/404 on its own terms, so assert on the
+        // errcode rather than the status for the allowed cases.
+        auto const suspended_errcode = [&started, &token](std::string_view method, std::string const& path,
+                                                          std::string const& body) {
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {std::string{method}, path, token, body});
+            auto const parsed = parse_object(response.response.body);
+            auto const* errcode = string_member(parsed, "errcode");
+            return errcode == nullptr ? std::string{} : *errcode;
+        };
+
+        WHEN("the suspended user verifies a device and writes cross-signing data")
+        {
+            THEN("the three endpoints the spec names are not blocked by suspension")
+            {
+                // Spec SHOULD: verify other devices and write cross-signing data.
+                REQUIRE(suspended_errcode("POST", "/_matrix/client/v3/keys/query",
+                                          R"({"device_keys":{"@alice:example.org":[]}})") != "M_USER_SUSPENDED");
+                REQUIRE(suspended_errcode("POST", "/_matrix/client/v3/keys/device_signing/upload", "{}") !=
+                        "M_USER_SUSPENDED");
+                REQUIRE(suspended_errcode("POST", "/_matrix/client/v3/keys/signatures/upload", "{}") !=
+                        "M_USER_SUSPENDED");
+            }
+        }
+
+        WHEN("the suspended user populates their key backup")
+        {
+            THEN("the key backup subtree is not blocked by suspension")
+            {
+                // Spec SHOULD: populate their key backup.
+                REQUIRE(suspended_errcode("GET", "/_matrix/client/v3/room_keys/version", {}) != "M_USER_SUSPENDED");
+            }
+        }
+
+        WHEN("the suspended user uses a key endpoint the spec does not list")
+        {
+            THEN("publishing device and one-time keys is refused")
+            {
+                // Not in the spec's permitted list: this publishes the account's
+                // own device identity and one-time keys, which is participation,
+                // not verification.
+                REQUIRE(suspended_errcode("POST", "/_matrix/client/v3/keys/upload",
+                                          R"({"device_keys":{}})") == "M_USER_SUSPENDED");
+            }
+
+            THEN("claiming one-time keys is refused")
+            {
+                // Claiming an OTK opens an Olm session, which is a precursor to
+                // sending, not to verifying.
+                REQUIRE(suspended_errcode("POST", "/_matrix/client/v3/keys/claim",
+                                          R"({"one_time_keys":{}})") == "M_USER_SUSPENDED");
+            }
+
+            THEN("reading device-list changes is refused")
+            {
+                REQUIRE(suspended_errcode("GET", "/_matrix/client/v3/keys/changes?from=0&to=1", {}) ==
+                        "M_USER_SUSPENDED");
+            }
+        }
+    }
+}
+
 // --- Account suspension: login still permitted --------------------------------
 // Spec: Matrix Client-Server API v1.19
 // Section: Account suspension

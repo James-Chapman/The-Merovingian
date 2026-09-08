@@ -503,6 +503,13 @@ The boundary establishes these guarantees:
   a substring test let a suspended user name their transaction `redact` and send
   arbitrary messages. Anything added to this gate must be anchored to a segment
   the client cannot choose.
+- The allowlist does not go beyond the actions the spec's permitted list names.
+  Where the spec names specific endpoints, they are listed exactly rather than
+  admitted by a related-looking prefix: the key endpoints a suspended account
+  may use are `POST /keys/query`, `POST /keys/device_signing/upload`,
+  `POST /keys/signatures/upload` and the `/room_keys/` backup subtree — not the
+  whole `/keys` prefix, which also covers key upload and one-time-key claiming
+  (participation, not verification).
 - Token *rotation* is gated as well as token issue. `POST /refresh`
   authenticates with a refresh token, so it never reaches the request-path
   moderation gate — `refresh_local_session` therefore carries the locked-account

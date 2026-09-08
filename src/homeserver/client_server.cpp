@@ -862,8 +862,19 @@ namespace
     // Everything else (joining/knocking, invites, sending messages, profile
     // changes, redacting others' events, creating rooms) is blocked by the
     // request-path gate with M_USER_SUSPENDED. `path` is the query-stripped
-    // request path. Best-effort prefix matching; the spec leaves the exact
-    // disallowed set to the implementation.
+    // request path, still percent-encoded.
+    //
+    // The spec leaves the disallowed set to the implementation, but this
+    // allowlist deliberately does not go beyond the actions the spec's
+    // permitted list names. Two rules keep it honest, both learned from
+    // defects:
+    //   - Match an endpoint exactly, or anchor a prefix so it cannot span a
+    //     path segment the client chooses. A substring test here let a
+    //     suspended user name a transaction ID "redact" and send messages.
+    //   - Where the spec names specific endpoints, list them; do not admit a
+    //     whole prefix because it looks related. `/keys` swept in key upload
+    //     and one-time-key claiming, which are participation, not
+    //     verification.
     [[nodiscard]] auto action_allowed_while_suspended(std::string_view method, std::string_view path) noexcept -> bool
     {
         // Login is unauthenticated (handled before the gate) but is listed for
@@ -877,19 +888,32 @@ namespace
         {
             return true;
         }
-        // Device key verification / cross-signing / key claiming & querying.
-        if (starts_with(path, "/_matrix/client/v3/keys"))
+        // Device verification and cross-signing. The spec's permitted-actions
+        // list says "Verify other devices and write associated cross-signing
+        // data", linking §Device verification and §Cross-signing; between them
+        // those sections name exactly these three endpoints. They are listed
+        // exactly rather than admitted by a `/keys` prefix, which also let
+        // through POST /keys/upload (publishing this account's own device and
+        // one-time keys), POST /keys/claim (claiming a one-time key to open an
+        // Olm session) and GET /keys/changes — none of which the spec permits a
+        // suspended account, and the first two of which are participation
+        // rather than verification.
+        if (method == "POST" &&
+            (path == "/_matrix/client/v3/keys/query" || path == "/_matrix/client/v3/keys/device_signing/upload" ||
+             path == "/_matrix/client/v3/keys/signatures/upload"))
         {
             return true;
         }
-        // Server-side room key backup (read + populate).
-        if (starts_with(path, "/_matrix/client/v3/room_keys"))
+        // Server-side room key backup — the spec's "Populate their key backup",
+        // linking §Server-side key backups, which is the whole /room_keys/
+        // subtree. The trailing slash keeps this from also matching a path that
+        // merely starts with "room_keys".
+        if (starts_with(path, "/_matrix/client/v3/room_keys/"))
         {
             return true;
         }
-        // Cross-signing key storage and device management endpoints.
-        if (starts_with(path, "/_matrix/client/v3/keys/device_signing") ||
-            starts_with(path, "/_matrix/client/v3/account/deactivate"))
+        // Account deactivation.
+        if (starts_with(path, "/_matrix/client/v3/account/deactivate"))
         {
             return true;
         }

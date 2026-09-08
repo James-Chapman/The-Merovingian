@@ -187,6 +187,22 @@ complete while being wrong.
   routed today (`404 M_UNRECOGNIZED`); whoever implements it owns the ownership
   check, and the comment at the gate says so.
 
+- **The suspension allowlist admitted more key endpoints than the spec permits.**
+  Also not an audit finding. The spec's permitted-actions list names two
+  key-related capabilities — "Verify other devices and write associated
+  cross-signing data" (§Device verification, §Cross-signing) and "Populate their
+  key backup" (§Server-side key backups). Between them those sections name
+  exactly `POST /keys/query`, `POST /keys/device_signing/upload`,
+  `POST /keys/signatures/upload`, and the `/room_keys/` subtree.
+
+  The gate admitted the whole `/keys` prefix, which additionally allowed
+  `POST /keys/upload` (publishing the account's own device and one-time keys),
+  `POST /keys/claim` (claiming a one-time key to open an Olm session) and
+  `GET /keys/changes`. The first two are participation rather than
+  verification. The permitted endpoints are now listed exactly, with their
+  methods, and `/room_keys` gained a trailing slash so the prefix cannot match
+  a longer path segment.
+
 ### Also fixed
 
 - Three defects the branch's own first verification run surfaced in its new
