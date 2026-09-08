@@ -17,6 +17,7 @@
 //     single-use enforcement; a locked account is refused with M_USER_LOCKED while a
 //     suspended one is still served; a refresh whose device row was deleted fails closed
 //   - access_token_is_soft_logout: false for empty and unknown tokens
+//   - load_hashed_registration_token: a rotated token file invalidates the cached hash
 //   - request_openid_token / federation_openid_userinfo: mint returns all
 //     spec-required fields; userinfo redeems a valid token; unknown and
 //     expired tokens both fail closed identically; an OpenID token is
@@ -26,6 +27,7 @@
 
 #include "../support/master_key.hpp"
 #include "../support/registration_token.hpp"
+#include "../support/temp_directory.hpp"
 #include "merovingian/auth/identity.hpp"
 #include "merovingian/auth/password.hpp"
 #include "merovingian/config/config.hpp"
@@ -37,9 +39,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <system_error>
 
 #include <sodium.h>
+#include <unistd.h>
 
 namespace
 {
@@ -697,6 +703,67 @@ SCENARIO("refresh_local_session refuses a refresh token whose device has been de
                 REQUIRE(refreshed.device_id == "DEVICE2");
             }
         }
+    }
+}
+
+// --- load_hashed_registration_token: rotation invalidates the cache -----------
+
+// M-01 (security audit 2026-09). The Argon2id hash of the registration token
+// file is cached because hashing it on every registration would be a
+// self-inflicted DoS. It was cached by path alone and never revalidated, so an
+// operator who rotated the token on disk kept serving the old one until the
+// next restart — a revoked credential that stays live is the failure mode
+// credential rotation exists to prevent.
+SCENARIO("load_hashed_registration_token reloads a rotated token file", "[homeserver][auth][registration][token]")
+{
+    GIVEN("a registration token file on disk")
+    {
+        REQUIRE(sodium_init() >= 0);
+        auto const path = std::filesystem::path{merovingian::tests::temporary_directory() /
+                                                ("merovingian-rotate-" + std::to_string(::getpid()) + ".txt")};
+        {
+            auto output = std::ofstream{path};
+            output << "first-token-value\n";
+        }
+        auto registration = merovingian::config::RegistrationSecurityConfig{};
+        registration.token_file = path.string();
+
+        auto const first = merovingian::homeserver::load_hashed_registration_token(registration);
+        REQUIRE(first.has_value());
+        REQUIRE(merovingian::auth::registration_token_matches(*first, "first-token-value"));
+
+        WHEN("the file is read again without changing")
+        {
+            auto const again = merovingian::homeserver::load_hashed_registration_token(registration);
+
+            THEN("the same hash is served from cache")
+            {
+                REQUIRE(again.has_value());
+                REQUIRE(*again == *first);
+            }
+        }
+
+        WHEN("the operator rotates the token on disk")
+        {
+            // A same-second rewrite is the hard case: an mtime-seconds-only
+            // check would miss it. The identity therefore includes size and
+            // sub-second mtime as well.
+            {
+                auto output = std::ofstream{path, std::ios::trunc};
+                output << "second-token-value-which-is-longer\n";
+            }
+            auto const rotated = merovingian::homeserver::load_hashed_registration_token(registration);
+
+            THEN("the new token is accepted and the old one is not")
+            {
+                REQUIRE(rotated.has_value());
+                REQUIRE(merovingian::auth::registration_token_matches(*rotated, "second-token-value-which-is-longer"));
+                REQUIRE_FALSE(merovingian::auth::registration_token_matches(*rotated, "first-token-value"));
+            }
+        }
+
+        std::error_code ec{};
+        std::ignore = std::filesystem::remove(path, ec);
     }
 }
 

@@ -812,11 +812,61 @@ namespace
 
 } // namespace
 
-// Load the registration token from disk once, hash it with Argon2id, and cache
-// only the hash keyed by the file path.  The plaintext token is zeroised after
-// hashing so it does not remain in server memory.  Exposed in auth_service.hpp so
-// the registration-token validity endpoint compares via the hash rather than
-// holding the plaintext token on the request path.
+namespace
+{
+
+    // Identifies a particular *version* of a file on disk. The registration
+    // token hash is cached because Argon2id on every registration would be a
+    // self-inflicted DoS, but caching by path alone made the cache outlive the
+    // secret it summarised: an operator who rotated the token kept serving the
+    // old one until the next restart, which is precisely the failure that
+    // credential rotation exists to prevent.
+    //
+    // Sub-second mtime and size are both included because a rotation is
+    // typically a same-second rewrite, which an mtime-seconds check alone would
+    // miss; device and inode catch an atomic replace-by-rename.
+    struct RegistrationTokenFileIdentity final
+    {
+        std::uint64_t device{0U};
+        std::uint64_t inode{0U};
+        std::int64_t modified_seconds{0};
+        std::int64_t modified_nanoseconds{0};
+        std::uint64_t size{0U};
+
+        [[nodiscard]] auto operator==(RegistrationTokenFileIdentity const&) const noexcept -> bool = default;
+    };
+
+    [[nodiscard]] auto registration_token_file_identity(std::string const& path)
+        -> std::optional<RegistrationTokenFileIdentity>
+    {
+        struct ::stat info{};
+        if (::stat(path.c_str(), &info) != 0)
+        {
+            return std::nullopt;
+        }
+        return RegistrationTokenFileIdentity{
+            static_cast<std::uint64_t>(info.st_dev), static_cast<std::uint64_t>(info.st_ino),
+            static_cast<std::int64_t>(info.st_mtim.tv_sec), static_cast<std::int64_t>(info.st_mtim.tv_nsec),
+            static_cast<std::uint64_t>(info.st_size)};
+    }
+
+    struct CachedRegistrationToken final
+    {
+        RegistrationTokenFileIdentity identity{};
+        std::string hash{};
+    };
+
+} // namespace
+
+// Load the registration token from disk, hash it with Argon2id, and cache the
+// hash against the identity of the file version it was derived from.  The
+// plaintext token is zeroised after hashing so it does not remain in server
+// memory.  Exposed in auth_service.hpp so the registration-token validity
+// endpoint compares via the hash rather than holding the plaintext token on the
+// request path.
+//
+// A stat() per call is the price of honouring rotation; the Argon2id hash is
+// what the cache is actually protecting.
 [[nodiscard]] auto load_hashed_registration_token(config::RegistrationSecurityConfig const& registration)
     -> std::optional<std::string>
 {
@@ -826,13 +876,15 @@ namespace
     }
 
     static auto mutex = std::mutex{};
-    static auto cache = std::unordered_map<std::string, std::string>{};
+    static auto cache = std::unordered_map<std::string, CachedRegistrationToken>{};
+
+    auto const identity_before = registration_token_file_identity(registration.token_file);
 
     auto lock = std::lock_guard<std::mutex>{mutex};
     auto const it = cache.find(registration.token_file);
-    if (it != cache.end())
+    if (it != cache.end() && identity_before.has_value() && it->second.identity == *identity_before)
     {
-        return it->second;
+        return it->second.hash;
     }
 
     auto secret = read_registration_token_file(registration.token_file);
@@ -854,9 +906,19 @@ namespace
         return std::nullopt;
     }
 
-    auto const [inserted, ok] = cache.emplace(registration.token_file, std::move(*hash));
-    std::ignore = ok;
-    return inserted->second;
+    // Only cache when the file did not change under us between the two stats.
+    // Caching a hash against an identity it was not derived from would pin a
+    // stale token permanently — worse than not caching at all.
+    auto const identity_after = registration_token_file_identity(registration.token_file);
+    if (identity_before.has_value() && identity_after.has_value() && *identity_before == *identity_after)
+    {
+        cache.insert_or_assign(registration.token_file, CachedRegistrationToken{*identity_after, *hash});
+    }
+    else
+    {
+        cache.erase(registration.token_file);
+    }
+    return hash;
 }
 
 auto register_local_user(HomeserverRuntime& runtime, std::string_view localpart, std::string_view password,

@@ -10,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <span>
+#include <string>
 
 SCENARIO("Auth identity validators enforce Matrix-shaped identifiers", "[auth]")
 {
@@ -33,6 +34,51 @@ SCENARIO("Auth identity validators enforce Matrix-shaped identifiers", "[auth]")
                 REQUIRE_FALSE(invalid_user_result);
                 REQUIRE(valid_device_result);
                 REQUIRE_FALSE(invalid_device_result);
+            }
+        }
+    }
+}
+
+// L-03 (security audit 2026-09). A device ID is not just a name: it is a
+// component of other identifiers. Key IDs are `<algorithm>:<device_id>` (spec
+// §End-to-end encryption), so a ':' inside the device ID makes `ed25519:a:b`
+// ambiguous — this server and a federation partner may split it differently.
+// Device IDs are also a path segment in `/devices/{deviceId}`, which '/', '?'
+// and '#' terminate or redirect once the path is decoded.
+SCENARIO("Device IDs reject characters that are structural in other Matrix identifiers", "[auth][device]")
+{
+    GIVEN("device IDs containing characters reserved by key IDs and URL paths")
+    {
+        WHEN("each candidate is validated")
+        {
+            THEN("ordinary device IDs are accepted")
+            {
+                REQUIRE(merovingian::auth::device_id_is_valid("DEVICE123"));
+                REQUIRE(merovingian::auth::device_id_is_valid("AAAAAAAAAA"));
+                REQUIRE(merovingian::auth::device_id_is_valid("dev-1_2.3"));
+            }
+
+            THEN("a colon is rejected because it is the key-ID separator")
+            {
+                REQUIRE_FALSE(merovingian::auth::device_id_is_valid("foo:bar"));
+                REQUIRE_FALSE(merovingian::auth::device_id_is_valid(":leading"));
+                REQUIRE_FALSE(merovingian::auth::device_id_is_valid("trailing:"));
+                REQUIRE_FALSE(merovingian::auth::device_id_is_valid("ed25519:DEVICE"));
+            }
+
+            THEN("URL-structural characters are rejected")
+            {
+                REQUIRE_FALSE(merovingian::auth::device_id_is_valid("a/b"));
+                REQUIRE_FALSE(merovingian::auth::device_id_is_valid("a?b"));
+                REQUIRE_FALSE(merovingian::auth::device_id_is_valid("a#b"));
+            }
+
+            THEN("the pre-existing rules still hold")
+            {
+                REQUIRE_FALSE(merovingian::auth::device_id_is_valid(""));
+                REQUIRE_FALSE(merovingian::auth::device_id_is_valid("DEVICE 123"));
+                REQUIRE_FALSE(merovingian::auth::device_id_is_valid(std::string(256U, 'A')));
+                REQUIRE(merovingian::auth::device_id_is_valid(std::string(255U, 'A')));
             }
         }
     }
