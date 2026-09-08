@@ -1133,8 +1133,22 @@ namespace
             {
                 return {400U, homeserver::matrix_error("M_BAD_JSON", event_envelope.error)};
             }
-            auto const room_ver =
-                invite_request->room_version.empty() ? std::string{"12"} : invite_request->room_version;
+            // Spec: Matrix Server-Server API v1.19 —
+            //   PUT /_matrix/federation/v1/invite/{roomId}/{eventId}
+            // URL: ../../docs/matrix-v1.19-spec/server-server-api.md#put_matrixfederationv1inviteroomideventid
+            //   "Servers which receive a v1 invite request must assume that the
+            //    room version is either \"1\" or \"2\"."
+            // A v2 invite body carries room_version explicitly; a v1 body does
+            // not. Security (audit M-04): this used to fall back to "12", so the
+            // reference-hash event ID and the Ed25519 signature check ran under
+            // the wrong redaction rules for every non-v12 room. Resolve the
+            // room's real version from local state where we have it (mirroring
+            // send_join), and otherwise apply the spec-mandated v1 assumption.
+            auto const resolved_room_ver =
+                runtime.room_version_resolver ? runtime.room_version_resolver(invite_request->room_id) : std::string{};
+            auto const room_ver = !invite_request->room_version.empty() ? invite_request->room_version
+                                  : !resolved_room_ver.empty()          ? resolved_room_ver
+                                                                        : std::string{"1"};
             auto const* room_version = rooms::find_room_version_policy(room_ver);
             if (room_version == nullptr)
             {
@@ -2391,7 +2405,14 @@ auto verify_inbound_federation_signature(FederationRuntimeState& runtime, Signed
     {
         return {.accepted = false, .identity = VerifiedFederationIdentity{}, .error = std::move(resolution.error)};
     }
-    if (!request.signature_verified)
+    // Security (audit M-05): this verifier is exported and ALWAYS performs the
+    // Ed25519 check. It deliberately ignores request.signature_verified — that
+    // flag is a plain bool on a caller-supplied struct, so honouring it here
+    // would turn any caller mistake into a silent bypass of X-Matrix
+    // authentication. The worker fast path lives in
+    // handle_inbound_federation_request, which is the only entry point allowed
+    // to trust a verification main already performed over the authenticated IPC
+    // channel.
     {
         auto const rejection = check_inbound_request_signature(runtime, request, resolution.remote);
         if (rejection.has_value())
@@ -2593,6 +2614,15 @@ auto handle_inbound_federation_request(FederationRuntimeState& runtime, SignedFe
     // remote server (e.g. Synapse) to back off the entire destination for a
     // backoff period, blocking all subsequent federation.
     auto pdu_errors = canonicaljson::Object{};
+    // Security (audit H-04): counts the PDUs in this transaction that failed a
+    // trust check (signature, sender-key resolution, event authorization, or
+    // content hash). `remote` is a local copy of the peer's trust record, so
+    // the per-PDU increments below are only durable if they are persisted; the
+    // handler used to overwrite them with zero at transaction completion, which
+    // let a peer flood forged PDUs forever without ever tripping the backoff.
+    // Room-ACL denials are deliberately excluded — an ACL is local policy, not
+    // evidence that the peer is misbehaving.
+    auto pdu_trust_failures = std::size_t{0U};
     // Pre-resolve distinct relayed sender-domain signing keys in parallel so a
     // large inbound transaction carrying PDUs from many senders does not pay N
     // serial discovery+fetch round-trips. Each task writes a disjoint slot in
@@ -2747,6 +2777,7 @@ auto handle_inbound_federation_request(FederationRuntimeState& runtime, SignedFe
                 else
                 {
                     ++remote.trust.consecutive_failures;
+                    ++pdu_trust_failures;
                     auto const reason = std::string{"relayed PDU: could not resolve sender domain signing key"};
                     log_diagnostic("pdu.rejected", {
                                                        {"origin",     request.origin,              false},
@@ -2765,6 +2796,7 @@ auto handle_inbound_federation_request(FederationRuntimeState& runtime, SignedFe
         if (!pdu_decision.accepted)
         {
             ++remote.trust.consecutive_failures;
+            ++pdu_trust_failures;
             log_diagnostic("pdu.rejected", {
                                                {"origin",         request.origin,                      false},
                                                {"transaction_id", transaction.transaction_id,          false},
@@ -2793,6 +2825,10 @@ auto handle_inbound_federation_request(FederationRuntimeState& runtime, SignedFe
             if (parsed_for_hash.error != canonicaljson::ParseError::none ||
                 !events::verify_pdu_content_hash(parsed_for_hash.value))
             {
+                // A content-hash mismatch is tampering evidence, not policy, so
+                // it counts against the peer's trust record (audit H-04).
+                ++remote.trust.consecutive_failures;
+                ++pdu_trust_failures;
                 pdu_errors.push_back(canonicaljson::make_member(
                     pdu.event_id,
                     canonicaljson::Value{canonicaljson::Object{canonicaljson::make_member(
@@ -2912,7 +2948,16 @@ auto handle_inbound_federation_request(FederationRuntimeState& runtime, SignedFe
         }
     }
 
-    remote.trust.consecutive_failures = 0U;
+    // Security (audit H-04): only a transaction in which every PDU passed its
+    // trust checks resets the peer's consecutive-failure count. When PDUs were
+    // rejected, `remote.trust.consecutive_failures` already carries the
+    // incremented value and is persisted as-is, so a stream of forged-PDU
+    // transactions eventually trips the backoff and circuit breaker instead of
+    // zeroing the counter on every round trip.
+    if (pdu_trust_failures == 0U)
+    {
+        remote.trust.consecutive_failures = 0U;
+    }
     persist_remote_trust(runtime, remote);
     {
         auto guard = federation_guard(runtime);

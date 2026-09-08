@@ -478,7 +478,8 @@ auto parse_srv_records(unsigned char const* message, int message_length) -> std:
     return records;
 }
 
-auto discover_server(std::string_view server_name, std::string_view well_known_server) -> ServerDiscoveryResult
+auto discover_server(LiteralDiscoveryOptIn, std::string_view server_name, std::string_view well_known_server)
+    -> ServerDiscoveryResult
 {
     auto result = ServerDiscoveryResult{};
     result.server_name = server_name;

@@ -10,6 +10,8 @@
 #include "merovingian/observability/logger.hpp"
 #include "merovingian/observability/observability.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <string>
 #include <string_view>
@@ -21,6 +23,11 @@ namespace merovingian::federation
 {
 namespace
 {
+
+    // Upper bound on the number of PDUs a single /backfill request may ask for.
+    // Matches the conventional Matrix backfill batch size; see the clamp in
+    // parse_backfill_query for the rationale (audit L-06).
+    constexpr auto max_backfill_limit = std::size_t{100U};
 
     auto log_diagnostic(std::string_view event, std::vector<observability::StructuredLogField> fields,
                         observability::LogEventSeverity severity = observability::LogEventSeverity::debug) -> void
@@ -221,7 +228,16 @@ auto parse_backfill_query(std::string_view target) -> std::optional<BackfillRequ
             {
                 return std::nullopt;
             }
-            request.limit = static_cast<std::size_t>(parsed);
+            // Security (audit L-06): the backfill limit reaches the injected
+            // BackfillProvider directly, and the provider is not obliged to cap
+            // it. An unbounded `limit` therefore lets a remote ask for the whole
+            // room in one request. The spec (SS API §Backfilling and retrieving
+            // missing events) describes `limit` as "the maximum number of PDUs
+            // to retrieve" and the 200 response as carrying events "up to the
+            // given limit" — it does not require the server to honour an
+            // arbitrarily large value, so clamping is spec-compatible and keeps
+            // federation working with peers that ask for more than we serve.
+            request.limit = std::min(static_cast<std::size_t>(parsed), max_backfill_limit);
         }
         if (amp == std::string_view::npos)
         {
