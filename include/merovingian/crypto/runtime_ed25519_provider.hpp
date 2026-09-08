@@ -21,6 +21,19 @@ namespace merovingian::crypto
 class RuntimeEd25519Provider final : public Ed25519Provider
 {
 public:
+    // Security audit 2026-09 L-07: this is the trust boundary where
+    // forgery-capable secret material enters the provider, so it is
+    // validated here rather than left to the first sign() call. A
+    // SecretBuffer that is not exactly ed25519_secret_key_bytes (64 bytes)
+    // is never retained -- the constructor leaves secret_key_ at its empty
+    // default and the malformed bytes are wiped when the by-value parameter
+    // goes out of scope. Construction itself cannot report an error (this
+    // project's toolchain does not build std::expected cleanly, and
+    // Ed25519Provider deletes copy/move, ruling out an optional-returning
+    // factory that would need to relocate the constructed object); sign()
+    // (M-07) carries its own guard on the stored buffer's size, so a
+    // provider built from bad key material can never produce a signature
+    // either way.
     explicit RuntimeEd25519Provider(core::SecretBuffer secret_key);
 
     [[nodiscard]] auto sign(Ed25519SecretKeyHandle const& /*key*/, std::string_view message)

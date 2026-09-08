@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "../support/tls_mock_server.hpp"
+#include "merovingian/homeserver/tls.hpp"
 #include "merovingian/http/connection_guard.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+
+#include <openssl/ssl.h>
 
 SCENARIO("HTTP slowloris policy validates conservative bounds", "[http][slowloris]")
 {
@@ -67,6 +71,50 @@ SCENARIO("HTTP slowloris policy summary is stable", "[http][slowloris]")
                 REQUIRE(summary.find("min_bytes_per_second=64") != std::string::npos);
                 REQUIRE(summary.find("grace_seconds=5") != std::string::npos);
                 REQUIRE(summary.find("header_deadline_seconds=30") != std::string::npos);
+            }
+        }
+    }
+}
+
+SCENARIO("TLS server context excludes non-forward-secret cipher suites", "[http][tls][security]")
+{
+    // Security audit 2026-09 L-04: HIGH:!aNULL:!MD5:!RC4:!3DES still permitted
+    // plain-RSA key exchange (no forward secrecy) and CBC/HMAC suites. This
+    // only governs SSL_CTX_set_cipher_list, which configures TLS 1.2-and-below
+    // suites; TLS 1.3 ciphersuites are selected separately (OpenSSL's
+    // compiled-in defaults, never touched by tls.cpp) and must stay available.
+    GIVEN("a TLS server context built with the hardened cipher list")
+    {
+        auto certificate = merovingian::tests::tls_mock::write_test_tls_certificate();
+        auto result = merovingian::homeserver::make_tls_server_context(certificate.certificate_file,
+                                                                       certificate.private_key_file);
+        REQUIRE(result.ok());
+
+        WHEN("the effective enabled cipher suites are inspected")
+        {
+            auto* const ciphers = SSL_CTX_get_ciphers(&result.context->native_handle());
+            REQUIRE(ciphers != nullptr);
+            REQUIRE(sk_SSL_CIPHER_num(ciphers) > 0);
+
+            auto saw_tls13_suite = false;
+            auto saw_rsa_key_exchange = false;
+            for (auto i = 0; i < sk_SSL_CIPHER_num(ciphers); ++i)
+            {
+                auto const* cipher = sk_SSL_CIPHER_value(ciphers, i);
+                if (SSL_CIPHER_get_kx_nid(cipher) == NID_kx_rsa)
+                {
+                    saw_rsa_key_exchange = true;
+                }
+                if (std::string{SSL_CIPHER_get_name(cipher)}.starts_with("TLS_"))
+                {
+                    saw_tls13_suite = true;
+                }
+            }
+
+            THEN("no enabled suite uses plain RSA key exchange, and a TLS 1.3 ciphersuite is still present")
+            {
+                REQUIRE_FALSE(saw_rsa_key_exchange);
+                REQUIRE(saw_tls13_suite);
             }
         }
     }

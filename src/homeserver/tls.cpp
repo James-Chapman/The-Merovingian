@@ -229,7 +229,16 @@ auto make_tls_server_context(std::string const& certificate_file, std::string co
         return {{}, openssl_error_string("unable to enforce TLS minimum protocol version")};
     }
 
-    if (SSL_CTX_set_cipher_list(context.m_context, "HIGH:!aNULL:!MD5:!RC4:!3DES") != 1)
+    // Security audit 2026-09 L-04: "HIGH:!aNULL:!MD5:!RC4:!3DES" still allowed
+    // plain-RSA key exchange (no forward secrecy) and CBC/HMAC suites -- a
+    // later compromise of the server's RSA private key could retrospectively
+    // decrypt recorded traffic. Restrict to authenticated ephemeral
+    // (ECDHE/DHE) AEAD suites only. This list governs TLS 1.2 and below only;
+    // TLS 1.3 ciphersuites are negotiated separately via OpenSSL's compiled-in
+    // defaults (SSL_CTX_set_ciphersuites is never called here) and are
+    // unaffected.
+    if (SSL_CTX_set_cipher_list(context.m_context,
+                                "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:!aNULL:!MD5:!RC4:!3DES:!RSA:!SHA1") != 1)
     {
         return {{}, openssl_error_string("unable to configure TLS cipher list")};
     }
