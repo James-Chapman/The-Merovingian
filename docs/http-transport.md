@@ -53,6 +53,16 @@ Implemented now:
   `-Headers`, and `-Max-Age` derived from the runtime's `server.cors.*`
   config (0.4.60 preflight; 0.5.30 extended to all non-OPTIONS
   responses via a single `handle_client_server_request` boundary).
+  Since 0.12.9 this includes the errors the *transport* layer answers before
+  routing — parser errors, request timeouts, head-too-large and body-too-large.
+  Those were formatted with no CORS headers, so a browser saw a `400`, `408` or
+  `413` as an opaque CORS failure and could not tell it from a network outage.
+  When the head never parsed there is no `http::RequestHead` to consult, so the
+  `Origin` is read straight out of the raw head bytes.
+  `Access-Control-Allow-Credentials` is never emitted on these responses, and
+  `apply_cors_headers` refuses to pair it with a wildcard origin at all —
+  `config::validate` already rejects that combination at startup, but a runtime
+  CORS snapshot assembled in process never passes through validation.
   Reverse proxies must not add their own CORS headers; see
   `docs/user-manual.md` Reverse proxy section.
 - response-header validation at both the client-server header assembler and
@@ -317,6 +327,30 @@ for the full rationale and the rule this sets for future code: nothing may
 put a TLS client socket back into blocking mode, and no code below the HTTP
 layer may perform a blocking I/O call on a connection descriptor.
 
+The cipher list configured with `SSL_CTX_set_cipher_list` is restricted to
+authenticated ephemeral (ECDHE/DHE) AEAD suites:
+`ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:!aNULL:!MD5:!RC4:!3DES:!RSA:!SHA1`. The
+previous `HIGH:!aNULL:!MD5:!RC4:!3DES` still permitted plain-RSA key exchange,
+so an attacker who recorded traffic and later obtained the server's private key
+could decrypt it retrospectively. This list governs TLS 1.2 and below only;
+TLS 1.3 ciphersuites are negotiated separately from OpenSSL's compiled-in
+defaults, which this code never overrides.
+
+### Plain-HTTP sockets obey the same rule
+
+The non-blocking rule above is not TLS-specific, and since 0.12.9 the plaintext
+path obeys it too. Accepted client sockets carry `SOCK_NONBLOCK` from `accept4`
+itself, so the descriptor is non-blocking from the instant it exists rather than
+from the instant a worker picks it up. `PlainConnectionStream::read` and
+`::write` retry on `EAGAIN` against a deadline, and the sync-pool's direct
+`send_all(fd, ...)` path waits for `POLLOUT` the same way.
+
+Reads on a plaintext socket were already bounded by the HTTP layer's
+`poll(POLLIN)` — for a plaintext socket, unlike a TLS one, readable bytes really
+do mean a readable request. Writes were not: a peer that accepted a connection
+and then stopped reading parked a worker inside `::send()` for as long as it
+liked, and one such client could exhaust the pool.
+
 OpenSSL is the selected TLS provider for this boundary. The project-owned
 wrapper keeps OpenSSL-specific types out of higher-level transport code, which
 contains provider maintenance without making provider replacement part of the
@@ -403,6 +437,15 @@ Two independent wall-clock token-bucket tiers are maintained:
 - **Per-IP**, keyed by `(effective_client_ip, normalized_route)`.
 - **Per-user**, keyed by `(authenticated_user_id, normalized_route)` for
   requests that present a valid access token.
+
+Both bucket tables hash their keys with `http::BucketKeyHash` — keyed BLAKE2b
+through `crypto::generic_hash_bytes`, under a per-process random key — not
+`std::hash<std::string>`. Bucket keys are attacker-influenceable, and the
+default hash is neither collision-resistant nor randomised per process, so a
+single precomputed collision set would degrade the table into a linear scan on
+every deployment: the structure the server uses to defend against floods would
+become the target of one. `kMaxBucketsPerTable` still bounds table size; the
+hash bounds the cost of each lookup within it.
 
 A quiet server does not freeze a bucket because the window rolls over on elapsed
 real time, not on request count. When a cap is exceeded the server returns

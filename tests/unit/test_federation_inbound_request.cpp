@@ -2529,3 +2529,160 @@ SCENARIO("A cache-served key resolution is not charged to the network budget",
         }
     }
 }
+
+// Regression test for security audit finding H-04 (2026-09).
+//
+// Spec: Matrix Server-Server API v1.19 - Transactions
+// URL:  ../../docs/matrix-v1.19-spec/server-server-api.md#transactions
+//
+// Per-PDU rejections inside a /send transaction incremented a LOCAL copy of the
+// peer's trust record, and the handler then unconditionally wrote
+// consecutive_failures = 0 back at transaction completion. A malicious peer
+// could therefore stream endless transactions full of forged PDUs -- each
+// answered with HTTP 200 and per-PDU errors, exactly as the spec requires --
+// while the consecutive-failures backoff and circuit breaker never fired.
+SCENARIO("Transactions whose PDUs are all rejected keep incrementing the "
+         "peer's failure count",
+         "[federation][inbound][trust][security]") {
+  GIVEN("a known remote sending transactions whose only PDU fails PDU "
+        "authorization") {
+    REQUIRE(sodium_is_ready());
+    auto runtime = merovingian::federation::make_federation_runtime_state(
+        runtime_config());
+    auto const origin = std::string{"matrix.example.org"};
+    auto const key_id = std::string{"ed25519:auto"};
+    auto const token = std::string{"verify-token"};
+    merovingian::federation::upsert_remote(runtime,
+                                           remote_for(origin, key_id, token));
+
+    // Each transaction carries a distinct transaction id so the replay-dedup
+    // fast path (which legitimately resets the counter) is never taken. The
+    // PDU has no signatures, so authorize_federation_pdu rejects it and the
+    // transaction returns HTTP 200 with a per-PDU error.
+    auto const send_rejected_transaction = [&runtime, &origin, &key_id,
+                                            &token](std::string const &txn_id) {
+      auto request = signed_request(
+          origin, key_id, token,
+          transaction_body(origin, "{\"type\":\"m.room.message\"}"));
+      request.target = "/_matrix/federation/v1/send/" + txn_id;
+      request.signature = merovingian::federation::make_federation_signature(
+          request.origin, request.destination, request.method, request.target,
+          request.body,
+          merovingian::federation::test::keypair_from_seed(token).secret_key);
+      return merovingian::federation::handle_inbound_federation_request(
+          runtime, request);
+    };
+    auto const persisted_failures = [&runtime]() {
+      return runtime.remotes.front().trust.consecutive_failures;
+    };
+
+    WHEN("three all-rejected transactions arrive in sequence") {
+      auto const first = send_rejected_transaction("txn-reject-1");
+      auto const after_first = persisted_failures();
+      auto const second = send_rejected_transaction("txn-reject-2");
+      auto const after_second = persisted_failures();
+      auto const third = send_rejected_transaction("txn-reject-3");
+      auto const after_third = persisted_failures();
+      auto const fourth = send_rejected_transaction("txn-reject-4");
+
+      THEN("the persisted failure count rises monotonically and the peer is "
+           "backed off") {
+        // Spec: per-PDU failures are reported at HTTP 200, never 4xx/5xx.
+        REQUIRE(first.status == 200U);
+        REQUIRE(second.status == 200U);
+        REQUIRE(third.status == 200U);
+        REQUIRE(first.body.find("\"error\"") != std::string::npos);
+        // The persisted count MUST grow, not reset to zero.
+        REQUIRE(after_first == 1U);
+        REQUIRE(after_second == 2U);
+        REQUIRE(after_third == 3U);
+        // Backoff / circuit breaker fires at three consecutive failures.
+        REQUIRE(fourth.status == 429U);
+        REQUIRE(fourth.body == "remote backoff required");
+      }
+    }
+
+    AND_WHEN(
+        "a transaction whose PDUs are all accepted follows two rejected ones") {
+      std::ignore = send_rejected_transaction("txn-reject-a");
+      std::ignore = send_rejected_transaction("txn-reject-b");
+      auto const before_success = persisted_failures();
+
+      auto good = signed_request(
+          origin, key_id, token,
+          transaction_body(origin, signed_json_pdu(origin, key_id, token)));
+      good.target = "/_matrix/federation/v1/send/txn-accept-1";
+      good.signature = merovingian::federation::make_federation_signature(
+          good.origin, good.destination, good.method, good.target, good.body,
+          merovingian::federation::test::keypair_from_seed(token).secret_key);
+      auto const accepted =
+          merovingian::federation::handle_inbound_federation_request(runtime,
+                                                                     good);
+
+      THEN("a fully successful transaction still resets the counter to zero") {
+        REQUIRE(before_success == 2U);
+        REQUIRE(accepted.status == 200U);
+        REQUIRE(accepted.body == "{\"pdus\":{}}");
+        REQUIRE(persisted_failures() == 0U);
+      }
+    }
+  }
+}
+
+// Regression test for security audit finding M-05 (2026-09).
+//
+// Spec: Matrix Server-Server API v1.19 - Request authentication
+// URL: ../../docs/matrix-v1.19-spec/server-server-api.md#request-authentication
+//
+// verify_inbound_federation_signature is the exported verifier. It previously
+// honoured SignedFederationRequest::signature_verified and skipped the Ed25519
+// check entirely, so any caller that set the bool before verifying obtained a
+// fail-open bypass of X-Matrix authentication. The worker fast path lives in
+// handle_inbound_federation_request; the exported verifier must always perform
+// real cryptography.
+SCENARIO("verify_inbound_federation_signature always performs the crypto check "
+         "even when signature_verified is set",
+         "[federation][inbound][security]") {
+  GIVEN("a known remote and a request with a bad signature marked "
+        "signature_verified") {
+    REQUIRE(sodium_is_ready());
+    auto runtime = merovingian::federation::make_federation_runtime_state(
+        runtime_config());
+    auto const origin = std::string{"matrix.example.org"};
+    auto const key_id = std::string{"ed25519:auto"};
+    auto const token = std::string{"verify-token"};
+    merovingian::federation::upsert_remote(runtime,
+                                           remote_for(origin, key_id, token));
+    auto request = signed_request(origin, key_id, token, pdu_for(origin));
+    request.signature = "not-a-real-signature";
+    request.signature_verified = true;
+
+    WHEN("the exported verifier is called") {
+      auto const result =
+          merovingian::federation::verify_inbound_federation_signature(runtime,
+                                                                       request);
+
+      THEN("the signature is checked and the request is rejected") {
+        // Spec MUST: a request whose X-Matrix signature does not verify
+        // is rejected. A caller-supplied bool cannot stand in for crypto.
+        REQUIRE_FALSE(result.accepted);
+        REQUIRE(result.error.status == 403U);
+      }
+    }
+
+    AND_WHEN("the worker entry point handles the same pre-verified request") {
+      auto worker_request = signed_request(
+          origin, key_id, token,
+          transaction_body(origin, signed_json_pdu(origin, key_id, token)));
+      worker_request.signature = "not-a-real-signature";
+      worker_request.signature_verified = true;
+      auto const response =
+          merovingian::federation::handle_inbound_federation_request(
+              runtime, worker_request);
+
+      THEN("the worker fast path still accepts it without re-verifying") {
+        REQUIRE(response.status == 200U);
+      }
+    }
+  }
+}

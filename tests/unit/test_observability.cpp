@@ -7,8 +7,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <string>
+#include <thread>
 #include <vector>
 
 SCENARIO("Admin control surfaces default to local-only safe exposure", "[observability][admin]")
@@ -73,8 +76,15 @@ SCENARIO("Admin routes expose health, metrics, audit, account, review, and shutd
     }
 }
 
-SCENARIO("Append-only audit log event model covers required audit categories", "[observability][audit]")
+SCENARIO("Audit log events cover required audit categories and persist only via INSERT", "[observability][audit]")
 {
+    // L-11 (security-audit-report-2026-09.md): AuditLogEvent used to carry
+    // an `append_only` flag that nothing ever consulted -- it was removed
+    // rather than enforced, since real enforcement (a database trigger
+    // rejecting UPDATE/DELETE) requires a migration outside this change's
+    // scope. What this scenario asserts instead is the guarantee that
+    // actually exists: the only SQL `audit_log_insert_statement` ever
+    // produces is an INSERT, never an UPDATE or DELETE.
     GIVEN("audit events")
     {
         auto const auth_event = merovingian::observability::make_audit_event(
@@ -98,15 +108,18 @@ SCENARIO("Append-only audit log event model covers required audit categories", "
             auto const statement = merovingian::observability::audit_log_insert_statement(auth_event);
             auto const summary = merovingian::observability::audit_event_summary(policy_event);
 
-            THEN("events are append-only and persistence uses prepared statements")
+            THEN("every category round-trips through make_audit_event and persistence is INSERT-only")
             {
-                REQUIRE(auth_event.append_only);
-                REQUIRE(key_event.append_only);
-                REQUIRE(policy_event.append_only);
-                REQUIRE(moderation_event.append_only);
-                REQUIRE(admin_event.append_only);
+                REQUIRE(auth_event.category == merovingian::observability::AuditCategory::auth);
+                REQUIRE(key_event.category == merovingian::observability::AuditCategory::key_lifecycle);
+                REQUIRE(policy_event.category == merovingian::observability::AuditCategory::policy);
+                REQUIRE(moderation_event.category == merovingian::observability::AuditCategory::moderation);
+                REQUIRE(admin_event.category == merovingian::observability::AuditCategory::admin);
                 REQUIRE(statement.name == "observability_append_audit_event");
                 REQUIRE(merovingian::database::prepared_statement_is_valid(statement).valid);
+                REQUIRE(statement.sql.find("INSERT") == 0U);
+                REQUIRE(statement.sql.find("UPDATE") == std::string::npos);
+                REQUIRE(statement.sql.find("DELETE") == std::string::npos);
                 REQUIRE(summary.find("policy") != std::string::npos);
                 REQUIRE(summary.find("media_blocked") != std::string::npos);
             }
@@ -394,6 +407,235 @@ SCENARIO("Startup hardening self-check output is represented in observability sn
                 REQUIRE(hardening_summaries[0] == "hardening stack-protector=enabled");
                 REQUIRE(hardening_summaries[1] == "hardening relro=disabled");
                 REQUIRE(merovingian::observability::observability_snapshot_is_safe(snapshot));
+            }
+        }
+    }
+}
+
+SCENARIO("redact_log_message redacts key=value tokens carrying secret markers in freeform text",
+         "[observability][logging][redaction]")
+{
+    // M-11 (security-audit-report-2026-09.md): the legacy LOG_*/LOGF_*
+    // macros pass a caller-built std::string straight to SingleLog, so they
+    // cannot carry a StructuredLogField's `sensitive` bit. redact_log_message
+    // is the boundary SingleLog::log() now applies to every line (see
+    // logger.hpp) so a plain-string call site cannot bypass redaction the
+    // way structured `log_diagnostic` fields already could not.
+    GIVEN("a message with no key=value tokens")
+    {
+        WHEN("it is redacted")
+        {
+            auto const redacted =
+                merovingian::observability::redact_log_message("Federation worker: runtime hardening applied");
+
+            THEN("plain prose passes through unchanged")
+            {
+                REQUIRE(redacted == "Federation worker: runtime hardening applied");
+            }
+        }
+    }
+
+    GIVEN("a message with a single sensitive key=value token")
+    {
+        WHEN("it is redacted")
+        {
+            auto const redacted =
+                merovingian::observability::redact_log_message("login attempt access_token=abc123XYZ rejected");
+
+            THEN("the token's value is replaced and the surrounding words survive")
+            {
+                REQUIRE(redacted == "login attempt access_token=<redacted> rejected");
+                REQUIRE(redacted.find("abc123XYZ") == std::string::npos);
+            }
+        }
+    }
+
+    GIVEN("a message with both a sensitive and a non-sensitive key=value token")
+    {
+        WHEN("it is redacted")
+        {
+            auto const redacted = merovingian::observability::redact_log_message(
+                "Federation worker starting: shard=0 config=/etc/merovingian.toml token=super-secret");
+
+            THEN("only the sensitive token is redacted; file paths and non-secret fields are untouched")
+            {
+                REQUIRE(redacted.find("shard=0") != std::string::npos);
+                REQUIRE(redacted.find("config=/etc/merovingian.toml") != std::string::npos);
+                REQUIRE(redacted.find("token=<redacted>") != std::string::npos);
+                REQUIRE(redacted.find("super-secret") == std::string::npos);
+            }
+        }
+    }
+
+    GIVEN("a message with a password field")
+    {
+        WHEN("it is redacted")
+        {
+            auto const redacted = merovingian::observability::redact_log_message("reset password=hunter2 for user");
+
+            THEN("the password value does not reach the redacted line")
+            {
+                REQUIRE(redacted.find("password=<redacted>") != std::string::npos);
+                REQUIRE(redacted.find("hunter2") == std::string::npos);
+            }
+        }
+    }
+}
+
+SCENARIO("DropEpisodePolicy reports exactly one drop episode per contiguous run of failures",
+         "[observability][logging][backpressure]")
+{
+    // L-13 / L-10 (security-audit-report-2026-09.md): shared by the bounded
+    // console/file log queues and the audit-sink no-op path. The behaviour
+    // under test -- a flood produces one warning signal, not one per
+    // dropped item, and the total dropped count keeps accumulating -- is
+    // tested at the policy level (deterministic, no background threads or
+    // real queue capacity involved) rather than by racing SingleLog's
+    // asynchronous writer threads, which would make the test's outcome
+    // depend on machine speed.
+    GIVEN("a fresh policy")
+    {
+        auto policy = merovingian::observability::DropEpisodePolicy{};
+
+        WHEN("no attempts have been observed yet")
+        {
+            THEN("it starts with nothing dropped and no active episode")
+            {
+                REQUIRE(policy.dropped_total() == 0U);
+                REQUIRE_FALSE(policy.in_drop_episode());
+            }
+        }
+
+        WHEN("a run of successful attempts is observed")
+        {
+            REQUIRE_FALSE(policy.observe(true));
+            REQUIRE_FALSE(policy.observe(true));
+
+            THEN("nothing is reported as dropped and no episode is entered")
+            {
+                REQUIRE(policy.dropped_total() == 0U);
+                REQUIRE_FALSE(policy.in_drop_episode());
+            }
+        }
+
+        WHEN("a flood of failed attempts follows a success")
+        {
+            REQUIRE_FALSE(policy.observe(true));
+            auto const first_drop_warns = policy.observe(false);
+            auto const second_drop_warns = policy.observe(false);
+            auto const third_drop_warns = policy.observe(false);
+
+            THEN("only the first failure in the run signals a warning, but every failure counts")
+            {
+                REQUIRE(first_drop_warns);
+                REQUIRE_FALSE(second_drop_warns);
+                REQUIRE_FALSE(third_drop_warns);
+                REQUIRE(policy.dropped_total() == 3U);
+                REQUIRE(policy.in_drop_episode());
+            }
+        }
+
+        WHEN("the flood recovers and then floods again")
+        {
+            REQUIRE(policy.observe(false));
+            REQUIRE_FALSE(policy.observe(false));
+            REQUIRE_FALSE(policy.observe(true));
+            auto const second_episode_warns = policy.observe(false);
+
+            THEN("a success ends the episode, so the next failure warns again")
+            {
+                REQUIRE(second_episode_warns);
+                REQUIRE(policy.dropped_total() == 3U);
+                REQUIRE(policy.in_drop_episode());
+            }
+        }
+    }
+}
+
+namespace
+{
+
+// Test-only audit sink for the L-09 concurrency scenario below. AuditSink is
+// a plain function pointer (see logger.hpp), so this must be a free
+// function, not a capturing lambda.
+std::atomic<std::size_t> g_test_audit_sink_invocations{0U}; // NOLINT
+
+auto counting_test_audit_sink(merovingian::observability::AuditSinkFields const& /*fields*/) -> void
+{
+    g_test_audit_sink_invocations.fetch_add(1U, std::memory_order_relaxed);
+}
+
+} // namespace
+
+SCENARIO("The audit sink survives concurrent installation and invocation without corruption",
+         "[observability][audit][thread-safety]")
+{
+    // L-09 (security-audit-report-2026-09.md): `set_audit_sink()` used to
+    // write a plain (non-atomic) function pointer while `log_diagnostic_audit`
+    // read it from arbitrary threads. This scenario exercises exactly that
+    // pattern -- concurrent installers and concurrent invokers -- so a TSan
+    // build (tests/integration/AGENTS.md: sanitizers run in CI) can catch a
+    // regression. Per project rule, every thread is joined before any
+    // REQUIRE runs: Catch2 assertions are not thread-safe, and a live
+    // std::thread next to a failing REQUIRE aborts the whole binary.
+    GIVEN("the current audit sink, saved so this scenario can restore it afterwards")
+    {
+        auto const previous_sink = merovingian::observability::the_audit_sink().load(std::memory_order_acquire);
+        g_test_audit_sink_invocations.store(0U, std::memory_order_relaxed);
+
+        WHEN("multiple threads install the sink while multiple other threads invoke it")
+        {
+            auto threads = std::vector<std::thread>{};
+            constexpr auto installer_threads = 4;
+            constexpr auto invoker_threads = 4;
+            constexpr auto invocations_per_thread = 200;
+
+            for (auto i = 0; i < installer_threads; ++i)
+            {
+                threads.emplace_back([] {
+                    for (auto j = 0; j < 50; ++j)
+                    {
+                        merovingian::observability::set_audit_sink(&counting_test_audit_sink);
+                    }
+                });
+            }
+            for (auto i = 0; i < invoker_threads; ++i)
+            {
+                threads.emplace_back([] {
+                    auto const fields =
+                        merovingian::observability::AuditSinkFields{merovingian::observability::AuditCategory::auth,
+                                                                    "test.concurrent", "actor", "target", "reason"};
+                    for (auto j = 0; j < invocations_per_thread; ++j)
+                    {
+                        merovingian::observability::log_diagnostic_audit(
+                            "test_observability", "test.concurrent", {},
+                            merovingian::observability::LogEventSeverity::warning, fields);
+                    }
+                });
+            }
+
+            // Every thread is joined here, before any assertion, per the
+            // project's Catch2-threading rule.
+            for (auto& worker : threads)
+            {
+                worker.join();
+            }
+
+            THEN("the sink remains a valid, callable pointer afterward with no corruption")
+            {
+                merovingian::observability::set_audit_sink(&counting_test_audit_sink);
+                auto const before = g_test_audit_sink_invocations.load(std::memory_order_relaxed);
+                merovingian::observability::log_diagnostic_audit("test_observability", "test.concurrent", {},
+                                                                 merovingian::observability::LogEventSeverity::warning,
+                                                                 merovingian::observability::AuditSinkFields{});
+                REQUIRE(g_test_audit_sink_invocations.load(std::memory_order_relaxed) == before + 1U);
+
+                // Restore the process-wide sink. Other tests in this binary
+                // (e.g. tests/unit/test_local_database_scope.cpp,
+                // tests/unit/test_auth_session.cpp) depend on whichever real
+                // sink was installed before this scenario ran; leaving our
+                // test-only sink in place would silently break them.
+                merovingian::observability::set_audit_sink(previous_sink);
             }
         }
     }

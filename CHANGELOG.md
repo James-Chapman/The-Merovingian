@@ -1,5 +1,221 @@
+## 0.12.9
+
+Fixes all 33 confirmed findings of the September 2026 security audit
+(`docs/security-audit-report-2026-09.md`). Every finding was checked against the
+code and against the v1.19 spec before any change was made. Three did not
+survive that check as stated and were implemented differently; each is called
+out below, because in every case the audit's suggested remedy would have looked
+complete while being wrong.
+
+### High severity
+
+- **H-01** `POST /_matrix/client/v3/refresh` authenticates with a refresh token,
+  so it never reached the access-token moderation gate. A locked account could
+  keep minting access tokens indefinitely, defeating `M_USER_LOCKED` on every
+  endpoint except logout. `refresh_local_session` now refuses a locked account
+  with `401 M_USER_LOCKED` and `soft_logout: true`.
+
+  *Departure from the audit:* suspended accounts are deliberately still served.
+  The spec SHOULD-lists logging in, creating further sessions, and reading
+  through `/sync` and `/messages` among a suspended account's permitted actions,
+  and this server's own suspension allowlist already permits `POST /login` —
+  which mints unlimited fresh access tokens. Refusing a rotation while permitting
+  a fresh login buys nothing and denies the reads the spec asks servers to
+  preserve. See [ADR-0058](docs/adr/0058-a-suspended-account-may-still-refresh-its-access-token.md).
+
+- **H-02** Refresh no longer resurrects a deleted device. The token lifecycle
+  binds every credential to a device row; a refresh token that outlives its row
+  can only have arrived through a failure, and honouring it reanimated a session
+  for a device the user believed was gone.
+
+- **H-03** Accepted plain-HTTP sockets were left blocking. Reads were guarded by
+  the HTTP layer's `poll(POLLIN)`, but the response write was not, so a peer that
+  accepted a connection and then stopped reading parked a worker inside `::send()`
+  indefinitely — one client could exhaust the pool. ADR-0054 fixed this for TLS
+  and stated the rule; plaintext was left out. Accepted sockets now carry
+  `SOCK_NONBLOCK` from `accept4` itself, and both send paths wait for writability
+  against a deadline.
+
+- **H-04** Per-PDU rejections incremented a local copy of the peer's
+  consecutive-failure count, and the handler then zeroed it unconditionally at
+  transaction completion. A peer could send endless transactions of forged PDUs —
+  each answered `200` with per-PDU errors — without ever tripping the backoff or
+  circuit breaker. The count now survives any transaction in which a PDU failed a
+  trust check; only a fully clean transaction resets it. Room-ACL denials are
+  excluded, because an ACL is local policy rather than evidence of peer
+  misbehaviour.
+
+- **H-05** The event signer logged the full canonical signing payload and the
+  complete signed event JSON at debug level under field names the redactor does
+  not recognise. Diagnostics now carry each payload's byte count and SHA-256
+  digest only — still enough to compare byte-for-byte with a peer when triaging
+  a `BadSignatureError`.
+
+- **H-06** V2 state resolution never populated `authorising_user_member`, which
+  the restricted-join authorization branch requires, so every valid restricted
+  join in the conflicted set was rejected and room state diverged across servers.
+
+- **H-07** V2 state resolution read power levels with an integer-only accessor.
+  Room versions 1–9 permit string-encoded levels and the authorization path
+  already parses them, so the resolver silently demoted such senders to
+  `users_default` — letting a lower-power event win the ordering. It now respects
+  the room version policy, matching the auth path.
+
+### Medium severity
+
+- **M-01** The Argon2id hash of the registration token file was cached by path
+  and never revalidated, so rotating the token on disk kept the old one live
+  until restart. The cache is now keyed on the file version (device, inode, size,
+  sub-second mtime) and only stores an entry when the file did not change between
+  the two stats bracketing the read.
+- **M-02** The rate limiter's own bucket tables used `std::hash<std::string>`
+  over attacker-influenceable keys, so one precomputed collision set degrades
+  every deployment's table into a linear scan. Keys now hash through keyed
+  BLAKE2b at the crypto boundary under a per-process random key.
+- **M-03** Parser errors, timeouts and head-too-large responses carried no CORS
+  headers, so a browser saw them as CORS failures instead of the real status
+  (spec §10.5). The `Origin` is now read out of the raw head, which is the only
+  source available when the head never parsed.
+- **M-04** v1 invites fell back to room version 12 for the reference-hash event
+  ID and the Ed25519 check. The spec requires a v1 invite to be assumed room
+  version 1 or 2; the room's real version is now resolved from local state as
+  `send_join` does, falling back to v1.
+- **M-05** `verify_inbound_federation_signature` is exported and skipped the
+  Ed25519 check whenever a caller-set bool said it was already verified. It now
+  always verifies; the worker fast path stays in
+  `handle_inbound_federation_request`.
+- **M-06** The well-known discovery overload resolved through a literal network
+  that returns a documentation IP for every host, bypassing DNS and the SSRF
+  checks. It now requires an explicit test-only opt-in token, so a production
+  call site written against the old signature fails to compile.
+- **M-07 / L-07** `RuntimeEd25519Provider` handed its stored `SecretBuffer`
+  straight to libsodium with no size check. The constructor is the trust boundary
+  where forgery-capable material enters, so a secret that is not exactly 64 bytes
+  is now never retained, and `sign()` keeps its own guard.
+- **M-08** The identity-server unbind credential pair (`client_secret`, `sid`)
+  was bound as a public value and could reach a query trace or diagnostic log.
+  Both are now sensitive bindings.
+
+  *Scope note:* the audit also asked for encryption at rest or a redesign around
+  homeserver-signed unbind. That is a schema and protocol change, not a binding
+  fix, and remains the documented residual risk in `docs/threat-model.md`.
+- **M-09** `PQexecParams` sends every parameter as a null-terminated C string, so
+  a raw binary payload truncates at its first embedded NUL. `media_blobs.bytes`
+  is now marked binary and hex-encoded into PostgreSQL's `bytea` literal on the
+  way in and decoded on the way out, matching SQLite's length-based binding.
+- **M-10** Neither backend serialised a migration plan across processes, and each
+  step commits separately, so two servers starting together could interleave DDL.
+  PostgreSQL now holds a `pg_advisory_lock` for the whole plan under an RAII
+  lease. SQLite cannot hold a cross-process lock spanning its per-step
+  transactions without deadlocking against them, so it re-reads the ledger inside
+  each step's `BEGIN IMMEDIATE` and skips a step the winner already applied. See
+  [ADR-0059](docs/adr/0059-serialise-migrations-per-backend-not-per-abstraction.md).
+- **M-11** `LOG_*` passed a caller-built string straight to `SingleLog`,
+  bypassing the only secret-redaction boundary the structured diagnostics use.
+  Every named method now routes its composed line through `redact_log_message`,
+  which applies the same sensitivity rule as structured fields.
+
+### Low severity
+
+- **L-01 / L-02** Both UIAA challenges carried a compile-time constant session id
+  shared by every client and every attempt. Challenges now mint a random
+  per-attempt id, bounded and TTL-pruned, scoped to the endpoint that issued it;
+  a client that supplies a session must supply one we issued for that endpoint.
+  Omitting it entirely is still served, because the spec permits completing a
+  single-stage flow in one shot. Multi-stage tracking is deliberately not
+  implemented — there is exactly one configured stage, so there is no ordering to
+  enforce. See [ADR-0057](docs/adr/0057-uiaa-sessions-are-in-memory-and-single-stage.md).
+- **L-03** `device_id_is_valid` accepted `:` — the key-ID separator, which makes
+  `ed25519:a:b` ambiguous — along with `/`, `?` and `#`, which break the
+  `/devices/{deviceId}` path segment.
+- **L-04** The TLS 1.2-and-below cipher list still permitted plain-RSA key
+  exchange, so a later compromise of the server's key could retrospectively
+  decrypt recorded traffic. Restricted to authenticated ephemeral AEAD suites;
+  TLS 1.3 ciphersuites are configured separately and are unaffected.
+- **L-05** `apply_cors_headers` paired `Access-Control-Allow-Credentials` with a
+  wildcard origin, which CORS forbids.
+
+  *Correction to the audit:* this was not reachable through configuration —
+  `config::validate` already refuses wildcard-plus-credentials and the server
+  will not start with it. The fix is defence in depth for a runtime CORS snapshot
+  that never passed through validation.
+- **L-06** The backfill `limit` reached the injected provider unclamped; it is
+  now capped at 100.
+- **L-08** `parse_u32` in the `db-migrate` CLI folded empty input, non-numeric
+  text and overflow all into 0, so `--plan abc def` printed an empty plan and
+  exited 0.
+- **L-09** The audit sink was a plain function pointer written during thread
+  startup and read from arbitrary threads with no happens-before edge. It is now
+  a lock-free atomic.
+- **L-10** `local_audit_sink` no-opped silently whenever the thread-local
+  database was unset or closed. It now warns once per drop episode rather than
+  once per dropped event, which would have made a flood worse.
+- **L-11** `AuditLogEvent.append_only` asserted a guarantee nothing enforced.
+  Removed rather than left lying; real enforcement is a database trigger, which
+  belongs in its own migration.
+- **L-12** `string_format` forwarded a runtime string as a `printf` format
+  (CWE-134). It and the `LOGF_*` macros built on it had no call site in `src/`,
+  so both are deleted outright.
+- **L-13** The bounded console and file log queues discarded messages with no
+  signal. They now count drops and emit one warning per episode, written straight
+  to stderr so the warning about a full queue is not itself queued.
+- **L-14** `signing_key_id_is_valid` accepted any printable key id; it now
+  delegates the `ed25519:` prefix and shape check to the crypto boundary.
+- **L-15** `make_content_hash_id` hardcoded room version 12 regardless of the
+  event's actual version; it now takes the policy from the caller.
+
+### Found while reviewing the suspension allowlist
+
+- **Account suspension was bypassable through a client-chosen path segment.**
+  Not an audit finding — found while answering a question about what suspended
+  accounts may still do. `action_allowed_while_suspended` permitted its three
+  per-room actions by searching for `/leave`, `/messages` and `/redact`
+  *anywhere* in the request path, and the gate sees the raw undecoded target.
+  Several room endpoints end in a segment the client picks: the transaction ID
+  of `PUT /rooms/{roomId}/send/{eventType}/{txnId}` and the state key of
+  `PUT /rooms/{roomId}/state/{eventType}/{stateKey}`. A suspended user who
+  named their transaction `redact` could therefore send arbitrary messages, and
+  one who named a state key `redact` could write room state — both returning
+  `200`, defeating suspension for the two actions it most exists to block.
+
+  The allowlist now matches the *action segment* — the path segment immediately
+  after the room ID — by exact comparison. Anything added to this gate in future
+  must be anchored to a segment the client cannot choose.
+
+  Note also that the gate cannot enforce the spec's "redact **their own**
+  events", because it cannot see the target event's sender. That endpoint is not
+  routed today (`404 M_UNRECOGNIZED`); whoever implements it owns the ownership
+  check, and the comment at the gate says so.
+
+- **The suspension allowlist admitted more key endpoints than the spec permits.**
+  Also not an audit finding. The spec's permitted-actions list names two
+  key-related capabilities — "Verify other devices and write associated
+  cross-signing data" (§Device verification, §Cross-signing) and "Populate their
+  key backup" (§Server-side key backups). Between them those sections name
+  exactly `POST /keys/query`, `POST /keys/device_signing/upload`,
+  `POST /keys/signatures/upload`, and the `/room_keys/` subtree.
+
+  The gate admitted the whole `/keys` prefix, which additionally allowed
+  `POST /keys/upload` (publishing the account's own device and one-time keys),
+  `POST /keys/claim` (claiming a one-time key to open an Olm session) and
+  `GET /keys/changes`. The first two are participation rather than
+  verification. The permitted endpoints are now listed exactly, with their
+  methods, and `/room_keys` gained a trailing slash so the prefix cannot match
+  a longer path segment.
+
+### Also fixed
+
+- Three defects the branch's own first verification run surfaced in its new
+  tests: a dangling pointer into a `parse_object` temporary, a CORS test whose
+  config could never start, and a race between `accept` and the worker's first
+  I/O.
+
 ## 0.12.8
 
+- Publish parallel security audit report covering 33 confirmed findings across
+  auth, client HTTP, federation, crypto, database, observability, and event
+  engine surfaces, with adversarial verification and actionable acceptance
+  criteria (see `docs/security-audit-report-2026-09.md`).
 - Apply configured module/default log levels to direct logging macros as well
   as structured diagnostics, including when console debugging is enabled.
 - Emit one diagnostic warning per client rate-limit rejection while preserving

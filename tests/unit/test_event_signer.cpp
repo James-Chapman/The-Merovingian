@@ -18,6 +18,7 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <sodium.h>
 
@@ -181,6 +182,125 @@ SCENARIO("signing_key_id_is_valid accepts printable key IDs and rejects malforme
             THEN("the key ID is rejected")
             {
                 REQUIRE_FALSE(merovingian::events::signing_key_id_is_valid({"example.org", "ed25519:\x7f"}));
+            }
+        }
+
+        // Spec: Matrix Server-Server API v1.19 — verify_keys/old_verify_keys:
+        // "The object's key is the algorithm and version combined (ed25519 being
+        // the algorithm and abc123 being the version ...). Together, this forms
+        // the Key ID." A bare version with no algorithm is not a Key ID, and
+        // ed25519 is the only algorithm Matrix defines.
+        WHEN("key_id has no algorithm prefix")
+        {
+            THEN("the key ID is rejected")
+            {
+                REQUIRE_FALSE(merovingian::events::signing_key_id_is_valid({"example.org", "auto"}));
+                REQUIRE_FALSE(merovingian::events::signing_key_id_is_valid({"example.org", "abc123"}));
+            }
+        }
+
+        WHEN("key_id names an algorithm this server does not implement")
+        {
+            THEN("the key ID is rejected")
+            {
+                REQUIRE_FALSE(merovingian::events::signing_key_id_is_valid({"example.org", "rsa:auto"}));
+                REQUIRE_FALSE(merovingian::events::signing_key_id_is_valid({"example.org", "ed25519x:auto"}));
+            }
+        }
+
+        WHEN("key_id is the algorithm prefix with no version")
+        {
+            THEN("the key ID is rejected")
+            {
+                REQUIRE_FALSE(merovingian::events::signing_key_id_is_valid({"example.org", "ed25519:"}));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sign_event_accepted_diagnostic_fields
+// ---------------------------------------------------------------------------
+
+// src/observability/AGENTS.md: "Never log secret material. No tokens, passwords,
+// private keys, or full request bodies." The signing payload and the signed
+// event JSON are full event bodies, so the accepted-signing diagnostic must
+// describe them rather than reproduce them.
+SCENARIO("The accepted-signing diagnostic never carries the signing payload or the signed event JSON",
+         "[events][event-signer][logging][security]")
+{
+    GIVEN("a signing payload and a signed event JSON with recognisable content")
+    {
+        REQUIRE(sodium_ready());
+
+        auto const payload =
+            std::string{R"({"content":{"body":"correct horse battery staple"},"type":"m.room.message"})"};
+        auto const signed_json = std::string{
+            R"({"content":{"body":"correct horse battery staple"},"signatures":{"example.org":{"ed25519:auto":"AAAA"}}})"};
+
+        WHEN("the accepted-signing diagnostic fields are built")
+        {
+            auto const fields = merovingian::events::sign_event_accepted_diagnostic_fields(
+                {"example.org", "ed25519:auto"}, "AAAA", payload, signed_json);
+
+            THEN("no field reproduces the payload, the signed JSON, or the event content")
+            {
+                REQUIRE_FALSE(fields.empty());
+                for (auto const& field : fields)
+                {
+                    // Rule: no full request/event body in any log field.
+                    REQUIRE(field.value.find("correct horse battery staple") == std::string::npos);
+                    REQUIRE(field.value.find(payload) == std::string::npos);
+                    REQUIRE(field.value.find(signed_json) == std::string::npos);
+                    // The redactor keys on field names; these two were never in its
+                    // marker list, so they must not be emitted at all.
+                    REQUIRE(field.key != "signing_payload");
+                    REQUIRE(field.key != "signed_json");
+                }
+            }
+
+            THEN("the payload is still identifiable by size and digest for peer comparison")
+            {
+                auto const value_of = [&fields](std::string_view key) -> std::string {
+                    for (auto const& field : fields)
+                    {
+                        if (field.key == key)
+                        {
+                            return field.value;
+                        }
+                    }
+                    return {};
+                };
+                REQUIRE(value_of("payload_bytes") == std::to_string(payload.size()));
+                REQUIRE_FALSE(value_of("payload_sha256").empty());
+                REQUIRE_FALSE(value_of("signed_json_sha256").empty());
+                REQUIRE(value_of("payload_sha256") != value_of("signed_json_sha256"));
+                REQUIRE(value_of("key_id") == "ed25519:auto");
+            }
+        }
+
+        WHEN("the fields are built again for a payload that differs by one byte")
+        {
+            auto const original = merovingian::events::sign_event_accepted_diagnostic_fields(
+                {"example.org", "ed25519:auto"}, "AAAA", payload, signed_json);
+            auto const tampered = merovingian::events::sign_event_accepted_diagnostic_fields(
+                {"example.org", "ed25519:auto"}, "AAAA", payload + " ", signed_json);
+
+            THEN("the payload digests differ, so a peer mismatch is still diagnosable")
+            {
+                auto const digest_of =
+                    [](std::vector<merovingian::events::EventSigningDiagnosticField> const& fields) -> std::string {
+                    for (auto const& field : fields)
+                    {
+                        if (field.key == "payload_sha256")
+                        {
+                            return field.value;
+                        }
+                    }
+                    return {};
+                };
+                REQUIRE_FALSE(digest_of(original).empty());
+                REQUIRE(digest_of(original) != digest_of(tampered));
             }
         }
     }

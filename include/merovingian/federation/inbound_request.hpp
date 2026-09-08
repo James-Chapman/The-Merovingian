@@ -452,6 +452,12 @@ struct InboundSignatureVerification final
 // verified identity to the federation worker over the authenticated IPC
 // channel (#323), so the raw peer Authorization header (origin/key/sig) never
 // crosses the IPC boundary and cannot be harvested by a compromised worker.
+//
+// Security (audit M-05, 2026-09): this function ALWAYS performs the Ed25519
+// verification. It ignores SignedFederationRequest::signature_verified — that
+// bypass belongs solely to handle_inbound_federation_request, the worker entry
+// point. Do not reintroduce the flag check here: a plain bool on a
+// caller-supplied struct must never stand in for cryptographic authentication.
 [[nodiscard]] auto verify_inbound_federation_signature(FederationRuntimeState& runtime,
                                                        SignedFederationRequest const& request)
     -> InboundSignatureVerification;

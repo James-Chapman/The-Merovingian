@@ -88,8 +88,15 @@ using EventJsonIndex = std::unordered_map<std::string, std::reference_wrapper<ca
 [[nodiscard]] auto state_resolution_summary(StateResolutionResult const& result) -> std::string;
 
 [[nodiscard]] auto partition_conflicted_state(std::vector<StateGroup> const& groups) -> std::pair<StateMap, StateMap>;
+// `policy` decides how a sender's power level is read: room versions 1-9 accept
+// a power level encoded as a JSON string, v10+ require a real integer. The
+// ordering ranks events by sender power, so reading a v9 string level as absent
+// would demote the sender to users_default and let a lower-power event win.
+// Spec: ../../docs/matrix-v1.19-spec/rooms/v10.md — "Values in
+// m.room.power_levels events must be integers".
 [[nodiscard]] auto reverse_topological_power_sort(std::vector<StateEventReference> const& conflicted,
-                                                  StateMap const& unconflicted) -> std::vector<StateEventReference>;
+                                                  StateMap const& unconflicted, rooms::RoomVersionPolicy const& policy)
+    -> std::vector<StateEventReference>;
 
 // Spec (rooms/v10 — Definitions, Power events): a power event is an
 // m.room.power_levels or m.room.join_rules state event, or an m.room.member

@@ -4029,6 +4029,103 @@ SCENARIO("A locked account receives M_USER_LOCKED on all APIs except logout",
     }
 }
 
+// --- Account locking: POST /refresh is not an escape hatch -------------------
+// Spec: Matrix Client-Server API v1.19
+// Section: Account locking / Soft logout
+// URL: ../../docs/matrix-v1.19-spec/client-server-api.md#account-locking
+//
+// "When an account is locked, servers MUST return a 401 Unauthorized error
+// response with an M_USER_LOCKED error code and soft_logout set to true on all
+// but the following Client-Server APIs: POST /logout, POST /logout/all."
+// POST /refresh is not on that list, and §Soft logout is explicit that a client
+// holding M_USER_LOCKED "cannot obtain a new access token until the account has
+// been unlocked". A locked account that can keep refreshing defeats the lock on
+// every other endpoint, so /refresh MUST be gated even though it authenticates
+// with a refresh token rather than an access token.
+SCENARIO("A locked account cannot mint new tokens through POST /refresh",
+         "[conformance][client-server][session][account]")
+{
+    GIVEN("a running client-server and a user holding a valid refresh token")
+    {
+        auto started = merovingian::homeserver::start_client_server(conformance_config());
+        REQUIRE(started.started);
+
+        REQUIRE(merovingian::homeserver::handle_client_server_request(
+                    started.runtime, {"POST",
+                                      "/_matrix/client/v3/register",
+                                      {},
+                                      merovingian::tests::registration_json("lockedrefresh", "CorrectHorse7!")})
+                    .response.status == 200U);
+
+        auto const login_resp = merovingian::homeserver::handle_client_server_request(
+            started.runtime,
+            {"POST",
+             "/_matrix/client/v3/login",
+             {},
+             R"({"type":"m.login.password","identifier":{"type":"m.id.user","user":"@lockedrefresh:example.org"},"password":"CorrectHorse7!","device_id":"LRDEV","refresh_token":true})"});
+        REQUIRE(login_resp.response.status == 200U);
+        // parse_object returns by value and string_member points into it, so the
+        // object must outlive the pointer -- inlining the call reads freed memory.
+        auto const login_body = parse_object(login_resp.response.body);
+        auto const* issued = string_member(login_body, "refresh_token");
+        REQUIRE(issued != nullptr);
+        auto const refresh_tok = *issued;
+
+        auto const admin = admin_token(started.runtime, "lockadmin");
+        REQUIRE(merovingian::homeserver::handle_client_server_request(
+                    started.runtime, {"PUT", "/_matrix/client/v1/admin/lock/%40lockedrefresh%3Aexample.org", admin,
+                                      R"({"locked":true})"})
+                    .response.status == 200U);
+
+        WHEN("the locked user calls POST /refresh with that refresh token")
+        {
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"POST",
+                                  "/_matrix/client/v3/refresh",
+                                  {},
+                                  std::string{R"({"refresh_token":")"} + refresh_tok + R"("})"});
+
+            THEN("the server returns 401 M_USER_LOCKED with soft_logout:true and issues no token")
+            {
+                // Spec MUST: 401 M_USER_LOCKED with soft_logout:true.
+                REQUIRE(response.response.status == 401U);
+                auto const body = parse_object(response.response.body);
+                REQUIRE(string_member(body, "errcode") != nullptr);
+                REQUIRE(*string_member(body, "errcode") == "M_USER_LOCKED");
+                auto const* soft = bool_member(body, "soft_logout");
+                REQUIRE(soft != nullptr);
+                REQUIRE(*soft == true);
+
+                // Spec MUST: no new credential is minted for a locked account.
+                REQUIRE(string_member(body, "access_token") == nullptr);
+                REQUIRE(string_member(body, "refresh_token") == nullptr);
+            }
+        }
+
+        WHEN("the account is unlocked again and the same refresh token is presented")
+        {
+            REQUIRE(merovingian::homeserver::handle_client_server_request(
+                        started.runtime, {"PUT", "/_matrix/client/v1/admin/lock/%40lockedrefresh%3Aexample.org", admin,
+                                          R"({"locked":false})"})
+                        .response.status == 200U);
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"POST",
+                                  "/_matrix/client/v3/refresh",
+                                  {},
+                                  std::string{R"({"refresh_token":")"} + refresh_tok + R"("})"});
+
+            THEN("the refresh succeeds — locking is reversible and does not revoke tokens")
+            {
+                // Spec: "Servers SHOULD NOT invalidate access tokens on locked
+                // accounts", so the refusal above must be a gate, not a revocation.
+                REQUIRE(response.response.status == 200U);
+                auto const body = parse_object(response.response.body);
+                REQUIRE(string_member(body, "access_token") != nullptr);
+            }
+        }
+    }
+}
+
 // --- Account suspension: request-path enforcement (M_USER_SUSPENDED) ----------
 // Spec: Matrix Client-Server API v1.19
 // Section: Account suspension
@@ -4085,6 +4182,188 @@ SCENARIO("A suspended account receives M_USER_SUSPENDED on disallowed actions on
             {
                 // Spec SHOULD: suspended users may log out.
                 REQUIRE(response.response.status == 200U);
+            }
+        }
+    }
+}
+
+// --- Account suspension: the allowlist must not be substring-matchable -------
+// Spec: Matrix Client-Server API v1.19
+// Section: Account suspension
+// URL: ../../docs/matrix-v1.19-spec/client-server-api.md#account-suspension
+//
+// The suspension allowlist permits three per-room actions by looking for
+// "/leave", "/messages" and "/redact" anywhere in the request path. Several
+// room endpoints end in a client-controlled path segment -- the transaction ID
+// of POST /rooms/{roomId}/send/{eventType}/{txnId}, and the state key of
+// PUT /rooms/{roomId}/state/{eventType}/{stateKey}. The gate sees the raw
+// undecoded target, so a client that simply names its transaction "leave"
+// produces a path containing "/leave".
+//
+// If the allowlist matched that, a suspended account could send messages --
+// the single action suspension exists to stop -- by choosing a transaction ID.
+SCENARIO("A suspended account cannot reach a blocked action by naming a path segment after an allowed one",
+         "[conformance][client-server][server-admin][account][security]")
+{
+    GIVEN("a running client-server with a suspended user who is in a room")
+    {
+        auto started = merovingian::homeserver::start_client_server(conformance_config());
+        REQUIRE(started.started);
+        auto const token = logged_in_token(started.runtime); // alice, DEVICE1
+        auto const room_id = create_room(started.runtime, token);
+        auto const admin = admin_token(started.runtime, "admin");
+        REQUIRE(merovingian::homeserver::handle_client_server_request(
+                    started.runtime,
+                    {"PUT", "/_matrix/client/v1/admin/suspend/%40alice%3Aexample.org", admin, R"({"suspended":true})"})
+                    .response.status == 200U);
+
+        WHEN("the suspended user sends a message with an ordinary transaction ID")
+        {
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"PUT", "/_matrix/client/v3/rooms/" + room_id + "/send/m.room.message/txn1", token,
+                                  R"({"msgtype":"m.text","body":"hello"})"});
+
+            THEN("the server returns 403 M_USER_SUSPENDED")
+            {
+                REQUIRE(response.response.status == 403U);
+                REQUIRE(*string_member(parse_object(response.response.body), "errcode") == "M_USER_SUSPENDED");
+            }
+        }
+
+        WHEN("the suspended user names the transaction \"redact\"")
+        {
+            // PUT is the method the allowlist accepts for "/redact", and the
+            // transaction ID is the last path segment, so a substring match
+            // hands a suspended user the send endpoint for free.
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"PUT", "/_matrix/client/v3/rooms/" + room_id + "/send/m.room.message/redact", token,
+                                  R"({"msgtype":"m.text","body":"hello"})"});
+
+            THEN("the transaction ID does not buy access to a blocked action")
+            {
+                REQUIRE(response.response.status == 403U);
+                REQUIRE(*string_member(parse_object(response.response.body), "errcode") == "M_USER_SUSPENDED");
+            }
+        }
+
+        WHEN("the suspended user names a state key \"redact\"")
+        {
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"PUT", "/_matrix/client/v3/rooms/" + room_id + "/state/m.room.topic/redact", token,
+                                  R"({"topic":"owned"})"});
+
+            THEN("the state key does not buy access to a blocked action")
+            {
+                REQUIRE(response.response.status == 403U);
+                REQUIRE(*string_member(parse_object(response.response.body), "errcode") == "M_USER_SUSPENDED");
+            }
+        }
+
+        WHEN("the suspended user reads room messages normally")
+        {
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"GET", "/_matrix/client/v3/rooms/" + room_id + "/messages?limit=10", token, {}});
+
+            THEN("the permitted read still works")
+            {
+                // Spec SHOULD: suspended users may see and receive messages.
+                REQUIRE(response.response.status == 200U);
+            }
+        }
+    }
+}
+
+// --- Account suspension: the key endpoints match the spec's list exactly -----
+// Spec: Matrix Client-Server API v1.19
+// Section: Account suspension
+// URL: ../../docs/matrix-v1.19-spec/client-server-api.md#account-suspension
+//
+// The permitted actions the spec SHOULD-lists for a suspended account name two
+// key-related capabilities, each linking to a specific section:
+//
+//   "Verify other devices and write associated cross-signing data"
+//        -> §Device verification and §Cross-signing, which between them name
+//           POST /keys/query, POST /keys/device_signing/upload and
+//           POST /keys/signatures/upload.
+//   "Populate their key backup"
+//        -> §Server-side key backups, i.e. the /room_keys/ subtree.
+//
+// Admitting the whole `/keys` prefix went further than that: it also permitted
+// POST /keys/upload (publishing this account's own device and one-time keys),
+// POST /keys/claim (claiming one-time keys to open an Olm session) and
+// GET /keys/changes. None appear in the spec's permitted list.
+SCENARIO("A suspended account may use only the key endpoints the spec permits",
+         "[conformance][client-server][server-admin][account][security]")
+{
+    GIVEN("a running client-server with a suspended user holding a valid token")
+    {
+        auto started = merovingian::homeserver::start_client_server(conformance_config());
+        REQUIRE(started.started);
+        auto const token = logged_in_token(started.runtime); // alice, DEVICE1
+        auto const admin = admin_token(started.runtime, "admin");
+        REQUIRE(merovingian::homeserver::handle_client_server_request(
+                    started.runtime,
+                    {"PUT", "/_matrix/client/v1/admin/suspend/%40alice%3Aexample.org", admin, R"({"suspended":true})"})
+                    .response.status == 200U);
+
+        // The gate's only job is to decide M_USER_SUSPENDED or not; a permitted
+        // endpoint may still answer 400/404 on its own terms, so assert on the
+        // errcode rather than the status for the allowed cases.
+        auto const suspended_errcode = [&started, &token](std::string_view method, std::string const& path,
+                                                          std::string const& body) {
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {std::string{method}, path, token, body});
+            auto const parsed = parse_object(response.response.body);
+            auto const* errcode = string_member(parsed, "errcode");
+            return errcode == nullptr ? std::string{} : *errcode;
+        };
+
+        WHEN("the suspended user verifies a device and writes cross-signing data")
+        {
+            THEN("the three endpoints the spec names are not blocked by suspension")
+            {
+                // Spec SHOULD: verify other devices and write cross-signing data.
+                REQUIRE(suspended_errcode("POST", "/_matrix/client/v3/keys/query",
+                                          R"({"device_keys":{"@alice:example.org":[]}})") != "M_USER_SUSPENDED");
+                REQUIRE(suspended_errcode("POST", "/_matrix/client/v3/keys/device_signing/upload", "{}") !=
+                        "M_USER_SUSPENDED");
+                REQUIRE(suspended_errcode("POST", "/_matrix/client/v3/keys/signatures/upload", "{}") !=
+                        "M_USER_SUSPENDED");
+            }
+        }
+
+        WHEN("the suspended user populates their key backup")
+        {
+            THEN("the key backup subtree is not blocked by suspension")
+            {
+                // Spec SHOULD: populate their key backup.
+                REQUIRE(suspended_errcode("GET", "/_matrix/client/v3/room_keys/version", {}) != "M_USER_SUSPENDED");
+            }
+        }
+
+        WHEN("the suspended user uses a key endpoint the spec does not list")
+        {
+            THEN("publishing device and one-time keys is refused")
+            {
+                // Not in the spec's permitted list: this publishes the account's
+                // own device identity and one-time keys, which is participation,
+                // not verification.
+                REQUIRE(suspended_errcode("POST", "/_matrix/client/v3/keys/upload",
+                                          R"({"device_keys":{}})") == "M_USER_SUSPENDED");
+            }
+
+            THEN("claiming one-time keys is refused")
+            {
+                // Claiming an OTK opens an Olm session, which is a precursor to
+                // sending, not to verifying.
+                REQUIRE(suspended_errcode("POST", "/_matrix/client/v3/keys/claim",
+                                          R"({"one_time_keys":{}})") == "M_USER_SUSPENDED");
+            }
+
+            THEN("reading device-list changes is refused")
+            {
+                REQUIRE(suspended_errcode("GET", "/_matrix/client/v3/keys/changes?from=0&to=1", {}) ==
+                        "M_USER_SUSPENDED");
             }
         }
     }

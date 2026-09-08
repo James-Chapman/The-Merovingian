@@ -7,6 +7,7 @@
 #include "merovingian/observability/logger.hpp"
 #include "merovingian/observability/observability.hpp"
 
+#include <array>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -102,6 +103,22 @@ namespace
         return true;
     }
 
+    // Unpadded standard-alphabet base64 of the SHA-256 of `input`. Used to
+    // describe a signing payload in diagnostics without emitting its content.
+    [[nodiscard]] auto sha256_base64(std::string_view input) -> std::string
+    {
+        if (!sodium_is_ready())
+        {
+            return {};
+        }
+        auto digest = std::array<unsigned char, crypto_hash_sha256_BYTES>{};
+        if (crypto_hash_sha256(digest.data(), reinterpret_cast<unsigned char const*>(input.data()), input.size()) != 0)
+        {
+            return {};
+        }
+        return matrix_base64_from_bytes(std::string_view{reinterpret_cast<char const*>(digest.data()), digest.size()});
+    }
+
     [[nodiscard]] auto signature_is_valid_shape(std::string_view signature) noexcept -> bool
     {
         auto const decoded = matrix_bytes_from_base64(signature);
@@ -189,8 +206,33 @@ namespace
 
 auto signing_key_id_is_valid(SigningKeyId const& key_id) noexcept -> bool
 {
-    return !key_id.server_name.empty() && !key_id.key_id.empty() && contains_no_control_or_space(key_id.server_name) &&
-           contains_no_control_or_space(key_id.key_id);
+    // Spec: Matrix Server-Server API v1.19 — a Key ID is the signing algorithm
+    // and the key version combined ("ed25519:abc123"). Ed25519 is the only
+    // algorithm Matrix defines, so the algorithm prefix and the version's shape
+    // are checked at the crypto boundary rather than re-implemented here; a bare
+    // version string with no algorithm is not a Key ID.
+    return !key_id.server_name.empty() && contains_no_control_or_space(key_id.server_name) &&
+           crypto::ed25519_key_id_is_valid(key_id.key_id);
+}
+
+auto sign_event_accepted_diagnostic_fields(SigningKeyId const& key_id, std::string_view signature,
+                                           std::string_view signing_payload, std::string_view signed_json)
+    -> std::vector<EventSigningDiagnosticField>
+{
+    // src/observability/AGENTS.md: never log full request or event bodies. The
+    // signing payload and the signed event JSON are exactly that, so only their
+    // size and SHA-256 digest are reported. Those are still enough to compare
+    // byte-for-byte with a federation peer when triaging a BadSignatureError:
+    // equal digests mean equal payloads.
+    return {
+        {"server_name",        std::string{key_id.server_name}       },
+        {"key_id",             std::string{key_id.key_id}            },
+        {"payload_bytes",      std::to_string(signing_payload.size())},
+        {"payload_sha256",     sha256_base64(signing_payload)        },
+        {"signature",          std::string{signature}                },
+        {"signed_json_bytes",  std::to_string(signed_json.size())    },
+        {"signed_json_sha256", sha256_base64(signed_json)            },
+    };
 }
 
 auto matrix_base64_from_bytes(std::string_view bytes) -> std::string
@@ -364,17 +406,18 @@ auto sign_event_for_server(canonicaljson::Value const& event, rooms::RoomVersion
                 canonicaljson::canonical_json_error_name(signed_json.error)};
     }
 
-    // Diagnostic: log the exact signing payload, signature, and signed event JSON
-    // so operators can compare byte-for-byte with a federation peer's verification
+    // Diagnostic: describe the signing payload and the signed event JSON by size
+    // and SHA-256 digest only. Logging their content would put full event bodies
+    // in debug logs, which src/observability/AGENTS.md forbids; the digests are
+    // still enough to compare byte-for-byte with a federation peer's verification
     // payload when triaging BadSignatureError ("Signature was forged or corrupt").
-    log_diagnostic("sign_event.accepted", {
-                                              {"server_name",     signature.server_name,                 false},
-                                              {"key_id",          signature.key_id,                      false},
-                                              {"payload_bytes",   std::to_string(payload.output.size()), false},
-                                              {"signing_payload", payload.output,                        false},
-                                              {"signature",       encoded,                               false},
-                                              {"signed_json",     signed_json.output,                    false}
-    });
+    auto accepted_fields = std::vector<observability::StructuredLogField>{};
+    for (auto const& field : sign_event_accepted_diagnostic_fields({signature.server_name, signature.key_id}, encoded,
+                                                                   payload.output, signed_json.output))
+    {
+        accepted_fields.push_back({field.key, field.value, false});
+    }
+    log_diagnostic("sign_event.accepted", accepted_fields);
     return {signed_json.output, signature.server_name, signature.key_id, encoded, {}};
 }
 

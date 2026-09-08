@@ -133,6 +133,8 @@ using BackfillProvider = std::function<BackfillResult(BackfillRequest const&)>;
 
 // Parses the v1 backfill query string (?v=eventId&v=eventId&limit=N). Returns
 // nullopt when the input is malformed (e.g. limit not numeric).
+// The parsed `limit` is clamped to a server-side maximum (100) so a remote
+// cannot ask the injected BackfillProvider for an unbounded number of PDUs.
 [[nodiscard]] auto parse_backfill_query(std::string_view target) -> std::optional<BackfillRequest>;
 
 [[nodiscard]] auto parse_invite_body(std::string_view body, std::string_view room_id, std::string_view event_id,

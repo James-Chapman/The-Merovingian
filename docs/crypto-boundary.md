@@ -107,6 +107,14 @@ Access-token and refresh-token hashes now use a keyed BLAKE2b (`token-hash:v3`)
 construction seeded from runtime secret material; the previous unkeyed
 `token-hash:v2` form remains accepted only for lookup compatibility with older
 persisted rows.
+- Every Ed25519 provider validates the secret key's size before handing it to
+  libsodium. For `RuntimeEd25519Provider` the check is at *construction* — the
+  trust boundary where forgery-capable material enters — so a `SecretBuffer`
+  that is not exactly `ed25519_secret_key_bytes` is never retained; the
+  malformed bytes are wiped when the by-value parameter goes out of scope.
+  `sign()` keeps its own guard on the stored buffer as defence in depth, so a
+  provider built from bad key material can never produce a signature by either
+  route. `RuntimeMultiKeyEd25519Provider` already validated its stored keys.
 - Variable-length secret comparison does not branch on input length before
   computing a fixed-size digest, removing a timing side-channel on secret size.
 - Signing secret material is held in a `core::SecretBuffer` while in process memory

@@ -5,6 +5,7 @@
 #include "merovingian/database/connection.hpp"
 #include "merovingian/database/persistent_store.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -18,6 +19,19 @@ struct PostgresqlConnectionPolicyResult final
     bool allowed{false};
     std::string reason{};
 };
+
+// M-10: pg_advisory_lock() key used to serialize schema migrations across
+// every process sharing one PostgreSQL database. apply_pending_migrations
+// holds this session-scoped lock for the whole migration plan — acquired
+// before the first step, released only after the target version is
+// recorded — so a second server process starting concurrently blocks on
+// pg_advisory_lock() instead of racing DDL with this one. The value is
+// arbitrary but must stay fixed: it identifies "a migration is in flight"
+// to any process, including ones built from a different revision, so
+// changing it is safe (an in-flight lock from an old binary simply becomes
+// unreachable) but pointless. Exposed here so tests can verify the
+// exclusion and release-on-completion behavior without duplicating the key.
+inline constexpr std::int64_t postgresql_migration_lock_key = 0x4d65726f'76313000LL; // "Merov10\0" in hex, arbitrary.
 
 struct PostgresqlConnectionHandle;
 struct PostgresqlConnectionOpenResult;
@@ -54,6 +68,20 @@ struct PostgresqlConnectionOpenResult final
 
 [[nodiscard]] auto validate_postgresql_conninfo(std::string_view conninfo) -> PostgresqlConnectionPolicyResult;
 [[nodiscard]] auto redact_postgresql_conninfo(std::string_view conninfo) -> std::string;
+
+// M-09: PQexecParams sends every parameter as a null-terminated C string
+// unless told otherwise, which silently truncates a raw binary payload
+// (e.g. media_blobs.bytes) at its first embedded NUL byte. Rather than
+// switching that parameter to libpq's binary wire format, a BoundValue
+// marked `binary` is hex-encoded into PostgreSQL's own bytea text literal
+// (`\x` followed by lowercase hex pairs) before being bound as an ordinary
+// text parameter — the encoded form is plain ASCII and never contains a NUL,
+// so the existing null-terminated text path round-trips it exactly. Reading
+// a bytea column back (PostgreSQL's default `bytea_output = hex`) reverses
+// the encoding. Exposed here (rather than kept file-local) so both
+// directions are independently unit-testable without a live database.
+[[nodiscard]] auto encode_postgresql_bytea_hex(std::string_view bytes) -> std::string;
+[[nodiscard]] auto decode_postgresql_bytea_hex(std::string_view hex_text) -> std::string;
 [[nodiscard]] auto postgresql_schema_bootstrap_statements() -> std::vector<PreparedStatement>;
 [[nodiscard]] auto open_postgresql_connection(std::string_view conninfo) -> PostgresqlConnectionOpenResult;
 // `runtime_role` is the DML-only role from packaging/postgresql/provision-roles.sql;
@@ -77,10 +105,8 @@ struct PostgresqlConnectionOpenResult final
 // open fails rather than silently falling back to the login role -- a fallback
 // would quietly restore exactly the privilege level this separation exists to
 // remove.
-[[nodiscard]] auto open_postgresql_persistent_store(std::string_view conninfo,
-                                                    std::string_view runtime_role = {},
-                                                    std::string_view migration_role = {})
-    -> PersistentStoreOpenResult;
+[[nodiscard]] auto open_postgresql_persistent_store(std::string_view conninfo, std::string_view runtime_role = {},
+                                                    std::string_view migration_role = {}) -> PersistentStoreOpenResult;
 
 // Switch the session role on `connection` to `role_name`. Returns false if
 // the connection is not open or `SET ROLE` fails (e.g. the current login

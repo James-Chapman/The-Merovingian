@@ -1103,6 +1103,69 @@ SCENARIO("RuntimeEd25519Provider signs and verifies with its own keypair", "[cry
     }
 }
 
+SCENARIO("RuntimeEd25519Provider fails closed on a malformed secret size", "[crypto][signing]")
+{
+    // Security audit 2026-09 M-07/L-07: the secret is validated once, in the
+    // constructor, and never retained if it is not exactly the 64-byte
+    // Ed25519 secret key representation (ed25519_secret_key_bytes). sign()
+    // keeps its own guard on the stored buffer's size as defense in depth,
+    // matching RuntimeMultiKeyEd25519Provider::sign's guard on its stored
+    // keys, so libsodium is never invoked with a wrong-sized buffer either
+    // way.
+    GIVEN("a SecretBuffer one byte short of the Ed25519 secret key size")
+    {
+        auto provider = merovingian::crypto::RuntimeEd25519Provider{merovingian::core::SecretBuffer{63U}};
+        auto const handle = merovingian::crypto::Ed25519SecretKeyHandle{"ed25519:auto"};
+
+        WHEN("sign() is called")
+        {
+            auto const sign_result = provider.sign(handle, "test message");
+
+            THEN("it fails closed instead of calling libsodium with a 63-byte buffer")
+            {
+                REQUIRE(sign_result.signature.bytes.empty());
+                REQUIRE_FALSE(sign_result.error.empty());
+            }
+        }
+    }
+
+    GIVEN("a SecretBuffer one byte over the Ed25519 secret key size")
+    {
+        auto provider = merovingian::crypto::RuntimeEd25519Provider{merovingian::core::SecretBuffer{65U}};
+        auto const handle = merovingian::crypto::Ed25519SecretKeyHandle{"ed25519:auto"};
+
+        WHEN("sign() is called")
+        {
+            auto const sign_result = provider.sign(handle, "test message");
+
+            THEN("it fails closed instead of calling libsodium with a 65-byte buffer")
+            {
+                REQUIRE(sign_result.signature.bytes.empty());
+                REQUIRE_FALSE(sign_result.error.empty());
+            }
+        }
+    }
+
+    GIVEN("a SecretBuffer that is exactly the Ed25519 secret key size")
+    {
+        auto keypair = merovingian::crypto::generate_ed25519_keypair();
+        REQUIRE(keypair.has_value());
+        auto provider = merovingian::crypto::RuntimeEd25519Provider{std::move(keypair->secret_key)};
+        auto const handle = merovingian::crypto::Ed25519SecretKeyHandle{"ed25519:auto"};
+
+        WHEN("sign() is called")
+        {
+            auto const sign_result = provider.sign(handle, "test message");
+
+            THEN("a valid detached signature is produced")
+            {
+                REQUIRE(sign_result.error.empty());
+                REQUIRE(sign_result.signature.bytes.size() == crypto_sign_BYTES);
+            }
+        }
+    }
+}
+
 SCENARIO("Crypto random generators return bounded bytes and hex", "[crypto]")
 {
     GIVEN("a bounded random request")

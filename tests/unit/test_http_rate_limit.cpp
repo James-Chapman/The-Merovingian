@@ -4,8 +4,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <functional>
 #include <string>
+#include <tuple>
+#include <vector>
 
 namespace
 {
@@ -181,6 +185,89 @@ SCENARIO("HTTP rate limit summary is stable", "[http][rate-limit]")
             {
                 REQUIRE(summary.find("max_requests=5") != std::string::npos);
                 REQUIRE(summary.find("window_seconds=60") != std::string::npos);
+            }
+        }
+    }
+}
+
+// M-02 (security audit 2026-09). The rate limiter's per-IP and per-user bucket
+// tables are keyed by strings an attacker influences (`client_ip|target`, and a
+// user ID). `std::hash<std::string>` is not collision-resistant and is not
+// randomised per process, so one precomputed set of colliding keys degrades the
+// table into a linear scan on every deployment — turning the structure that
+// defends against floods into the target of one.
+SCENARIO("Rate limit bucket keys are hashed with a keyed, collision-resistant hash", "[http][rate-limit][security]")
+{
+    GIVEN("the bucket-key hasher and a sample of realistic bucket keys")
+    {
+        auto const hasher = merovingian::http::BucketKeyHash{};
+        auto const keys = std::vector<std::string>{
+            "203.0.113.7|/_matrix/client/v3/login", "203.0.113.7|/_matrix/client/v3/register",
+            "198.51.100.4|/_matrix/client/v3/login", "@alice:example.org",
+            "@bob:example.org", "2001:db8::1|/_matrix/client/v3/sync",
+        };
+
+        WHEN("each key is hashed")
+        {
+            auto digests = std::vector<std::size_t>{};
+            for (auto const& key : keys)
+            {
+                digests.push_back(hasher(key));
+            }
+
+            THEN("no digest matches what the default std::hash would have produced")
+            {
+                // Not a cryptographic claim about std::hash — just proof that
+                // the default implementation is no longer the one in use.
+                for (auto index = std::size_t{0U}; index < keys.size(); ++index)
+                {
+                    REQUIRE(digests[index] != std::hash<std::string>{}(keys[index]));
+                }
+            }
+
+            THEN("distinct keys produce distinct digests")
+            {
+                auto sorted = digests;
+                std::ranges::sort(sorted);
+                REQUIRE(std::ranges::adjacent_find(sorted) == sorted.end());
+            }
+
+            THEN("the same key hashes the same way within one process")
+            {
+                for (auto index = std::size_t{0U}; index < keys.size(); ++index)
+                {
+                    REQUIRE(hasher(keys[index]) == digests[index]);
+                }
+            }
+        }
+    }
+}
+
+SCENARIO("Rate limiting still enforces its cap under a flood of distinct bucket keys", "[http][rate-limit][security]")
+{
+    GIVEN("an engine that has been filled with many distinct per-IP keys")
+    {
+        auto clock = ManualClock{};
+        auto const cfg = merovingian::http::default_client_rate_limit_config();
+        auto engine = merovingian::http::RateLimitEngine{cfg, clock};
+
+        for (auto index = 0U; index < 5000U; ++index)
+        {
+            std::ignore = engine.check("198.51.100.1|" + std::to_string(index), "/_matrix/client/v3/sync", {});
+        }
+
+        WHEN("one victim key then exceeds its own cap")
+        {
+            auto rejected = false;
+            for (auto attempt = 0U; attempt < 5000U && !rejected; ++attempt)
+            {
+                rejected = !engine.check("203.0.113.99", "/_matrix/client/v3/sync", {}).allowed;
+            }
+
+            THEN("the cap is still enforced and the table stays bounded")
+            {
+                REQUIRE(rejected);
+                REQUIRE(engine.ip_bucket_count() <= 100000U);
             }
         }
     }

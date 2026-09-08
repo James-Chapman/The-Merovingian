@@ -6,6 +6,8 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -14,7 +16,7 @@
 namespace
 {
 
-constexpr auto version = std::string_view{"0.12.8"};
+constexpr auto version = std::string_view{"0.12.9"};
 
 auto print_help() -> void
 {
@@ -23,18 +25,31 @@ auto print_help() -> void
               << "  merovingian-db-migrate --plan <current-version> <target-version> [--migrations <directory>]\n";
 }
 
-[[nodiscard]] auto parse_u32(std::string_view value) noexcept -> std::uint32_t
+// L-08 (security audit 2026-09): returns nullopt for anything that is not a
+// plain decimal integer in range, rather than folding empty input, "abc" and
+// "99999999999999" all into 0. `merovingian-db-migrate --plan abc def` used to
+// build a current=0 target=0 plan with no steps and exit 0, telling an operator
+// that a migration they mistyped had nothing to do.
+[[nodiscard]] auto parse_u32(std::string_view value) noexcept -> std::optional<std::uint32_t>
 {
-    auto result = std::uint32_t{0U};
+    if (value.empty())
+    {
+        return std::nullopt;
+    }
+    auto result = std::uint64_t{0U};
     for (auto const character : value)
     {
         if (character < '0' || character > '9')
         {
-            return 0U;
+            return std::nullopt;
         }
-        result = (result * 10U) + static_cast<std::uint32_t>(character - '0');
+        result = (result * 10U) + static_cast<std::uint64_t>(character - '0');
+        if (result > std::numeric_limits<std::uint32_t>::max())
+        {
+            return std::nullopt;
+        }
     }
-    return result;
+    return static_cast<std::uint32_t>(result);
 }
 
 } // namespace
@@ -74,10 +89,20 @@ auto main(int argc, char const* const* argv) -> int
         file_steps = std::move(loaded.steps);
     }
 
+    auto const current_version = parse_u32(argv[2]);
+    auto const target_version = parse_u32(argv[3]);
+    if (!current_version.has_value() || !target_version.has_value())
+    {
+        std::cerr << "error: <current-version> and <target-version> must be decimal integers in [0, "
+                  << std::numeric_limits<std::uint32_t>::max() << "]\n";
+        print_help();
+        return 64;
+    }
+
     auto database = merovingian::config::DatabaseConfig{};
     database.role = merovingian::config::DatabaseRole::migration;
-    auto plan = merovingian::database::build_offline_migration_plan(database, parse_u32(argv[2]), parse_u32(argv[3]),
-                                                                    file_steps);
+    auto plan =
+        merovingian::database::build_offline_migration_plan(database, *current_version, *target_version, file_steps);
     std::cout << merovingian::database::offline_migrator_summary(plan) << '\n';
     return plan.ok ? 0 : 78;
 }

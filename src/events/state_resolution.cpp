@@ -11,6 +11,7 @@
 #include "merovingian/rooms/room_version_policy.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -54,17 +55,6 @@ namespace
             return nullptr;
         }
         return std::get_if<std::string>(&value->storage());
-    }
-
-    [[nodiscard]] auto integer_member(canonicaljson::Object const& object, std::string_view key) noexcept
-        -> std::int64_t const*
-    {
-        auto const* value = object_member(object, key);
-        if (value == nullptr)
-        {
-            return nullptr;
-        }
-        return std::get_if<std::int64_t>(&value->storage());
     }
 
     [[nodiscard]] auto object_member_as_object(canonicaljson::Object const& object, std::string_view key) noexcept
@@ -161,8 +151,50 @@ namespace
         return candidate.event_id < existing.event_id ? candidate : existing;
     }
 
-    [[nodiscard]] auto extract_user_power(canonicaljson::Value const& power_levels_event,
-                                          std::string_view user_id) noexcept -> std::int64_t
+    // A power level in a form the room version accepts, or nullopt when the value
+    // is absent or not a power level for this room version.
+    // Spec: ../../docs/matrix-v1.19-spec/rooms/v10.md — "Values in
+    // m.room.power_levels events must be integers", and v9's "m.room.power_levels
+    // events accept values as strings" for versions 1-9. This mirrors
+    // authorization.cpp's power_level_value; the two must agree, or state
+    // resolution would order events by a power level the auth rules do not see.
+    [[nodiscard]] auto power_level_value(canonicaljson::Value const* value, bool allow_string_values) noexcept
+        -> std::optional<std::int64_t>
+    {
+        if (value == nullptr)
+        {
+            return std::nullopt;
+        }
+        if (auto const* integer = std::get_if<std::int64_t>(&value->storage()); integer != nullptr)
+        {
+            return *integer;
+        }
+        if (!allow_string_values)
+        {
+            return std::nullopt;
+        }
+        auto const* text = std::get_if<std::string>(&value->storage());
+        if (text == nullptr || text->empty())
+        {
+            return std::nullopt;
+        }
+        // Only a plain, optionally-signed decimal integer counts. from_chars
+        // rejects leading whitespace, "+", "0x" and trailing junk, and the
+        // end-pointer check rejects anything it stopped short on, so "10abc" and
+        // "1.5" are not power levels.
+        auto parsed = std::int64_t{0};
+        auto const* first = text->data();
+        auto const* last = first + text->size();
+        auto const result = std::from_chars(first, last, parsed);
+        if (result.ec != std::errc{} || result.ptr != last)
+        {
+            return std::nullopt;
+        }
+        return parsed;
+    }
+
+    [[nodiscard]] auto extract_user_power(canonicaljson::Value const& power_levels_event, std::string_view user_id,
+                                          rooms::RoomVersionPolicy const& policy) noexcept -> std::int64_t
     {
         auto const* obj = value_is_object(power_levels_event);
         if (obj == nullptr)
@@ -174,50 +206,49 @@ namespace
         {
             return 0;
         }
-        auto const default_level = [&]() -> std::int64_t {
-            auto const* level = integer_member(*content, "users_default");
-            return level != nullptr ? *level : 0;
-        }();
+        auto const allow_string_values = !policy.power_levels_require_integers;
+        auto const default_level =
+            power_level_value(object_member(*content, "users_default"), allow_string_values).value_or(0);
         auto const* users = object_member_as_object(*content, "users");
         if (users == nullptr)
         {
             return default_level;
         }
-        auto const* level = integer_member(*users, std::string{user_id});
-        return level != nullptr ? *level : default_level;
+        return power_level_value(object_member(*users, user_id), allow_string_values).value_or(default_level);
     }
 
-    [[nodiscard]] auto power_level_from_event(StateEventReference const& event, StateMap const& unconflicted) noexcept
-        -> std::int64_t
+    [[nodiscard]] auto power_level_from_event(StateEventReference const& event, StateMap const& unconflicted,
+                                              rooms::RoomVersionPolicy const& policy) noexcept -> std::int64_t
     {
         if (event.key.event_type == "m.room.power_levels" && event.key.state_key.empty())
         {
-            auto const sender_power = extract_user_power(event.event_json, event.sender);
+            auto const sender_power = extract_user_power(event.event_json, event.sender, policy);
             return sender_power;
         }
         auto const pl_key = StateKey{"m.room.power_levels", ""};
         auto const it = unconflicted.find(pl_key);
         if (it != unconflicted.end() && value_has_content(it->second.event_json))
         {
-            return extract_user_power(it->second.event_json, event.sender);
+            return extract_user_power(it->second.event_json, event.sender, policy);
         }
         return 0;
     }
 
-    [[nodiscard]] auto event_power_data(StateEventReference const& event, StateMap const& unconflicted) noexcept
-        -> EventPowerData
+    [[nodiscard]] auto event_power_data(StateEventReference const& event, StateMap const& unconflicted,
+                                        rooms::RoomVersionPolicy const& policy) noexcept -> EventPowerData
     {
-        return {power_level_from_event(event, unconflicted), event.origin_server_ts};
+        return {power_level_from_event(event, unconflicted, policy), event.origin_server_ts};
     }
 
     struct ReverseTopoCompare final
     {
         StateMap const& unconflicted;
+        rooms::RoomVersionPolicy const& policy;
 
         [[nodiscard]] auto operator()(StateEventReference const& a, StateEventReference const& b) const noexcept -> bool
         {
-            auto const pa = event_power_data(a, unconflicted);
-            auto const pb = event_power_data(b, unconflicted);
+            auto const pa = event_power_data(a, unconflicted, policy);
+            auto const pb = event_power_data(b, unconflicted, policy);
 
             if (pa.sender_power != pb.sender_power)
             {
@@ -320,6 +351,28 @@ namespace
                     it != current_state.end())
                 {
                     result.third_party_invite = it->second.event_json;
+                }
+            }
+
+            // Spec: server-server-api.md § Auth events selection — "If membership
+            // is join, content.join_authorised_via_users_server is present, and
+            // the room version supports restricted rooms, then the m.room.member
+            // event with state_key matching content.join_authorised_via_users_server".
+            // Auth rule 4.3.5.2 rejects the restricted join without it, so state
+            // resolution has to offer it or every restricted join in the conflicted
+            // set fails auth and room state diverges across servers. No room-version
+            // gate is needed here: the only rule that reads this member event is the
+            // restricted/knock_restricted join branch, which no pre-v8 room can reach.
+            auto const* membership = content == nullptr ? nullptr : string_member(*content, "membership");
+            auto const* authorising_user =
+                content == nullptr ? nullptr : string_member(*content, "join_authorised_via_users_server");
+            if (membership != nullptr && *membership == "join" && authorising_user != nullptr &&
+                !authorising_user->empty())
+            {
+                if (auto it = current_state.find(StateKey{"m.room.member", *authorising_user});
+                    it != current_state.end())
+                {
+                    result.authorising_user_member = it->second.event_json;
                 }
             }
         }
@@ -482,11 +535,11 @@ auto partition_conflicted_state(std::vector<StateGroup> const& groups) -> std::p
     return {unconflicted, conflicted};
 }
 
-auto reverse_topological_power_sort(std::vector<StateEventReference> const& conflicted, StateMap const& unconflicted)
-    -> std::vector<StateEventReference>
+auto reverse_topological_power_sort(std::vector<StateEventReference> const& conflicted, StateMap const& unconflicted,
+                                    rooms::RoomVersionPolicy const& policy) -> std::vector<StateEventReference>
 {
     auto sorted = conflicted;
-    std::stable_sort(sorted.begin(), sorted.end(), ReverseTopoCompare{unconflicted});
+    std::stable_sort(sorted.begin(), sorted.end(), ReverseTopoCompare{unconflicted, policy});
     return sorted;
 }
 
@@ -733,7 +786,7 @@ auto resolve_state_v2(StateResolutionRequest const& request, rooms::RoomVersionP
             remaining_events.push_back(event);
         }
     }
-    auto const sorted_power = reverse_topological_power_sort(power_events, unconflicted);
+    auto const sorted_power = reverse_topological_power_sort(power_events, unconflicted, policy);
 
     // Algorithm step 2: auth-check the power events first, starting from the
     // unconflicted state, to obtain the partially resolved state.

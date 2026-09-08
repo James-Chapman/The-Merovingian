@@ -641,6 +641,94 @@ SCENARIO("merovingian-server marks accepted client sockets close-on-exec",
         }
     }
 }
+
+SCENARIO("merovingian-server keeps accepted plain-HTTP sockets non-blocking",
+         "[homeserver][http][listener][integration][security]")
+{
+    GIVEN("a started runtime and a plain-HTTP acceptor bound to an ephemeral loopback port")
+    {
+        auto const config = registration_enabled_config();
+        auto runtime_result = merovingian::homeserver::start_client_server(config);
+        REQUIRE(runtime_result.started);
+
+        auto acceptor = merovingian::net::TcpAcceptor{};
+        REQUIRE(acceptor.bind("127.0.0.1", 0U).ok);
+        auto const port = acceptor.bound_port();
+        REQUIRE(port > 0U);
+
+        auto shutdown = merovingian::net::ShutdownSignal{};
+        auto stats = merovingian::homeserver::HttpServeStats{};
+        auto runtime = std::move(runtime_result.runtime);
+        auto pool = merovingian::net::ThreadPool{4U};
+
+        WHEN("a client connects and holds the connection open with an incomplete request")
+        {
+            auto server_thread = std::thread{[&]() {
+                merovingian::homeserver::serve_http(acceptor, runtime, shutdown, stats,
+                                                    merovingian::homeserver::HttpDispatchMode::local_router, pool);
+            }};
+            struct ServerThreadGuard final
+            {
+                merovingian::net::ShutdownSignal& shutdown_signal;
+                std::thread& thread;
+
+                ~ServerThreadGuard()
+                {
+                    shutdown_signal.fire();
+                    if (thread.joinable())
+                    {
+                        thread.join();
+                    }
+                }
+            } server_thread_guard{shutdown, server_thread};
+
+            auto const client_fd = connect_loopback(port);
+            REQUIRE(client_fd >= 0);
+
+            auto client_local = sockaddr_in{};
+            auto client_local_len = socklen_t{sizeof(client_local)};
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+            REQUIRE(::getsockname(client_fd, reinterpret_cast<sockaddr*>(&client_local), &client_local_len) == 0);
+            auto const client_local_port = ntohs(client_local.sin_port);
+
+            REQUIRE(send_all(client_fd, "GET /no-such-route HTTP/1.1\r\nHost: localhost\r\n"));
+
+            auto accepted_fd = -1;
+            for (auto attempt = 0; attempt < 200 && accepted_fd < 0; ++attempt)
+            {
+                accepted_fd = find_accepted_socket_fd(client_local_port);
+                if (accepted_fd < 0)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+                }
+            }
+            REQUIRE(accepted_fd >= 0);
+
+            auto const status_flags = ::fcntl(accepted_fd, F_GETFL, 0);
+            REQUIRE(status_flags >= 0);
+
+            REQUIRE(send_all(client_fd, "\r\n"));
+            auto reader = PlainResponseReader{};
+            std::ignore = receive_response(client_fd, reader);
+            ::close(client_fd);
+
+            THEN("the accepted socket carries O_NONBLOCK for the life of the connection")
+            {
+                // ADR-0054 set the rule for TLS sockets: "no code below the
+                // HTTP layer may perform a blocking I/O call on a connection
+                // descriptor", because every timeout in the HTTP layer is
+                // expressed as poll() on the descriptor and that is only a
+                // timeout if the call beneath it cannot block. Plain-HTTP
+                // sockets were left blocking, and while reads are guarded by
+                // poll(POLLIN) the response write was not: a peer that stops
+                // reading parked a worker inside ::send() indefinitely, with
+                // no deadline anywhere above it. The flag is the invariant —
+                // if it is ever cleared, send_all() can block forever again.
+                REQUIRE((status_flags & O_NONBLOCK) != 0);
+            }
+        }
+    }
+}
 #endif // defined(__linux__)
 
 SCENARIO("merovingian-server accepts Matrix JSON requests over a configured TLS listener",
@@ -779,6 +867,87 @@ SCENARIO("merovingian-server routes client listener traffic through the Matrix J
                 REQUIRE(response.find(R"("user_id":"@alice:example.org")") != std::string::npos);
                 REQUIRE(stats.accepted_connections >= 1U);
                 REQUIRE(stats.completed_requests >= 1U);
+            }
+        }
+    }
+}
+
+// M-03 (security audit 2026-09). Spec v1.19 §10.5 requires the client-server
+// API to "supply Cross-Origin Resource Sharing (CORS) headers on all requests".
+// Errors answered by the transport layer — before routing, and in the parser
+// error case before there is even a parsed head — were the exception: a browser
+// received them as an opaque CORS failure rather than the real status, so a
+// client could not tell a 400 from a 413 from a network outage.
+SCENARIO("merovingian-server puts CORS headers on transport-layer error responses",
+         "[homeserver][http][listener][client-server][cors][integration]")
+{
+    GIVEN("a client-server listener with the default wildcard CORS allow-list")
+    {
+        auto const config = registration_enabled_config();
+        auto runtime_result = merovingian::homeserver::start_client_server(config);
+        REQUIRE(runtime_result.started);
+
+        auto acceptor = merovingian::net::TcpAcceptor{};
+        REQUIRE(acceptor.bind("127.0.0.1", 0U).ok);
+        auto const port = acceptor.bound_port();
+        REQUIRE(port > 0U);
+
+        auto shutdown = merovingian::net::ShutdownSignal{};
+        auto stats = merovingian::homeserver::HttpServeStats{};
+        auto runtime = std::move(runtime_result.runtime);
+        auto pool = merovingian::net::ThreadPool{4U};
+
+        WHEN("a browser-shaped request with an unparseable request line arrives")
+        {
+            auto server_thread = std::thread{[&]() {
+                merovingian::homeserver::serve_http(acceptor, runtime, shutdown, stats,
+                                                    merovingian::homeserver::HttpDispatchMode::client_server, pool);
+            }};
+
+            auto const client_fd = connect_loopback(port);
+            REQUIRE(client_fd >= 0);
+            REQUIRE(send_all(client_fd, "NOT-A-REQUEST-LINE\r\nOrigin: https://app.example.com\r\n\r\n"));
+            auto const response = receive_until_close(client_fd);
+            ::close(client_fd);
+
+            shutdown.fire();
+            server_thread.join();
+            pool.request_stop();
+
+            THEN("the parser error still carries Access-Control-Allow-Origin")
+            {
+                REQUIRE(response.starts_with("HTTP/1.1 4"));
+                REQUIRE(response.find("Access-Control-Allow-Origin: *") != std::string::npos);
+            }
+        }
+
+        WHEN("a browser-shaped request head exceeds the head cap")
+        {
+            auto server_thread = std::thread{[&]() {
+                merovingian::homeserver::serve_http(acceptor, runtime, shutdown, stats,
+                                                    merovingian::homeserver::HttpDispatchMode::client_server, pool);
+            }};
+
+            auto const client_fd = connect_loopback(port);
+            REQUIRE(client_fd >= 0);
+            auto oversized = std::string{"GET /_matrix/client/versions HTTP/1.1\r\nOrigin: https://app.example.com\r\n"};
+            // Never terminated: the head grows past the cap and the server
+            // answers 413 without ever parsing a complete head.
+            oversized.append("X-Filler: ");
+            oversized.append(std::string(200000U, 'a'));
+            oversized.append("\r\n");
+            std::ignore = send_all(client_fd, oversized);
+            auto const response = receive_until_close(client_fd);
+            ::close(client_fd);
+
+            shutdown.fire();
+            server_thread.join();
+            pool.request_stop();
+
+            THEN("the head-too-large rejection also carries Access-Control-Allow-Origin")
+            {
+                REQUIRE(response.starts_with("HTTP/1.1 413"));
+                REQUIRE(response.find("Access-Control-Allow-Origin: *") != std::string::npos);
             }
         }
     }

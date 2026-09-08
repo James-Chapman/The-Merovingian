@@ -9,8 +9,10 @@
 #include "merovingian/events/event.hpp"
 #include "merovingian/rooms/room_version_policy.hpp"
 
+#include <cstddef>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace merovingian::events
 {
@@ -36,7 +38,32 @@ struct SignedEventResult final
     std::string error{};
 };
 
+// One key/value pair of the diagnostic emitted when an event is signed. Modelled
+// here rather than as an observability::StructuredLogField so event_signer.hpp
+// does not drag the observability header (and its database/http dependencies)
+// into every translation unit that signs an event.
+struct EventSigningDiagnosticField final
+{
+    std::string key{};
+    std::string value{};
+};
+
+// A key ID is valid only if it names a signing algorithm this server implements.
+// Spec: Matrix Server-Server API v1.19 — "The object's key is the algorithm and
+// version combined (`ed25519` being the algorithm ...). Together, this forms the
+// Key ID." Ed25519 is the only algorithm Matrix defines, so the shape check is
+// delegated to the crypto boundary's `crypto::ed25519_key_id_is_valid`.
 [[nodiscard]] auto signing_key_id_is_valid(SigningKeyId const& key_id) noexcept -> bool;
+
+// The fields logged when `sign_event_for_server` accepts a signing request.
+// Built as data, and used by the production log call, so the logging policy is
+// directly assertable: `src/observability/AGENTS.md` forbids logging full
+// request or event bodies, so neither the signing payload nor the signed event
+// JSON may appear here. Operators triaging a peer's BadSignatureError compare
+// the reported byte counts and SHA-256 digests instead of the raw bytes.
+[[nodiscard]] auto sign_event_accepted_diagnostic_fields(SigningKeyId const& key_id, std::string_view signature,
+                                                         std::string_view signing_payload, std::string_view signed_json)
+    -> std::vector<EventSigningDiagnosticField>;
 [[nodiscard]] auto matrix_base64_from_bytes(std::string_view bytes) -> std::string;
 [[nodiscard]] auto matrix_bytes_from_base64(std::string_view encoded) -> std::string;
 [[nodiscard]] auto make_event_signing_payload(canonicaljson::Value const& event) -> canonicaljson::SerializeResult;

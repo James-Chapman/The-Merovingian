@@ -496,14 +496,51 @@ The boundary establishes these guarantees:
 - Locked accounts cannot pass the login policy gate; suspended accounts may
   still log in, and their new session is itself suspended and gated by the
   request-path `M_USER_SUSPENDED` check.
+- The suspension allowlist matches on the **action segment** — the path segment
+  immediately after the room ID — never as a substring of the whole path. The
+  gate sees the raw undecoded target, and several room endpoints end in a
+  segment the client chooses (`{txnId}` on `send`, `{stateKey}` on `state`), so
+  a substring test let a suspended user name their transaction `redact` and send
+  arbitrary messages. Anything added to this gate must be anchored to a segment
+  the client cannot choose.
+- The allowlist does not go beyond the actions the spec's permitted list names.
+  Where the spec names specific endpoints, they are listed exactly rather than
+  admitted by a related-looking prefix: the key endpoints a suspended account
+  may use are `POST /keys/query`, `POST /keys/device_signing/upload`,
+  `POST /keys/signatures/upload` and the `/room_keys/` backup subtree — not the
+  whole `/keys` prefix, which also covers key upload and one-time-key claiming
+  (participation, not verification).
+- Token *rotation* is gated as well as token issue. `POST /refresh`
+  authenticates with a refresh token, so it never reaches the request-path
+  moderation gate — `refresh_local_session` therefore carries the locked-account
+  check itself and answers `401 M_USER_LOCKED` with `soft_logout: true`. A
+  suspended account may still refresh, deliberately: see
+  [ADR-0058](adr/0058-a-suspended-account-may-still-refresh-its-access-token.md).
+- A refresh token must name a device that still exists in the persistent store.
+  A token that outlives its device row is refused rather than honoured; the
+  runtime device map is a cache and is never repopulated from a refresh alone.
 - Password login can be disabled per account.
-- Device IDs reject whitespace/control-shaped values.
+- Device IDs reject whitespace/control-shaped values, and also `:`, `/`, `?` and
+  `#`. A device ID is a component of other identifiers — key IDs are
+  `<algorithm>:<device_id>`, and the ID is a path segment in
+  `/devices/{deviceId}` — so those characters make the composed identifier
+  ambiguous or unaddressable.
+- UIAA challenges carry a random per-attempt session id, scoped to the endpoint
+  that issued it, held in memory and TTL-pruned. A client-supplied
+  `auth.session` is honoured only if this server issued it for that endpoint;
+  omitting it is still served, because the spec permits completing a
+  single-stage flow in one shot. See
+  [ADR-0057](adr/0057-uiaa-sessions-are-in-memory-and-single-stage.md).
 - Key API runtime records store route metadata and redacted payload summaries,
   not uploaded key material.
 - Persisted key material is represented as server-blind sensitive JSON payloads
   and is not logged through prepared-statement summaries.
 - Registration tokens are verified with Argon2id and only the hash is retained;
-  plaintext tokens are zeroised with `sodium_memzero` after hashing.
+  plaintext tokens are zeroised with `sodium_memzero` after hashing. The hash is
+  cached against the *version* of the token file it was derived from (device,
+  inode, size, sub-second mtime), so rotating the token on disk takes effect
+  without a restart; an entry is only cached when the file did not change
+  between the two stats bracketing the read.
 - OpenID tokens (`POST /user/{userId}/openid/request_token`) are hashed and
   persisted in a table structurally disjoint from `access_tokens`, with
   disjoint mint and lookup paths, so they can never authenticate an ordinary

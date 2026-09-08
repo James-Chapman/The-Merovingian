@@ -2,10 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "merovingian/crypto/generic_hash.hpp"
+#include "merovingian/crypto/random.hpp"
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -13,6 +20,45 @@
 
 namespace merovingian::http
 {
+
+// The rate limiter's own bucket tables are keyed by attacker-influenceable
+// strings: the per-IP key is `client_ip|normalized_target` and the per-user key
+// carries a user ID. `std::hash<std::string>` is neither collision-resistant nor
+// randomised across processes, so an attacker can precompute a set of colliding
+// keys once and reuse it against every deployment, collapsing the table into a
+// linear scan. That turns the structure the server uses to *defend* against
+// floods into the thing the flood attacks.
+//
+// The key is hashed with libsodium's keyed BLAKE2b through the crypto boundary
+// (never libsodium directly — see src/crypto/AGENTS.md) under a per-process
+// random key, so collisions cannot be precomputed offline and differ between
+// processes. `kMaxBucketsPerTable` still bounds table size; this bounds the
+// cost of each lookup within it.
+struct BucketKeyHash final
+{
+    [[nodiscard]] static auto process_key() -> std::vector<std::uint8_t> const&
+    {
+        // One 32-byte key per process. If the RNG is unavailable the hash falls
+        // back to unkeyed BLAKE2b, which is still collision-resistant — losing
+        // the per-process unpredictability is acceptable; losing the hash is
+        // not.
+        static auto const key = crypto::secure_random_bytes(32U).value_or(std::vector<std::uint8_t>{});
+        return key;
+    }
+
+    [[nodiscard]] auto operator()(std::string const& key) const -> std::size_t
+    {
+        auto const pieces = std::array<std::string_view, 1U>{std::string_view{key}};
+        auto const digest = crypto::generic_hash_bytes(pieces, process_key());
+        if (!digest.has_value() || digest->size() < sizeof(std::size_t))
+        {
+            return std::hash<std::string>{}(key);
+        }
+        auto value = std::size_t{0U};
+        std::memcpy(&value, digest->data(), sizeof(value));
+        return value;
+    }
+};
 
 struct RateLimitPolicy final
 {
@@ -281,6 +327,8 @@ private:
         TimePoint window_start{};
     };
 
+    using BucketTable = std::unordered_map<std::string, Bucket, BucketKeyHash>;
+
     // Bounds each bucket table so an attacker who can force many distinct keys
     // (e.g. rotating a client-supplied X-Forwarded-For value through a trusted
     // proxy) cannot grow memory or per-check scan cost without bound. Set well
@@ -294,7 +342,7 @@ private:
     // stale under any clock skew or missed sweep), then — if still at
     // capacity — evicts the single least-recently-touched entry. This bounds
     // table growth under sustained distinct-key pressure (see #427).
-    static auto evict_to_make_room(std::unordered_map<std::string, Bucket>& table, TimePoint now) -> void
+    static auto evict_to_make_room(BucketTable& table, TimePoint now) -> void
     {
         if (table.size() < kMaxBucketsPerTable)
         {
@@ -366,7 +414,7 @@ private:
         return static_cast<std::uint32_t>(remaining_ms);
     }
 
-    [[nodiscard]] auto check_bucket(std::unordered_map<std::string, Bucket>& table, std::string_view bucket_key,
+    [[nodiscard]] auto check_bucket(BucketTable& table, std::string_view bucket_key,
                                     std::optional<RateLimitPolicy> const& policy, TimePoint now) -> RateLimitDecision
     {
         if (!policy.has_value() || bucket_key.empty())
@@ -402,8 +450,8 @@ private:
 
     RateLimitConfig m_config{};
     Clock* m_clock{nullptr};
-    std::unordered_map<std::string, Bucket> m_ip_buckets{};
-    std::unordered_map<std::string, Bucket> m_user_buckets{};
+    BucketTable m_ip_buckets{};
+    BucketTable m_user_buckets{};
 };
 
 } // namespace merovingian::http

@@ -35,6 +35,19 @@ namespace
         return database;
     }
 
+    // L-10 (security-audit-report-2026-09.md): tracks whether
+    // `local_audit_sink` is currently in a run of drops on *this* thread,
+    // so a flood of audit-worthy events while the sink is unavailable
+    // produces exactly one warning, not one per dropped event. thread_local
+    // to match `thread_audit_database()` -- no cross-thread synchronization
+    // needed, and a per-thread episode is the right granularity since the
+    // install/teardown state this policy tracks is itself thread_local.
+    auto local_audit_sink_drop_policy() noexcept -> observability::DropEpisodePolicy&
+    {
+        thread_local auto policy = observability::DropEpisodePolicy{};
+        return policy;
+    }
+
     // Sink that forwards to `append_local_audit`. Installed once at
     // process start; the homeserver stores a thread-local pointer to
     // the active `LocalDatabase` so the sink can call
@@ -50,8 +63,22 @@ namespace
         // have torn down a LocalDatabase and the next test or hot
         // reload is about to install a new one. A closed `LocalDatabase`
         // is a sign that the previous owner is gone and the pointer is
-        // dangling. The sink silently no-ops until the next install.
-        if (database == nullptr || !database->opened)
+        // dangling. The sink no-ops until the next install; this was
+        // previously silent (L-10) -- it now warns once per drop episode
+        // via the diagnostic log so an operator can see that durable
+        // audit persistence, not just the event itself, was lost.
+        auto const available = database != nullptr && database->opened;
+        if (local_audit_sink_drop_policy().observe(available))
+        {
+            observability::log_diagnostic(
+                "local_services", "audit.dropped",
+                {
+                    {"event_type", std::string{fields.event_type},                                   false},
+                    {"category",   std::string{observability::audit_category_name(fields.category)}, false},
+            },
+                observability::LogEventSeverity::warning);
+        }
+        if (!available)
         {
             return;
         }
@@ -117,8 +144,9 @@ auto install_local_audit_database(LocalDatabase* database) noexcept -> void
 {
     // First-call install of the audit sink; subsequent calls just
     // point the thread-local database pointer. The sink function is
-    // installed exactly once; if multiple threads race, the function
-    // pointer is a plain write that is safe under TSan.
+    // installed exactly once; if multiple threads race, the write goes
+    // through `observability::set_audit_sink`'s atomic store (L-09), so
+    // it is race-free under TSan regardless of call order.
     std::ignore = ensure_audit_sink_installed();
     thread_audit_database() = database;
 }

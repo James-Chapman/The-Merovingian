@@ -3975,6 +3975,163 @@ SCENARIO("OPTIONS preflight echoes back an explicit single origin from the allow
     }
 }
 
+// L-05 (security audit 2026-09). The CORS specification forbids pairing
+// `Access-Control-Allow-Origin: *` with `Access-Control-Allow-Credentials:
+// true`, and a browser handed both rejects the response. config::validate
+// refuses the combination at startup, but a Config assembled in process never
+// passes through it — so the response builder has to refuse it too rather than
+// trusting a check that lives in another module.
+// L-01 / L-02 (security audit 2026-09). Spec §User-Interactive Authentication
+// API: the server's 401 challenge carries a `session` that identifies *this*
+// attempt, and the client echoes it back on the request that completes the
+// flow. Both challenges here used a compile-time constant instead
+// ("merovingian-ui-auth", "delete_device", "delete_devices"), so every client
+// and every attempt shared one id and an attacker knew it in advance.
+SCENARIO("UIAA challenges carry a unique per-attempt session id", "[homeserver][client-server][uiaa][security]")
+{
+    GIVEN("a runtime that requires a registration token")
+    {
+        auto started = merovingian::homeserver::start_client_server(registration_enabled_config());
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        auto const challenge_session = [&runtime](std::string_view body) {
+            auto request = merovingian::homeserver::LocalHttpRequest{};
+            request.method = "POST";
+            request.target = "/_matrix/client/v3/register";
+            request.body = std::string{body};
+            auto const response = merovingian::homeserver::handle_client_server_request(runtime, request);
+            REQUIRE(response.response.status == 401U);
+            auto const body_object = parse_object(response.response.body);
+            auto const* session = string_member(body_object, "session");
+            REQUIRE(session != nullptr);
+            return *session;
+        };
+
+        WHEN("two clients each provoke a registration challenge")
+        {
+            auto const first = challenge_session(R"({"username":"uiaa1","password":"CorrectHorse7!"})");
+            auto const second = challenge_session(R"({"username":"uiaa2","password":"CorrectHorse7!"})");
+
+            THEN("each attempt receives its own non-trivial session id")
+            {
+                REQUIRE_FALSE(first.empty());
+                REQUIRE_FALSE(second.empty());
+                REQUIRE(first != second);
+                // The old constant must not reappear under any name.
+                REQUIRE(first != "merovingian-ui-auth");
+                REQUIRE(first.size() >= 16U);
+            }
+        }
+
+        WHEN("a client echoes a session id the server never issued")
+        {
+            auto request = merovingian::homeserver::LocalHttpRequest{};
+            request.method = "POST";
+            request.target = "/_matrix/client/v3/register";
+            request.body =
+                std::string{R"({"username":"uiaa3","password":"CorrectHorse7!","auth":{"type":)"} +
+                R"("m.login.registration_token","token":"test-registration-token","session":"merovingian-ui-auth"}})";
+            auto const response = merovingian::homeserver::handle_client_server_request(runtime, request);
+
+            THEN("the attempt is refused with a fresh challenge rather than registering the user")
+            {
+                REQUIRE(response.response.status == 401U);
+            }
+        }
+
+        WHEN("a client completes the flow without supplying a session at all")
+        {
+            auto request = merovingian::homeserver::LocalHttpRequest{};
+            request.method = "POST";
+            request.target = "/_matrix/client/v3/register";
+            request.body = merovingian::tests::registration_json("uiaa4", "CorrectHorse7!");
+            auto const response = merovingian::homeserver::handle_client_server_request(runtime, request);
+
+            THEN("the single-stage flow still completes in one shot, as the spec permits")
+            {
+                REQUIRE(response.response.status == 200U);
+            }
+        }
+    }
+}
+
+SCENARIO("A wildcard allow-origin is never paired with allow-credentials",
+         "[homeserver][client-server][cors][preflight][security]")
+{
+    GIVEN("a runtime whose CORS snapshot wrongly combines the wildcard with credentials")
+    {
+        auto server = merovingian::config::ServerConfig{};
+        auto security = merovingian::config::SecurityConfig{};
+        security.secrets.master_key_file = merovingian::tests::shared_master_key_file();
+        merovingian::tests::enable_token_registration(security);
+        auto config = merovingian::config::Config{server, {}, {}, security, {}, {}};
+        config.server().cors.allowed_origins = {"*"};
+        auto started = merovingian::homeserver::start_client_server(config);
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+        // Set on the runtime snapshot rather than the config, because
+        // config::validate refuses wildcard-plus-credentials outright and
+        // start_client_server would not start. That is the point: the
+        // combination can only arise from a snapshot that never went through
+        // validation, which is exactly what the response builder must not
+        // trust.
+        runtime.cors.allow_credentials = true;
+
+        WHEN("a preflight arrives from some origin")
+        {
+            auto request = merovingian::homeserver::LocalHttpRequest{};
+            request.method = "OPTIONS";
+            request.target = "/_matrix/client/v3/sync";
+            request.headers = {
+                merovingian::http::Header{"Origin", "https://evil.example.com"}
+            };
+            auto const response = merovingian::homeserver::handle_client_server_request(runtime, request);
+
+            THEN("the wildcard is returned without the credentials header")
+            {
+                REQUIRE(response_header(response.response, "Access-Control-Allow-Origin") == "*");
+                REQUIRE(response_header(response.response, "Access-Control-Allow-Credentials").empty());
+            }
+        }
+    }
+}
+
+SCENARIO("An explicitly allowed origin still receives allow-credentials",
+         "[homeserver][client-server][cors][preflight][security]")
+{
+    GIVEN("a runtime with one explicit origin and credentials enabled")
+    {
+        auto server = merovingian::config::ServerConfig{};
+        auto security = merovingian::config::SecurityConfig{};
+        security.secrets.master_key_file = merovingian::tests::shared_master_key_file();
+        merovingian::tests::enable_token_registration(security);
+        auto config = merovingian::config::Config{server, {}, {}, security, {}, {}};
+        config.server().cors.allowed_origins = {"https://app.example.com"};
+        config.server().cors.allow_credentials = true;
+        auto started = merovingian::homeserver::start_client_server(config);
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        WHEN("a preflight arrives from that origin")
+        {
+            auto request = merovingian::homeserver::LocalHttpRequest{};
+            request.method = "OPTIONS";
+            request.target = "/_matrix/client/v3/sync";
+            request.headers = {
+                merovingian::http::Header{"Origin", "https://app.example.com"}
+            };
+            auto const response = merovingian::homeserver::handle_client_server_request(runtime, request);
+
+            THEN("the echoed origin is paired with the credentials header, which CORS permits")
+            {
+                REQUIRE(response_header(response.response, "Access-Control-Allow-Origin") == "https://app.example.com");
+                REQUIRE(response_header(response.response, "Access-Control-Allow-Credentials") == "true");
+            }
+        }
+    }
+}
+
 SCENARIO("OPTIONS preflight from an origin not in the allow-list omits Allow-Origin",
          "[homeserver][client-server][cors][preflight]")
 {

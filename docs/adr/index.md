@@ -60,6 +60,9 @@
 * [0054 - TLS sockets stay non-blocking for the life of the connection](0054-tls-sockets-stay-non-blocking-for-the-life-of-the-connection.md)
 * [0055 - Filter all diagnostics and preserve audits](0055-filter-all-diagnostics-and-preserve-audits.md)
 * [0056 - Use a thumbnail-specific rate limit](0056-use-a-thumbnail-specific-rate-limit.md)
+* [0057 - UIAA sessions are in-memory and single-stage](0057-uiaa-sessions-are-in-memory-and-single-stage.md)
+* [0058 - A suspended account may still refresh its access token](0058-a-suspended-account-may-still-refresh-its-access-token.md)
+* [0059 - Serialise migrations per backend, not per abstraction](0059-serialise-migrations-per-backend-not-per-abstraction.md)
 
 ## Rejected Records
 

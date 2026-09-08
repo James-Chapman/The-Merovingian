@@ -90,7 +90,8 @@ SCENARIO("Server discovery resolves a direct server name without well-known", "[
     {
         WHEN("discovery is attempted against a local mock")
         {
-            auto const result = merovingian::federation::discover_server("example.org", "https://example.org:8448");
+            auto const result = merovingian::federation::discover_server(
+                merovingian::federation::LiteralDiscoveryOptIn{}, "example.org", "https://example.org:8448");
 
             THEN("the resolved host and port are returned from the direct URL")
             {
@@ -119,8 +120,8 @@ SCENARIO("Server discovery resolves a server name with well-known delegation", "
     {
         WHEN("discovery parses the delegated server name")
         {
-            auto const result =
-                merovingian::federation::discover_server("example.org", "https://delegated.example.org:8448");
+            auto const result = merovingian::federation::discover_server(
+                merovingian::federation::LiteralDiscoveryOptIn{}, "example.org", "https://delegated.example.org:8448");
 
             THEN("the resolved host and port come from the delegated server")
             {
@@ -151,7 +152,8 @@ SCENARIO("Server discovery rejects private IP addresses", "[federation][discover
         {
             THEN("loopback addresses are rejected")
             {
-                auto const result = merovingian::federation::discover_server("evil.org", "https://127.0.0.1:8448");
+                auto const result = merovingian::federation::discover_server(
+                    merovingian::federation::LiteralDiscoveryOptIn{}, "evil.org", "https://127.0.0.1:8448");
                 // Spec MUST: discovery_allowed MUST be false for loopback destinations — SSRF prevention.
                 // Do NOT remove/change — weakening this allows internal network scanning via federation.
                 REQUIRE_FALSE(result.discovery_allowed);
@@ -174,8 +176,8 @@ SCENARIO("Server discovery results have correct structure", "[federation][discov
 {
     GIVEN("a successful discovery result")
     {
-        auto const result =
-            merovingian::federation::discover_server("matrix.example.org", "https://matrix.example.org:8448");
+        auto const result = merovingian::federation::discover_server(
+            merovingian::federation::LiteralDiscoveryOptIn{}, "matrix.example.org", "https://matrix.example.org:8448");
 
         WHEN("the result fields are inspected")
         {
@@ -211,8 +213,8 @@ SCENARIO("Server discovery with default port 8448 uses TLS", "[federation][disco
 {
     GIVEN("a server name resolved to port 8448")
     {
-        auto const result =
-            merovingian::federation::discover_server("matrix.example.org", "https://matrix.example.org:8448");
+        auto const result = merovingian::federation::discover_server(
+            merovingian::federation::LiteralDiscoveryOptIn{}, "matrix.example.org", "https://matrix.example.org:8448");
 
         WHEN("TLS requirement is checked")
         {
@@ -238,7 +240,8 @@ SCENARIO("Server discovery validates server name format", "[federation][discover
     {
         WHEN("an empty server name is discovered")
         {
-            auto const result = merovingian::federation::discover_server("", "https://:8448");
+            auto const result = merovingian::federation::discover_server(
+                merovingian::federation::LiteralDiscoveryOptIn{}, "", "https://:8448");
 
             THEN("discovery is rejected")
             {
@@ -954,7 +957,8 @@ SCENARIO("TLS origin validation accepts direct server name matches", "[federatio
 {
     GIVEN("a discovery result with the same server name and resolved host")
     {
-        auto const result = merovingian::federation::discover_server("example.org", "https://example.org:8448");
+        auto const result = merovingian::federation::discover_server(merovingian::federation::LiteralDiscoveryOptIn{},
+                                                                     "example.org", "https://example.org:8448");
 
         WHEN("the origin is validated")
         {
@@ -972,8 +976,8 @@ SCENARIO("TLS origin validation accepts matching well-known delegation", "[feder
 {
     GIVEN("a discovery result produced by well-known delegation")
     {
-        auto const result =
-            merovingian::federation::discover_server("example.org", "https://delegated.example.org:8448");
+        auto const result = merovingian::federation::discover_server(
+            merovingian::federation::LiteralDiscoveryOptIn{}, "example.org", "https://delegated.example.org:8448");
 
         WHEN("the origin is validated")
         {
@@ -1012,7 +1016,8 @@ SCENARIO("TLS origin validation rejects disallowed discovery destinations", "[fe
 {
     GIVEN("a discovery result that was rejected for private addresses")
     {
-        auto const result = merovingian::federation::discover_server("evil.org", "https://127.0.0.1:8448");
+        auto const result = merovingian::federation::discover_server(merovingian::federation::LiteralDiscoveryOptIn{},
+                                                                     "evil.org", "https://127.0.0.1:8448");
 
         WHEN("the origin is validated")
         {
@@ -1145,4 +1150,71 @@ SCENARIO("Direct A/AAAA resolution keeps the origin server name as the TLS ident
             }
         }
     }
+}
+
+namespace {
+
+// Detects whether `merovingian::federation::discover_server` can be called with
+// a given argument list. Used below to prove at compile time that the
+// well-known delegation overload is unreachable without its opt-in token.
+template <typename... Args>
+concept DiscoverServerInvocable = requires(Args... args) {
+  merovingian::federation::discover_server(args...);
+};
+
+} // namespace
+
+// --- Test-only literal discovery network
+// -------------------------------------- Regression test for security audit
+// finding M-06 (2026-09).
+//
+// Spec: Matrix Server-Server API v1.19, Sec. 2 Resolving server names
+// URL: ../../docs/matrix-v1.19-spec/server-server-api.md#resolving-server-names
+//
+// The well-known delegation overload of discover_server resolves through an
+// internal literal network that answers every non-numeric host with the
+// documentation address 203.0.113.10. It performs no DNS resolution, so it can
+// never stand in for the production resolution algorithm this file otherwise
+// pins. It used to be exported as a plain two-argument overload, one careless
+// call away from routing real federation traffic at a test address; it now
+// requires an explicit LiteralDiscoveryOptIn token.
+SCENARIO("The literal-network discovery overload is reachable only through its "
+         "test-only token",
+         "[federation][discovery][security]") {
+  GIVEN("the exported discover_server overload set") {
+    WHEN("the argument lists a caller could write are considered") {
+      THEN("the bare (server_name, well_known_server) form does not compile") {
+        // Production code that reaches for well-known delegation without
+        // the token fails to compile. Do NOT reintroduce a two-argument
+        // overload to make a call site shorter.
+        STATIC_REQUIRE_FALSE(
+            DiscoverServerInvocable<std::string_view, std::string_view>);
+        STATIC_REQUIRE_FALSE(
+            DiscoverServerInvocable<char const *, char const *>);
+      }
+
+      THEN("the token-tagged form and the production forms do compile") {
+        STATIC_REQUIRE(DiscoverServerInvocable<
+                       merovingian::federation::LiteralDiscoveryOptIn,
+                       std::string_view, std::string_view>);
+        STATIC_REQUIRE(DiscoverServerInvocable<std::string_view>);
+      }
+    }
+
+    WHEN("the token-tagged overload resolves a delegated host") {
+      auto const result = merovingian::federation::discover_server(
+          merovingian::federation::LiteralDiscoveryOptIn{}, "example.org",
+          "https://delegated.example.org:8448");
+
+      THEN("it answers from the literal network, not from real DNS") {
+        // The documentation address (RFC 5737 TEST-NET-3) is the tell:
+        // this path never queried a resolver. Anything relying on real
+        // address resolution — and therefore on the SSRF checks a live
+        // lookup feeds — must use the ServerDiscoveryNetwork overload.
+        REQUIRE(result.discovery_allowed);
+        REQUIRE(result.pinned_addresses.size() == 1U);
+        REQUIRE(result.pinned_addresses.front() == "203.0.113.10");
+      }
+    }
+  }
 }

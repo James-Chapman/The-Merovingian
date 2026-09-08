@@ -657,6 +657,13 @@ threat it closes; the controls above are the standing defences these reinforce.
   authenticate with a bearer `id_access_token` (except the unauthenticated
   mode-2 unbind body), fail closed with `502`/`403`, and release
   `runtime.mutex` for the network call.
+  **(v0.12.9)** `client_secret` and `sid` are additionally bound as *sensitive*
+  prepared-statement values, so they never reach a query trace or diagnostic
+  log — closing the leak path that did not require a DB read at all. They
+  remain plaintext at rest: that is the residual risk this entry documents, and
+  removing it means either encrypting the column or moving to homeserver-signed
+  unbind (auth mode 1), both of which are schema/protocol changes rather than a
+  binding fix.
 
 - **Outbound Push Gateway `notify` SSRF surface (v0.11.11, routed):** a
   pusher's gateway URL (`data.url` on `POST /_matrix/client/v3/pushers/set`)
@@ -1233,6 +1240,61 @@ threat it closes; the controls above are the standing defences these reinforce.
   strictly tighter than the worker profile on sockets, `openat`, and
   `clone`. See
   [ADR-0053](adr/0053-the-thumbnail-decoder-gets-its-own-syscall-profile.md).
+
+### September 2026 audit closures (v0.12.9)
+
+A full-surface audit produced 33 confirmed findings, all fixed in 0.12.9. The
+threats they represent, and the mitigations now in place:
+
+- **Account locking was defeatable through token rotation.** `POST /refresh`
+  authenticates with a refresh token and so never reached the access-token
+  moderation gate; a locked account could mint fresh access tokens indefinitely.
+  Mitigation: `refresh_local_session` carries the locked-account check itself.
+  Suspended accounts are deliberately still served — see ADR-0058.
+- **A refresh token could resurrect a deleted device.** Mitigation: refresh
+  requires the device row to still exist in the persistent store.
+- **A slow-reading client could exhaust the worker pool over plain HTTP.**
+  Accepted sockets were blocking on `send`. Mitigation: `SOCK_NONBLOCK` at
+  `accept4`, and every send path waits for writability against a deadline —
+  extending ADR-0054's rule from TLS to plaintext.
+- **A federation peer could flood forged PDUs without penalty.** Per-PDU trust
+  failures were zeroed at transaction completion, so the backoff and circuit
+  breaker never fired. Mitigation: the consecutive-failure count survives any
+  transaction in which a PDU failed a trust check; only a clean transaction
+  resets it. Room-ACL denials are excluded, being local policy rather than peer
+  misbehaviour.
+- **Debug logs retained full event content.** The event signer logged the
+  canonical signing payload and the signed event JSON under field names the
+  redactor did not recognise, and the legacy `LOG_*` macros bypassed the
+  redaction boundary entirely. Mitigation: digests instead of payloads, and every
+  `SingleLog` method routes through `redact_log_message`.
+- **Restricted-room state diverged across federation.** V2 state resolution
+  omitted `authorising_user_member`, so valid restricted joins failed auth.
+  Mitigation: the auth-event map is populated from resolved state.
+- **State resolution could be ordered by the wrong power level.** The resolver
+  read power levels integer-only while the auth path parsed room-v1-9 string
+  values, letting a lower-power sender's event win. Mitigation: the resolver
+  honours the room version policy, matching the auth path.
+- **The rate limiter was itself HashDoS-able.** Bucket tables keyed by
+  attacker-influenceable strings used `std::hash`. Mitigation: keyed BLAKE2b
+  under a per-process random key.
+- **Recorded TLS traffic was retrospectively decryptable.** The cipher list
+  permitted plain-RSA key exchange. Mitigation: ephemeral AEAD suites only.
+- **Rotating a registration token had no effect until restart.** Mitigation: the
+  Argon2id hash is cached against the token file's version, not its path.
+- **Concurrent server starts could strand the schema.** Mitigation: a
+  `pg_advisory_lock` across the PostgreSQL plan, and ledger-checked idempotence
+  inside each SQLite step — see ADR-0059.
+- **Binary media could be silently corrupted on PostgreSQL.** Parameters were
+  sent as null-terminated C strings, truncating at an embedded NUL. Mitigation:
+  binary parameters are hex-encoded into the `bytea` literal and decoded on read.
+- Smaller closures: an exported federation verifier that honoured a caller-set
+  "already verified" bool; a v1 invite defaulting to room version 12 for
+  signature and hash; a well-known discovery overload that resolved every host
+  to a documentation IP, bypassing DNS and the SSRF checks; an unclamped
+  backfill `limit`; Ed25519 secret material reaching libsodium unvalidated;
+  guessable shared UIAA session ids; device IDs containing the key-ID separator;
+  and transport-layer errors reaching browsers as opaque CORS failures.
 
 ## Security principles
 

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "merovingian/homeserver/local_services.hpp"
+#include "merovingian/observability/logger.hpp"
 #include "merovingian/observability/observability.hpp"
 #include "merovingian/platform/hardening_self_check.hpp"
 
@@ -7,6 +9,26 @@
 
 #include <string>
 #include <vector>
+
+namespace
+{
+
+// Resets the thread_local audit-sink database pointer at the end of each
+// scenario leaf, mirroring tests/unit/test_local_database_scope.cpp's
+// AuditDatabaseReset. Using an RAII guard (rather than a bare statement at
+// the end of GIVEN) matters here because a failing REQUIRE throws in
+// Catch2: without the guard, a failed assertion would skip the cleanup and
+// leave the thread_local pointing at this scenario's now-out-of-scope
+// `database`, dangling for whichever test runs next on this thread.
+struct AuditDatabaseReset final
+{
+    ~AuditDatabaseReset()
+    {
+        merovingian::homeserver::set_current_audit_database(nullptr);
+    }
+};
+
+} // namespace
 
 SCENARIO("Integrated observability flow emits safe admin audit health and metrics summaries",
          "[observability][integration]")
@@ -46,7 +68,10 @@ SCENARIO("Integrated observability flow emits safe admin audit health and metric
             {
                 REQUIRE(admin_route.matched);
                 REQUIRE(admin_route.route.operation == merovingian::observability::AdminOperation::account_action);
-                REQUIRE(audit.append_only);
+                // L-11: `append_only` was removed from AuditLogEvent (nothing
+                // enforced it); see test_observability.cpp's audit-category
+                // scenario for the INSERT-only assertion that replaced it.
+                REQUIRE(audit.category == merovingian::observability::AuditCategory::admin);
                 REQUIRE(audit_summary.find("manual_review") != std::string::npos);
                 REQUIRE(log_summary.find("super-secret") == std::string::npos);
                 REQUIRE(log_summary.find("<redacted>") != std::string::npos);
@@ -81,6 +106,61 @@ SCENARIO("Integrated observability flow marks degraded health and rejects unsafe
             {
                 REQUIRE(snapshot.health.status == merovingian::observability::HealthStatus::degraded);
                 REQUIRE_FALSE(merovingian::observability::observability_snapshot_is_safe(snapshot));
+            }
+        }
+    }
+}
+
+SCENARIO("The audit sink stays fail-closed while its database is unavailable and recovers once it opens",
+         "[observability][audit][integration]")
+{
+    // L-10 (security-audit-report-2026-09.md): the audit sink no-ops
+    // (drops the event) while the thread-local LocalDatabase is null or
+    // closed. The fix (src/homeserver/local_services.cpp's
+    // local_audit_sink) adds a warn-once-per-episode diagnostic, but must
+    // not change the fail-closed *behaviour*: no audit row is fabricated
+    // while the database is unavailable, no crash, and no duplicate row
+    // once it becomes available again. This spans homeserver + observability,
+    // so it belongs here rather than in a single-module unit test.
+    AuditDatabaseReset const reset{};
+    GIVEN("a LocalDatabase that starts closed")
+    {
+        auto database = merovingian::homeserver::LocalDatabase{};
+        database.opened = false;
+        merovingian::homeserver::install_local_audit_database(&database);
+
+        WHEN("several warning-severity diagnostics fire while the database is closed")
+        {
+            auto const fields =
+                merovingian::observability::AuditSinkFields{merovingian::observability::AuditCategory::auth,
+                                                            "test.flow.drop", "@alice:example.org", "target", "reason"};
+            for (auto attempt = 0; attempt < 5; ++attempt)
+            {
+                merovingian::observability::log_diagnostic_audit("observability_flow", "test.flow.drop", {},
+                                                                 merovingian::observability::LogEventSeverity::warning,
+                                                                 fields);
+            }
+
+            THEN("no audit row is recorded while the database stays closed")
+            {
+                REQUIRE(database.audit_events.empty());
+            }
+        }
+
+        WHEN("the database opens and a further diagnostic fires")
+        {
+            database.opened = true;
+            auto const fields = merovingian::observability::AuditSinkFields{
+                merovingian::observability::AuditCategory::auth, "test.flow.recovered", "@alice:example.org", "target",
+                "reason"};
+            merovingian::observability::log_diagnostic_audit("observability_flow", "test.flow.recovered", {},
+                                                             merovingian::observability::LogEventSeverity::warning,
+                                                             fields);
+
+            THEN("the audit row lands once the database is available")
+            {
+                REQUIRE_FALSE(database.audit_events.empty());
+                REQUIRE(database.audit_events.back().event_type == "test.flow.recovered");
             }
         }
     }

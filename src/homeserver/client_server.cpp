@@ -232,7 +232,14 @@ namespace
         append_header_if_missing(response.headers, "Vary", "Origin");
         if (req.method == "OPTIONS")
         {
-            if (cors.allow_credentials)
+            // The CORS specification forbids pairing a wildcard
+            // Access-Control-Allow-Origin with credentials, and a browser that
+            // is handed both rejects the response outright. config::validate
+            // refuses that combination at startup, but a Config built in
+            // process (tests, embedders) or reloaded outside that path never
+            // passes through it, so refuse it here too rather than trusting a
+            // check that lives in a different module.
+            if (cors.allow_credentials && allow_origin != "*")
             {
                 append_header_if_missing(response.headers, "Access-Control-Allow-Credentials", "true");
             }
@@ -855,8 +862,19 @@ namespace
     // Everything else (joining/knocking, invites, sending messages, profile
     // changes, redacting others' events, creating rooms) is blocked by the
     // request-path gate with M_USER_SUSPENDED. `path` is the query-stripped
-    // request path. Best-effort prefix matching; the spec leaves the exact
-    // disallowed set to the implementation.
+    // request path, still percent-encoded.
+    //
+    // The spec leaves the disallowed set to the implementation, but this
+    // allowlist deliberately does not go beyond the actions the spec's
+    // permitted list names. Two rules keep it honest, both learned from
+    // defects:
+    //   - Match an endpoint exactly, or anchor a prefix so it cannot span a
+    //     path segment the client chooses. A substring test here let a
+    //     suspended user name a transaction ID "redact" and send messages.
+    //   - Where the spec names specific endpoints, list them; do not admit a
+    //     whole prefix because it looks related. `/keys` swept in key upload
+    //     and one-time-key claiming, which are participation, not
+    //     verification.
     [[nodiscard]] auto action_allowed_while_suspended(std::string_view method, std::string_view path) noexcept -> bool
     {
         // Login is unauthenticated (handled before the gate) but is listed for
@@ -870,19 +888,32 @@ namespace
         {
             return true;
         }
-        // Device key verification / cross-signing / key claiming & querying.
-        if (starts_with(path, "/_matrix/client/v3/keys"))
+        // Device verification and cross-signing. The spec's permitted-actions
+        // list says "Verify other devices and write associated cross-signing
+        // data", linking §Device verification and §Cross-signing; between them
+        // those sections name exactly these three endpoints. They are listed
+        // exactly rather than admitted by a `/keys` prefix, which also let
+        // through POST /keys/upload (publishing this account's own device and
+        // one-time keys), POST /keys/claim (claiming a one-time key to open an
+        // Olm session) and GET /keys/changes — none of which the spec permits a
+        // suspended account, and the first two of which are participation
+        // rather than verification.
+        if (method == "POST" &&
+            (path == "/_matrix/client/v3/keys/query" || path == "/_matrix/client/v3/keys/device_signing/upload" ||
+             path == "/_matrix/client/v3/keys/signatures/upload"))
         {
             return true;
         }
-        // Server-side room key backup (read + populate).
-        if (starts_with(path, "/_matrix/client/v3/room_keys"))
+        // Server-side room key backup — the spec's "Populate their key backup",
+        // linking §Server-side key backups, which is the whole /room_keys/
+        // subtree. The trailing slash keeps this from also matching a path that
+        // merely starts with "room_keys".
+        if (starts_with(path, "/_matrix/client/v3/room_keys/"))
         {
             return true;
         }
-        // Cross-signing key storage and device management endpoints.
-        if (starts_with(path, "/_matrix/client/v3/keys/device_signing") ||
-            starts_with(path, "/_matrix/client/v3/account/deactivate"))
+        // Account deactivation.
+        if (starts_with(path, "/_matrix/client/v3/account/deactivate"))
         {
             return true;
         }
@@ -892,23 +923,47 @@ namespace
             return true;
         }
         // Per-room allowed actions: leave/reject invites, read /messages, redact.
-        if (starts_with(path, "/_matrix/client/v3/rooms/"))
+        //
+        // Matched on the ACTION SEGMENT — the path segment immediately after the
+        // room ID — never as a substring of the whole path. Several room
+        // endpoints end in a segment the client chooses: the transaction ID of
+        // `PUT /rooms/{roomId}/send/{eventType}/{txnId}` and the state key of
+        // `PUT /rooms/{roomId}/state/{eventType}/{stateKey}`. A substring test
+        // let a suspended user name their transaction "redact" and send
+        // arbitrary messages, or name a state key "redact" and write room
+        // state — defeating suspension for the two actions it most needs to
+        // block. Anything matching here must be anchored to a segment the
+        // client cannot choose.
+        auto constexpr rooms_prefix = std::string_view{"/_matrix/client/v3/rooms/"};
+        if (starts_with(path, rooms_prefix))
         {
-            auto constexpr leave_marker = std::string_view{"/leave"};
-            auto constexpr messages_marker = std::string_view{"/messages"};
-            auto constexpr redact_marker = std::string_view{"/redact"};
-            // PUT /rooms/{roomId}/redact/{eventId} — redacting (own events).
-            if (method == "PUT" && path.find(redact_marker) != std::string_view::npos)
+            auto const after_prefix = path.substr(rooms_prefix.size());
+            auto const room_id_end = after_prefix.find('/');
+            if (room_id_end == std::string_view::npos)
+            {
+                return false;
+            }
+            auto const after_room = after_prefix.substr(room_id_end + 1U);
+            auto const action_end = after_room.find('/');
+            auto const action = after_room.substr(0U, action_end);
+
+            // PUT /rooms/{roomId}/redact/{eventId}/{txnId} — redaction. The
+            // spec permits a suspended user to redact *their own* events; this
+            // gate cannot see the target event's sender, so the handler must
+            // enforce ownership itself. That endpoint is not routed today (it
+            // answers 404 M_UNRECOGNIZED); whoever implements it owns that
+            // check.
+            if (method == "PUT" && action == "redact")
             {
                 return true;
             }
             // POST /rooms/{roomId}/leave — leave a room or reject an invite.
-            if (method == "POST" && path.find(leave_marker) != std::string_view::npos)
+            if (method == "POST" && action == "leave")
             {
                 return true;
             }
             // GET /rooms/{roomId}/messages — see and receive messages.
-            if (method == "GET" && path.find(messages_marker) != std::string_view::npos)
+            if (method == "GET" && action == "messages")
             {
                 return true;
             }
@@ -1663,6 +1718,67 @@ namespace
         std::erase_if(rt.registration_validation_sessions, [now_ms](RegistrationValidationSession const& session) {
             return now_ms > session.updated_at_ms &&
                    now_ms - session.updated_at_ms > registration_validation_session_ttl_ms;
+        });
+    }
+
+    // --- User-Interactive Authentication sessions --------------------------
+    //
+    // L-01/L-02 (security audit 2026-09). Both UIAA challenges used to carry a
+    // compile-time constant session id shared by every client and every
+    // attempt. The spec (§User-Interactive Authentication API) treats the
+    // session id as the server's handle on one in-flight attempt; a constant is
+    // not a handle, and it publishes to an attacker exactly what to echo.
+    //
+    // Deliberately in memory and deliberately not stage-tracking: a UIAA
+    // session here carries no authority of its own -- the credential the single
+    // configured stage checks (a registration token, or the account password)
+    // travels inside the auth block on the same request -- and there is exactly
+    // one stage, so there is no ordering to enforce yet. Adding a second stage
+    // means adding persisted completed-stage tracking; see ADR-0057.
+    auto constexpr uia_session_ttl_ms = std::uint64_t{10U * 60U * 1000U};
+    // Bounds what an unauthenticated caller can grow: every 401 mints an entry.
+    auto constexpr uia_max_sessions = std::size_t{512U};
+
+    [[nodiscard]] auto issue_uia_session(ClientServerRuntime& rt, std::string_view purpose) -> std::string
+    {
+        auto const now_ms = wall_clock_milliseconds();
+        std::erase_if(rt.uia_sessions, [now_ms](UiaSession const& session) {
+            return now_ms > session.created_at_ms && now_ms - session.created_at_ms > uia_session_ttl_ms;
+        });
+        // Oldest-first eviction keeps the newest challenges usable under a
+        // flood; an evicted client simply receives a fresh challenge on retry.
+        while (rt.uia_sessions.size() >= uia_max_sessions && !rt.uia_sessions.empty())
+        {
+            rt.uia_sessions.erase(rt.uia_sessions.begin());
+        }
+        auto const id = crypto::secure_random_hex(16U);
+        if (!id.has_value())
+        {
+            // No random id means no session this server could later recognise.
+            // Return an empty one rather than a guessable placeholder: an empty
+            // id never matches in uia_session_is_valid.
+            return {};
+        }
+        rt.uia_sessions.push_back({*id, std::string{purpose}, now_ms});
+        return *id;
+    }
+
+    // A client-supplied session id is honoured only when this server issued it,
+    // issued it for this endpoint, and it has not expired. A request that omits
+    // `session` entirely is still served: the spec permits completing a
+    // single-stage flow in one shot, and the credential that stage checks is in
+    // the same auth block.
+    [[nodiscard]] auto uia_session_is_valid(ClientServerRuntime const& rt, std::string_view purpose,
+                                            std::string_view session_id) -> bool
+    {
+        if (session_id.empty())
+        {
+            return false;
+        }
+        auto const now_ms = wall_clock_milliseconds();
+        return std::ranges::any_of(rt.uia_sessions, [now_ms, purpose, session_id](UiaSession const& session) {
+            return session.session_id == session_id && session.purpose == purpose &&
+                   (now_ms <= session.created_at_ms || now_ms - session.created_at_ms <= uia_session_ttl_ms);
         });
     }
 
@@ -9314,26 +9430,36 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         {
             // Per spec v1.19 §5.5.1, incomplete credentials MUST receive 401
             // with the challenge — not proceed to registration and fail 403.
-            auto const uia_challenge = json_obj({
-                json_member(
-                    "flows",
-                    json_arr({json_obj({json_member("stages", json_arr({json_str("m.login.registration_token")}))})})),
+            // The session id is minted per attempt (L-01, security audit
+            // 2026-09); it used to be the constant "merovingian-ui-auth",
+            // shared by every client and every attempt.
+            auto const uia_challenge = json_serialize(json_obj({
+                json_member("flows", json_arr({json_obj({json_member(
+                                         "stages", json_arr({json_str("m.login.registration_token")}))})})),
                 json_member("params", json_obj({})),
-                json_member("session", json_str("merovingian-ui-auth")),
-            });
+                json_member("session", json_str(issue_uia_session(rt, "register"))),
+            }));
             auto const* auth = object_member_object(*registration_object, "auth");
             if (auth == nullptr)
             {
-                return dispatch_resp(req, rt, 401U, json_serialize(uia_challenge));
+                return dispatch_resp(req, rt, 401U, uia_challenge);
+            }
+            // A supplied session must be one this server issued for this
+            // endpoint. Omitting it is still allowed (single-shot flow);
+            // echoing a stale, guessed, or cross-endpoint id is not.
+            if (auto const* supplied_session = string_member(*auth, "session");
+                supplied_session != nullptr && !uia_session_is_valid(rt, "register", *supplied_session))
+            {
+                return dispatch_resp(req, rt, 401U, uia_challenge);
             }
             auto const* auth_type = string_member(*auth, "type");
             if (auth_type == nullptr || *auth_type != "m.login.registration_token")
             {
-                return dispatch_resp(req, rt, 401U, json_serialize(uia_challenge));
+                return dispatch_resp(req, rt, 401U, uia_challenge);
             }
             if (string_member(*auth, "token") == nullptr)
             {
-                return dispatch_resp(req, rt, 401U, json_serialize(uia_challenge));
+                return dispatch_resp(req, rt, 401U, uia_challenge);
             }
         }
         auto const body = parse_register_body(req.body);
@@ -9610,9 +9736,23 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         auto const refreshed = refresh_local_session(rt.homeserver, body->refresh_token);
         if (!refreshed.ok)
         {
+            // A locked account carries its own spec-mandated shape (401
+            // M_USER_LOCKED with soft_logout:true, spec §Account locking); the
+            // default 401 mapping of M_UNKNOWN_TOKEN would tell the client to
+            // discard its session instead of waiting for the lock to lift.
+            if (!refreshed.errcode.empty())
+            {
+                return refreshed.soft_logout
+                           ? dispatch_err_soft_logout(req, rt, refreshed.status, refreshed.errcode, refreshed.reason)
+                           : dispatch_err(req, rt, refreshed.status, refreshed.errcode, refreshed.reason);
+            }
             return dispatch_err(req, rt, refreshed.status, refreshed.status == 401U ? "M_UNKNOWN_TOKEN" : "M_UNKNOWN",
                                 refreshed.reason);
         }
+        // Repopulates the in-memory device cache only. refresh_local_session has
+        // already established that the device row exists in the persistent
+        // store, so this can no longer resurrect a deleted device — it only
+        // heals a cache that a restart or a worker split left incomplete.
         if (find_device(rt, refreshed.user_id, refreshed.device_id) == nullptr)
         {
             rt.devices.push_back({refreshed.user_id, refreshed.device_id, refreshed.device_id});
@@ -11457,7 +11597,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
     {
         // Spec §10.7.1: DELETE /devices/{deviceId} requires UIA with
         // m.login.password to prove account ownership before deletion.
-        auto const uia_challenge = device_delete_uia_challenge("delete_device");
+        auto const uia_challenge = device_delete_uia_challenge(issue_uia_session(rt, "delete_device"));
         auto const body_obj = parsed_json_object(req.body);
         if (!body_obj.has_value())
         {
@@ -11465,6 +11605,14 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         }
         auto const* auth = object_member_object(*body_obj, "auth");
         if (auth == nullptr)
+        {
+            return dispatch_resp(req, rt, 401U, uia_challenge);
+        }
+        // A supplied session must be one this server issued for this endpoint.
+        // Omitting it is still allowed (single-shot flow); echoing a stale,
+        // guessed, or cross-endpoint id is not.
+        if (auto const* supplied_session = string_member(*auth, "session");
+            supplied_session != nullptr && !uia_session_is_valid(rt, "delete_device", *supplied_session))
         {
             return dispatch_resp(req, rt, 401U, uia_challenge);
         }
@@ -11495,7 +11643,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
     }
     if (req.method == "POST" && req.target == "/_matrix/client/v3/delete_devices")
     {
-        auto const uia_challenge = device_delete_uia_challenge("delete_devices");
+        auto const uia_challenge = device_delete_uia_challenge(issue_uia_session(rt, "delete_devices"));
         auto const body_obj = parsed_json_object(req.body);
         if (!body_obj.has_value())
         {
@@ -11508,6 +11656,14 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         }
         auto const* auth = object_member_object(*body_obj, "auth");
         if (auth == nullptr)
+        {
+            return dispatch_resp(req, rt, 401U, uia_challenge);
+        }
+        // A supplied session must be one this server issued for this endpoint.
+        // Omitting it is still allowed (single-shot flow); echoing a stale,
+        // guessed, or cross-endpoint id is not.
+        if (auto const* supplied_session = string_member(*auth, "session");
+            supplied_session != nullptr && !uia_session_is_valid(rt, "delete_devices", *supplied_session))
         {
             return dispatch_resp(req, rt, 401U, uia_challenge);
         }

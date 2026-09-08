@@ -459,6 +459,13 @@ struct SessionRefreshResult final
     std::string user_id{};
     std::string device_id{};
     std::string reason{};
+    // Matrix error code the dispatcher must render for a refusal, when the
+    // generic status-to-errcode mapping would be wrong. A locked account is a
+    // spec MUST of M_USER_LOCKED + soft_logout (§Account locking), which is
+    // neither M_UNKNOWN_TOKEN nor M_UNKNOWN. Empty means "use the default
+    // mapping".
+    std::string errcode{};
+    bool soft_logout{false};
 };
 
 [[nodiscard]] auto bootstrap_local_database(config::Config const& config) -> LocalDatabase;

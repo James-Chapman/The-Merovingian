@@ -162,6 +162,46 @@ Runtime metrics and audit summaries are bounded operational summaries. They
 report counts, event types, actors, targets, and reason codes, but do not expose
 plaintext passwords, bearer tokens, key payloads, media bytes, or event content.
 
+**Redaction has one boundary, and the legacy macros go through it.** The `LOG_*`
+macros passed a caller-built `std::string` straight to `SingleLog`, so a call
+site could bypass redaction simply by not using `StructuredLogField`. Every
+named `SingleLog` method now routes its composed line through
+`redact_log_message`, which applies the same sensitivity rule
+`log_field_is_sensitive` applies to structured fields, rewriting a sensitive
+`key=value` token to `key=<redacted>`. The `LOGF_*` macros and the
+`string_format` helper they were built on — a runtime `std::string` forwarded
+as a `printf` format argument, CWE-134 — had no call site in `src/` and were
+deleted outright rather than deprecated.
+
+The event signer no longer logs the canonical signing payload or the signed
+event JSON. It emits each one's byte count and SHA-256 digest instead, which is
+still enough to compare byte-for-byte with a federation peer when triaging a
+`BadSignatureError`.
+
+**Dropped work is counted and announced once.** Two paths deliberately shed load
+rather than block, and both used to do it silently:
+
+- The bounded console and file log queues discard entries once they reach
+  `max_log_queue_size`. They now keep a drop counter
+  (`console_dropped_message_count()`, `file_dropped_message_count()`) and emit
+  one warning per drop *episode* — a contiguous run of drops — not one per
+  dropped message, which would make the flood worse. That warning is written
+  straight to stderr, bypassing the queue it is reporting as full.
+- `local_audit_sink` no-ops while the thread-local `LocalDatabase` is unset or
+  closed. It now warns once per episode so an operator can see that durable
+  audit persistence, not just one event, was lost.
+
+The audit sink pointer itself is a `std::atomic` function pointer. It is written
+during thread startup and read from arbitrary threads, and a plain pointer gave
+those no happens-before edge. It stays lock-free, so the read path on every
+warning-or-above diagnostic is a single atomic load.
+
+`AuditLogEvent` no longer carries an `append_only` flag. It was initialised to
+`true` and consulted by nothing — `audit_log_insert_statement()` only ever emits
+INSERT — so it asserted a guarantee the code did not enforce. Real enforcement
+is a database trigger rejecting UPDATE and DELETE on `audit_log`, which belongs
+in a migration; until that exists, the honest statement is the one above.
+
 The opt-in client_server event=sliding_sync.debug_response diagnostic is
 available only when the process starts with --debug; it is not an audit event
 and is never persisted. Its connection identifier data is limited to presence

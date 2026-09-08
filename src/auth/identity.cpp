@@ -359,8 +359,30 @@ auto user_id_server_name(std::string_view user_id) noexcept -> std::string_view
 
 auto device_id_is_valid(std::string_view device_id) noexcept -> bool
 {
+    // L-03 (security audit 2026-09). Printable-and-not-space is not enough,
+    // because a device ID is not only a name — it is a *component of other
+    // identifiers*, and two of those give it structural characters it must not
+    // contain:
+    //
+    //   - Key IDs are `<algorithm>:<device_id>` (spec §End-to-end encryption,
+    //     e.g. `ed25519:<device_id>`). A device ID containing ':' produces
+    //     `ed25519:foo:bar`, which no longer parses to a single algorithm and
+    //     device, and which a federation partner may split differently than
+    //     this server does.
+    //   - Device IDs appear as a path segment in `/devices/{deviceId}`. '/',
+    //     '?' and '#' terminate or redirect that segment once the path is
+    //     decoded, so such an ID is unaddressable through its own endpoints.
+    //
+    // Rejecting them at the validator is the only place that covers every
+    // entry point (login, appservice-supplied IDs, refresh, key upload) at
+    // once.
+    auto constexpr is_reserved = [](char value) noexcept {
+        return value == ':' || value == '/' || value == '?' || value == '#';
+    };
     return !device_id.empty() && device_id.size() <= 255U &&
-           std::ranges::all_of(device_id, is_printable_ascii_without_space);
+           std::ranges::all_of(device_id, [&is_reserved](char value) noexcept {
+               return is_printable_ascii_without_space(value) && !is_reserved(value);
+           });
 }
 
 auto password_is_acceptable(std::string_view password) noexcept -> bool

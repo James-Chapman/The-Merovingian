@@ -13,6 +13,15 @@ struct BoundValue final
 {
     std::string value{};
     bool sensitive{false};
+    // M-09: true when `value` is raw binary (e.g. a BYTEA/BLOB column payload)
+    // rather than text. PostgreSQL's parameter path sends every value as a
+    // null-terminated C string unless told otherwise, which silently
+    // truncates binary payloads at an embedded NUL byte; backends that need
+    // byte-exact round-tripping (see postgresql_store.cpp's
+    // encode_postgresql_bytea_hex/decode_postgresql_bytea_hex) inspect this
+    // flag. SQLite already binds every parameter by explicit length, so it
+    // is unaffected and simply ignores the flag.
+    bool binary{false};
 };
 
 struct PreparedStatement final

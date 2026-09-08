@@ -73,6 +73,15 @@ struct AdminRouteMatch final
     std::string reason{};
 };
 
+// NOTE (L-11, security-audit-report-2026-09.md): this struct previously
+// carried an `append_only` flag initialized to `true` that nothing ever
+// consulted -- `audit_log_insert_statement()` never emits anything but
+// INSERT, so the flag asserted a guarantee the code did not actually
+// enforce. The only real enforcement point is a database-level trigger
+// rejecting UPDATE/DELETE on `audit_log`, which belongs in a migration
+// and is out of scope here. Rather than keep a field that lies about a
+// guarantee, it was removed; `audit_log_insert_statement()` below is the
+// append-only guarantee that actually exists today.
 struct AuditLogEvent final
 {
     AuditCategory category{AuditCategory::admin};
@@ -81,7 +90,6 @@ struct AuditLogEvent final
     std::string target{};
     std::string reason_code{};
     std::string request_id{};
-    bool append_only{true};
 };
 
 struct StructuredLogField final
@@ -179,6 +187,17 @@ private:
 [[nodiscard]] auto log_field_is_sensitive(std::string_view key) -> bool;
 [[nodiscard]] auto sanitized_http_target(std::string_view target) -> std::string;
 [[nodiscard]] auto redact_log_value(StructuredLogField const& field) -> std::string;
+// M-11 (security-audit-report-2026-09.md): redacts `key=value` tokens in a
+// freeform log message when `key` matches the same sensitivity rules as
+// structured fields (see `log_field_is_sensitive`/`contains_sensitive_marker`).
+// This is the redaction boundary the legacy LOG_*/LOGF_* macros route through
+// at the `SingleLog` level (see logger.hpp), so no call site can bypass it by
+// building a plain std::string instead of using StructuredLogField. Tokens
+// are whitespace-delimited; a sensitive value that itself contains embedded
+// whitespace is only redacted up to the first space, matching the "key=value"
+// shape used by every current LOG_*/LOGF_* call site (e.g. "shard=0
+// config=/etc/x").
+[[nodiscard]] auto redact_log_message(std::string_view message) -> std::string;
 [[nodiscard]] auto structured_log_summary(StructuredLogEvent const& event) -> std::string;
 [[nodiscard]] auto diagnostic_log_summary(std::string_view logger, std::string_view event,
                                           std::vector<StructuredLogField> fields) -> std::string;
