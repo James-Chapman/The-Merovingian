@@ -1673,6 +1673,67 @@ namespace
         });
     }
 
+    // --- User-Interactive Authentication sessions --------------------------
+    //
+    // L-01/L-02 (security audit 2026-09). Both UIAA challenges used to carry a
+    // compile-time constant session id shared by every client and every
+    // attempt. The spec (§User-Interactive Authentication API) treats the
+    // session id as the server's handle on one in-flight attempt; a constant is
+    // not a handle, and it publishes to an attacker exactly what to echo.
+    //
+    // Deliberately in memory and deliberately not stage-tracking: a UIAA
+    // session here carries no authority of its own -- the credential the single
+    // configured stage checks (a registration token, or the account password)
+    // travels inside the auth block on the same request -- and there is exactly
+    // one stage, so there is no ordering to enforce yet. Adding a second stage
+    // means adding persisted completed-stage tracking; see ADR-0057.
+    auto constexpr uia_session_ttl_ms = std::uint64_t{10U * 60U * 1000U};
+    // Bounds what an unauthenticated caller can grow: every 401 mints an entry.
+    auto constexpr uia_max_sessions = std::size_t{512U};
+
+    [[nodiscard]] auto issue_uia_session(ClientServerRuntime& rt, std::string_view purpose) -> std::string
+    {
+        auto const now_ms = wall_clock_milliseconds();
+        std::erase_if(rt.uia_sessions, [now_ms](UiaSession const& session) {
+            return now_ms > session.created_at_ms && now_ms - session.created_at_ms > uia_session_ttl_ms;
+        });
+        // Oldest-first eviction keeps the newest challenges usable under a
+        // flood; an evicted client simply receives a fresh challenge on retry.
+        while (rt.uia_sessions.size() >= uia_max_sessions && !rt.uia_sessions.empty())
+        {
+            rt.uia_sessions.erase(rt.uia_sessions.begin());
+        }
+        auto const id = crypto::secure_random_hex(16U);
+        if (!id.has_value())
+        {
+            // No random id means no session this server could later recognise.
+            // Return an empty one rather than a guessable placeholder: an empty
+            // id never matches in uia_session_is_valid.
+            return {};
+        }
+        rt.uia_sessions.push_back({*id, std::string{purpose}, now_ms});
+        return *id;
+    }
+
+    // A client-supplied session id is honoured only when this server issued it,
+    // issued it for this endpoint, and it has not expired. A request that omits
+    // `session` entirely is still served: the spec permits completing a
+    // single-stage flow in one shot, and the credential that stage checks is in
+    // the same auth block.
+    [[nodiscard]] auto uia_session_is_valid(ClientServerRuntime const& rt, std::string_view purpose,
+                                            std::string_view session_id) -> bool
+    {
+        if (session_id.empty())
+        {
+            return false;
+        }
+        auto const now_ms = wall_clock_milliseconds();
+        return std::ranges::any_of(rt.uia_sessions, [now_ms, purpose, session_id](UiaSession const& session) {
+            return session.session_id == session_id && session.purpose == purpose &&
+                   (now_ms <= session.created_at_ms || now_ms - session.created_at_ms <= uia_session_ttl_ms);
+        });
+    }
+
     [[nodiscard]] auto normalize_threepid_address(std::string_view medium, std::string_view address) -> std::string
     {
         if (medium == "email")
@@ -9321,26 +9382,37 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         {
             // Per spec v1.19 §5.5.1, incomplete credentials MUST receive 401
             // with the challenge — not proceed to registration and fail 403.
-            auto const uia_challenge = json_obj({
+            // The session id is minted per attempt (L-01, security audit
+            // 2026-09); it used to be the constant "merovingian-ui-auth",
+            // shared by every client and every attempt.
+            auto const uia_challenge = json_serialize(json_obj({
                 json_member(
                     "flows",
                     json_arr({json_obj({json_member("stages", json_arr({json_str("m.login.registration_token")}))})})),
                 json_member("params", json_obj({})),
-                json_member("session", json_str("merovingian-ui-auth")),
-            });
+                json_member("session", json_str(issue_uia_session(rt, "register"))),
+            }));
             auto const* auth = object_member_object(*registration_object, "auth");
             if (auth == nullptr)
             {
-                return dispatch_resp(req, rt, 401U, json_serialize(uia_challenge));
+                return dispatch_resp(req, rt, 401U, uia_challenge);
+            }
+            // A supplied session must be one this server issued for this
+            // endpoint. Omitting it is still allowed (single-shot flow);
+            // echoing a stale, guessed, or cross-endpoint id is not.
+            if (auto const* supplied_session = string_member(*auth, "session");
+                supplied_session != nullptr && !uia_session_is_valid(rt, "register", *supplied_session))
+            {
+                return dispatch_resp(req, rt, 401U, uia_challenge);
             }
             auto const* auth_type = string_member(*auth, "type");
             if (auth_type == nullptr || *auth_type != "m.login.registration_token")
             {
-                return dispatch_resp(req, rt, 401U, json_serialize(uia_challenge));
+                return dispatch_resp(req, rt, 401U, uia_challenge);
             }
             if (string_member(*auth, "token") == nullptr)
             {
-                return dispatch_resp(req, rt, 401U, json_serialize(uia_challenge));
+                return dispatch_resp(req, rt, 401U, uia_challenge);
             }
         }
         auto const body = parse_register_body(req.body);
@@ -11478,7 +11550,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
     {
         // Spec §10.7.1: DELETE /devices/{deviceId} requires UIA with
         // m.login.password to prove account ownership before deletion.
-        auto const uia_challenge = device_delete_uia_challenge("delete_device");
+        auto const uia_challenge = device_delete_uia_challenge(issue_uia_session(rt, "delete_device"));
         auto const body_obj = parsed_json_object(req.body);
         if (!body_obj.has_value())
         {
@@ -11486,6 +11558,14 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         }
         auto const* auth = object_member_object(*body_obj, "auth");
         if (auth == nullptr)
+        {
+            return dispatch_resp(req, rt, 401U, uia_challenge);
+        }
+        // A supplied session must be one this server issued for this endpoint.
+        // Omitting it is still allowed (single-shot flow); echoing a stale,
+        // guessed, or cross-endpoint id is not.
+        if (auto const* supplied_session = string_member(*auth, "session");
+            supplied_session != nullptr && !uia_session_is_valid(rt, "delete_device", *supplied_session))
         {
             return dispatch_resp(req, rt, 401U, uia_challenge);
         }
@@ -11516,7 +11596,7 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
     }
     if (req.method == "POST" && req.target == "/_matrix/client/v3/delete_devices")
     {
-        auto const uia_challenge = device_delete_uia_challenge("delete_devices");
+        auto const uia_challenge = device_delete_uia_challenge(issue_uia_session(rt, "delete_devices"));
         auto const body_obj = parsed_json_object(req.body);
         if (!body_obj.has_value())
         {
@@ -11529,6 +11609,14 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         }
         auto const* auth = object_member_object(*body_obj, "auth");
         if (auth == nullptr)
+        {
+            return dispatch_resp(req, rt, 401U, uia_challenge);
+        }
+        // A supplied session must be one this server issued for this endpoint.
+        // Omitting it is still allowed (single-shot flow); echoing a stale,
+        // guessed, or cross-endpoint id is not.
+        if (auto const* supplied_session = string_member(*auth, "session");
+            supplied_session != nullptr && !uia_session_is_valid(rt, "delete_devices", *supplied_session))
         {
             return dispatch_resp(req, rt, 401U, uia_challenge);
         }

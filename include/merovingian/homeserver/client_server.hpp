@@ -84,6 +84,25 @@ struct ClientServerClock final
     }
 };
 
+// One outstanding User-Interactive Authentication challenge (spec §User-
+// Interactive Authentication API). Issued when the server answers 401 with a
+// flow the client must complete, and consumed when the client comes back with
+// a matching `auth.session`.
+//
+// L-01/L-02 (security audit 2026-09): the session id used to be a compile-time
+// constant shared by every client and every attempt (`merovingian-ui-auth`,
+// `delete_device`, `delete_devices`). The spec treats the session id as the
+// server's handle on one in-flight attempt; a constant is not a handle, and it
+// tells an attacker exactly what to echo.
+struct UiaSession final
+{
+    std::string session_id{};
+    // The endpoint the challenge was issued for: a session minted for a device
+    // deletion must not satisfy a registration challenge.
+    std::string purpose{};
+    std::uint64_t created_at_ms{0U};
+};
+
 struct ClientServerRuntime final
 {
     HomeserverRuntime homeserver{};
@@ -91,6 +110,11 @@ struct ClientServerRuntime final
     std::vector<ClientDevice> devices{};
     std::vector<ClientKeyApiRecord> key_api_records{};
     std::vector<RegistrationValidationSession> registration_validation_sessions{};
+    // Outstanding UIAA challenges. Bounded and TTL-pruned in
+    // issue_uia_session(); in-memory only, because a UIAA session carries no
+    // authority of its own (the credential travels in the auth block) and must
+    // not survive a restart.
+    std::vector<UiaSession> uia_sessions{};
     // CORS policy snapshot. Copied from `config.server().cors` at
     // `start_client_server()` time. CORS is not hot-reloadable: a config
     // change requires a server restart.

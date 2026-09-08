@@ -3981,6 +3981,81 @@ SCENARIO("OPTIONS preflight echoes back an explicit single origin from the allow
 // refuses the combination at startup, but a Config assembled in process never
 // passes through it — so the response builder has to refuse it too rather than
 // trusting a check that lives in another module.
+// L-01 / L-02 (security audit 2026-09). Spec §User-Interactive Authentication
+// API: the server's 401 challenge carries a `session` that identifies *this*
+// attempt, and the client echoes it back on the request that completes the
+// flow. Both challenges here used a compile-time constant instead
+// ("merovingian-ui-auth", "delete_device", "delete_devices"), so every client
+// and every attempt shared one id and an attacker knew it in advance.
+SCENARIO("UIAA challenges carry a unique per-attempt session id", "[homeserver][client-server][uiaa][security]")
+{
+    GIVEN("a runtime that requires a registration token")
+    {
+        auto started = merovingian::homeserver::start_client_server(registration_enabled_config());
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        auto const challenge_session = [&runtime](std::string_view body) {
+            auto request = merovingian::homeserver::LocalHttpRequest{};
+            request.method = "POST";
+            request.target = "/_matrix/client/v3/register";
+            request.body = std::string{body};
+            auto const response = merovingian::homeserver::handle_client_server_request(runtime, request);
+            REQUIRE(response.response.status == 401U);
+            auto const body_object = parse_object(response.response.body);
+            auto const* session = string_member(body_object, "session");
+            REQUIRE(session != nullptr);
+            return *session;
+        };
+
+        WHEN("two clients each provoke a registration challenge")
+        {
+            auto const first = challenge_session(R"({"username":"uiaa1","password":"CorrectHorse7!"})");
+            auto const second = challenge_session(R"({"username":"uiaa2","password":"CorrectHorse7!"})");
+
+            THEN("each attempt receives its own non-trivial session id")
+            {
+                REQUIRE_FALSE(first.empty());
+                REQUIRE_FALSE(second.empty());
+                REQUIRE(first != second);
+                // The old constant must not reappear under any name.
+                REQUIRE(first != "merovingian-ui-auth");
+                REQUIRE(first.size() >= 16U);
+            }
+        }
+
+        WHEN("a client echoes a session id the server never issued")
+        {
+            auto request = merovingian::homeserver::LocalHttpRequest{};
+            request.method = "POST";
+            request.target = "/_matrix/client/v3/register";
+            request.body =
+                std::string{R"({"username":"uiaa3","password":"CorrectHorse7!","auth":{"type":)"} +
+                R"("m.login.registration_token","token":"test-registration-token","session":"merovingian-ui-auth"}})";
+            auto const response = merovingian::homeserver::handle_client_server_request(runtime, request);
+
+            THEN("the attempt is refused with a fresh challenge rather than registering the user")
+            {
+                REQUIRE(response.response.status == 401U);
+            }
+        }
+
+        WHEN("a client completes the flow without supplying a session at all")
+        {
+            auto request = merovingian::homeserver::LocalHttpRequest{};
+            request.method = "POST";
+            request.target = "/_matrix/client/v3/register";
+            request.body = merovingian::tests::registration_json("uiaa4", "CorrectHorse7!");
+            auto const response = merovingian::homeserver::handle_client_server_request(runtime, request);
+
+            THEN("the single-stage flow still completes in one shot, as the spec permits")
+            {
+                REQUIRE(response.response.status == 200U);
+            }
+        }
+    }
+}
+
 SCENARIO("A wildcard allow-origin is never paired with allow-credentials",
          "[homeserver][client-server][cors][preflight][security]")
 {
