@@ -14,7 +14,8 @@
 //   - delete_local_device: unknown user/device rejected; valid deletion invalidates session
 //   - issue_refresh_token_for_session: unknown user rejected
 //   - refresh_local_session: empty/unknown token rejected; valid refresh issues new tokens;
-//     single-use enforcement
+//     single-use enforcement; a locked account is refused with M_USER_LOCKED while a
+//     suspended one is still served; a refresh whose device row was deleted fails closed
 //   - access_token_is_soft_logout: false for empty and unknown tokens
 //   - request_openid_token / federation_openid_userinfo: mint returns all
 //     spec-required fields; userinfo redeems a valid token; unknown and
@@ -34,6 +35,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 
@@ -539,6 +541,160 @@ SCENARIO("refresh_local_session issues a new access token from a valid refresh t
             THEN("the second use is rejected — refresh tokens are single-use")
             {
                 REQUIRE_FALSE(second.ok);
+            }
+        }
+    }
+}
+
+// H-01 / H-02 (security audit 2026-09). Two independent gates on the refresh
+// path. Locking is a spec MUST (§Account locking: 401 M_USER_LOCKED with
+// soft_logout on every API but logout), and §Soft logout says a locked client
+// "cannot obtain a new access token until the account has been unlocked" — so
+// the refusal has to live in refresh_local_session itself, which authenticates
+// with a refresh token and therefore never passes the access-token moderation
+// gate in the dispatcher.
+SCENARIO("refresh_local_session refuses to mint tokens for a locked account",
+         "[homeserver][auth][refresh][moderation]")
+{
+    GIVEN("a registered user holding a refresh token whose account is then locked")
+    {
+        REQUIRE(sodium_init() >= 0);
+        auto started = merovingian::homeserver::start_runtime(registration_enabled_config());
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        auto const reg = merovingian::homeserver::register_local_user(runtime, "lockme", "CorrectHorse7!",
+                                                                     merovingian::tests::registration_token);
+        REQUIRE(reg.ok);
+        std::ignore = merovingian::homeserver::login_local_user(runtime, reg.value, "CorrectHorse7!", "DEVICE1");
+        auto const issued = merovingian::homeserver::issue_refresh_token_for_session(runtime, reg.value, "DEVICE1");
+        REQUIRE(issued.ok);
+
+        auto const user = std::ranges::find_if(runtime.database.users,
+                                               [&reg](merovingian::homeserver::LocalUser const& candidate) {
+                                                   return candidate.user_id == reg.value;
+                                               });
+        REQUIRE(user != runtime.database.users.end());
+        user->locked = true;
+
+        WHEN("the refresh token is exchanged")
+        {
+            auto const refreshed = merovingian::homeserver::refresh_local_session(runtime, issued.value);
+
+            THEN("the refresh is refused as M_USER_LOCKED and no credential is issued")
+            {
+                REQUIRE_FALSE(refreshed.ok);
+                REQUIRE(refreshed.status == 401U);
+                REQUIRE(refreshed.errcode == "M_USER_LOCKED");
+                REQUIRE(refreshed.soft_logout);
+                REQUIRE(refreshed.access_token.empty());
+                REQUIRE(refreshed.refresh_token.empty());
+            }
+        }
+
+        WHEN("the account is unlocked and the same refresh token is exchanged")
+        {
+            user->locked = false;
+            auto const refreshed = merovingian::homeserver::refresh_local_session(runtime, issued.value);
+
+            THEN("the refresh succeeds — the lock gates the request, it does not revoke the token")
+            {
+                REQUIRE(refreshed.ok);
+                REQUIRE_FALSE(refreshed.access_token.empty());
+            }
+        }
+    }
+}
+
+// Suspension is deliberately NOT a refusal here. The spec leaves the permitted
+// actions of a suspended account to the implementation but SHOULD-lists "log in
+// and create additional sessions" and "see and receive messages ... through
+// /sync and /messages" among them, and this server's own suspension allowlist
+// already permits POST /login — which mints unlimited fresh access tokens.
+// Refusing /refresh while permitting /login would buy no security and would
+// break the sync access the spec asks servers to preserve.
+SCENARIO("refresh_local_session still serves a suspended account", "[homeserver][auth][refresh][moderation]")
+{
+    GIVEN("a registered user holding a refresh token whose account is then suspended")
+    {
+        REQUIRE(sodium_init() >= 0);
+        auto started = merovingian::homeserver::start_runtime(registration_enabled_config());
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        auto const reg = merovingian::homeserver::register_local_user(runtime, "suspendme", "CorrectHorse7!",
+                                                                     merovingian::tests::registration_token);
+        REQUIRE(reg.ok);
+        std::ignore = merovingian::homeserver::login_local_user(runtime, reg.value, "CorrectHorse7!", "DEVICE1");
+        auto const issued = merovingian::homeserver::issue_refresh_token_for_session(runtime, reg.value, "DEVICE1");
+        REQUIRE(issued.ok);
+
+        auto const user = std::ranges::find_if(runtime.database.users,
+                                               [&reg](merovingian::homeserver::LocalUser const& candidate) {
+                                                   return candidate.user_id == reg.value;
+                                               });
+        REQUIRE(user != runtime.database.users.end());
+        user->suspended = true;
+
+        WHEN("the refresh token is exchanged")
+        {
+            auto const refreshed = merovingian::homeserver::refresh_local_session(runtime, issued.value);
+
+            THEN("the refresh succeeds so the suspended user can keep syncing")
+            {
+                REQUIRE(refreshed.ok);
+                REQUIRE_FALSE(refreshed.access_token.empty());
+            }
+        }
+    }
+}
+
+// H-02 (security audit 2026-09). A refresh token outlives its device only
+// through a failure — a partial deactivation, a revocation race, a leak. The
+// token lifecycle assumes tokens are bound to real devices, so a refresh whose
+// device row is gone must fail closed rather than resurrect the session.
+SCENARIO("refresh_local_session refuses a refresh token whose device has been deleted",
+         "[homeserver][auth][refresh][device]")
+{
+    GIVEN("a registered user holding a refresh token for a device that is then deleted")
+    {
+        REQUIRE(sodium_init() >= 0);
+        auto started = merovingian::homeserver::start_runtime(registration_enabled_config());
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        auto const reg = merovingian::homeserver::register_local_user(runtime, "zombie", "CorrectHorse7!",
+                                                                     merovingian::tests::registration_token);
+        REQUIRE(reg.ok);
+        std::ignore = merovingian::homeserver::login_local_user(runtime, reg.value, "CorrectHorse7!", "DEVICE1");
+        auto const issued = merovingian::homeserver::issue_refresh_token_for_session(runtime, reg.value, "DEVICE1");
+        REQUIRE(issued.ok);
+        REQUIRE(merovingian::database::delete_device(runtime.database.persistent_store, reg.value, "DEVICE1"));
+
+        WHEN("the refresh token for the deleted device is exchanged")
+        {
+            auto const refreshed = merovingian::homeserver::refresh_local_session(runtime, issued.value);
+
+            THEN("the refresh is refused and no credential is issued for the dead device")
+            {
+                REQUIRE_FALSE(refreshed.ok);
+                REQUIRE(refreshed.status == 401U);
+                REQUIRE(refreshed.access_token.empty());
+                REQUIRE(refreshed.refresh_token.empty());
+            }
+        }
+
+        WHEN("a second device still exists and its refresh token is exchanged")
+        {
+            std::ignore = merovingian::homeserver::login_local_user(runtime, reg.value, "CorrectHorse7!", "DEVICE2");
+            auto const second = merovingian::homeserver::issue_refresh_token_for_session(runtime, reg.value, "DEVICE2");
+            REQUIRE(second.ok);
+            auto const refreshed = merovingian::homeserver::refresh_local_session(runtime, second.value);
+
+            THEN("that refresh still succeeds")
+            {
+                REQUIRE(refreshed.ok);
+                REQUIRE(refreshed.device_id == "DEVICE2");
             }
         }
     }

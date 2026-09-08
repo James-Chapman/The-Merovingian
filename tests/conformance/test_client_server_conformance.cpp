@@ -4029,6 +4029,100 @@ SCENARIO("A locked account receives M_USER_LOCKED on all APIs except logout",
     }
 }
 
+// --- Account locking: POST /refresh is not an escape hatch -------------------
+// Spec: Matrix Client-Server API v1.19
+// Section: Account locking / Soft logout
+// URL: ../../docs/matrix-v1.19-spec/client-server-api.md#account-locking
+//
+// "When an account is locked, servers MUST return a 401 Unauthorized error
+// response with an M_USER_LOCKED error code and soft_logout set to true on all
+// but the following Client-Server APIs: POST /logout, POST /logout/all."
+// POST /refresh is not on that list, and §Soft logout is explicit that a client
+// holding M_USER_LOCKED "cannot obtain a new access token until the account has
+// been unlocked". A locked account that can keep refreshing defeats the lock on
+// every other endpoint, so /refresh MUST be gated even though it authenticates
+// with a refresh token rather than an access token.
+SCENARIO("A locked account cannot mint new tokens through POST /refresh",
+         "[conformance][client-server][session][account]")
+{
+    GIVEN("a running client-server and a user holding a valid refresh token")
+    {
+        auto started = merovingian::homeserver::start_client_server(conformance_config());
+        REQUIRE(started.started);
+
+        REQUIRE(merovingian::homeserver::handle_client_server_request(
+                    started.runtime, {"POST",
+                                      "/_matrix/client/v3/register",
+                                      {},
+                                      merovingian::tests::registration_json("lockedrefresh", "CorrectHorse7!")})
+                    .response.status == 200U);
+
+        auto const login_resp = merovingian::homeserver::handle_client_server_request(
+            started.runtime,
+            {"POST",
+             "/_matrix/client/v3/login",
+             {},
+             R"({"type":"m.login.password","identifier":{"type":"m.id.user","user":"@lockedrefresh:example.org"},"password":"CorrectHorse7!","device_id":"LRDEV","refresh_token":true})"});
+        REQUIRE(login_resp.response.status == 200U);
+        auto const* issued = string_member(parse_object(login_resp.response.body), "refresh_token");
+        REQUIRE(issued != nullptr);
+        auto const refresh_tok = *issued;
+
+        auto const admin = admin_token(started.runtime, "lockadmin");
+        REQUIRE(merovingian::homeserver::handle_client_server_request(
+                    started.runtime, {"PUT", "/_matrix/client/v1/admin/lock/%40lockedrefresh%3Aexample.org", admin,
+                                      R"({"locked":true})"})
+                    .response.status == 200U);
+
+        WHEN("the locked user calls POST /refresh with that refresh token")
+        {
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"POST",
+                                  "/_matrix/client/v3/refresh",
+                                  {},
+                                  std::string{R"({"refresh_token":")"} + refresh_tok + R"("})"});
+
+            THEN("the server returns 401 M_USER_LOCKED with soft_logout:true and issues no token")
+            {
+                // Spec MUST: 401 M_USER_LOCKED with soft_logout:true.
+                REQUIRE(response.response.status == 401U);
+                auto const body = parse_object(response.response.body);
+                REQUIRE(string_member(body, "errcode") != nullptr);
+                REQUIRE(*string_member(body, "errcode") == "M_USER_LOCKED");
+                auto const* soft = bool_member(body, "soft_logout");
+                REQUIRE(soft != nullptr);
+                REQUIRE(*soft == true);
+
+                // Spec MUST: no new credential is minted for a locked account.
+                REQUIRE(string_member(body, "access_token") == nullptr);
+                REQUIRE(string_member(body, "refresh_token") == nullptr);
+            }
+        }
+
+        WHEN("the account is unlocked again and the same refresh token is presented")
+        {
+            REQUIRE(merovingian::homeserver::handle_client_server_request(
+                        started.runtime, {"PUT", "/_matrix/client/v1/admin/lock/%40lockedrefresh%3Aexample.org", admin,
+                                          R"({"locked":false})"})
+                        .response.status == 200U);
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"POST",
+                                  "/_matrix/client/v3/refresh",
+                                  {},
+                                  std::string{R"({"refresh_token":")"} + refresh_tok + R"("})"});
+
+            THEN("the refresh succeeds — locking is reversible and does not revoke tokens")
+            {
+                // Spec: "Servers SHOULD NOT invalidate access tokens on locked
+                // accounts", so the refusal above must be a gate, not a revocation.
+                REQUIRE(response.response.status == 200U);
+                auto const body = parse_object(response.response.body);
+                REQUIRE(string_member(body, "access_token") != nullptr);
+            }
+        }
+    }
+}
+
 // --- Account suspension: request-path enforcement (M_USER_SUSPENDED) ----------
 // Spec: Matrix Client-Server API v1.19
 // Section: Account suspension

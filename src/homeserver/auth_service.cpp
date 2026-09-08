@@ -1237,6 +1237,42 @@ auto refresh_local_session(HomeserverRuntime& runtime, std::string_view refresh_
     {
         return {false, 401U, {}, {}, {}, {}, "account deactivated"};
     }
+    // Spec §Account locking: a locked account MUST receive 401 M_USER_LOCKED
+    // with soft_logout on every Client-Server API except POST /logout and
+    // POST /logout/all, and §Soft logout is explicit that such a client
+    // "cannot obtain a new access token until the account has been unlocked".
+    // The dispatcher's moderation gate authenticates with an access token, so
+    // it never sees /refresh — without this check a locked account keeps
+    // minting access tokens indefinitely and the lock is defeated everywhere.
+    //
+    // Suspension is deliberately not a refusal. The spec leaves a suspended
+    // account's permitted actions to the implementation but SHOULD-lists
+    // logging in, creating further sessions, and reading through /sync and
+    // /messages; this server's own suspension allowlist already permits
+    // POST /login, which mints unlimited fresh access tokens. Refusing a
+    // rotation while permitting a fresh login would deny the reads the spec
+    // asks servers to preserve and buy nothing.
+    if (refresh_user->locked)
+    {
+        append_local_audit(runtime.database, observability::AuditCategory::auth, "auth.refresh.rejected", user_id,
+                           device_id, "account locked");
+        return {false, 401U, {}, {}, {}, {}, "This account has been locked", "M_USER_LOCKED", true};
+    }
+    // A refresh token must name a device that still exists. The token lifecycle
+    // binds every credential to a device row; a token that outlives its row can
+    // only have got there through a failure (a partial deactivation, a
+    // revocation race, a leak), and honouring it would resurrect a session for
+    // a device the user believes is gone. Fail closed rather than recreate it.
+    auto const device_exists = std::ranges::any_of(
+        runtime.database.persistent_store.devices, [&user_id, &device_id](database::PersistentDevice const& device) {
+            return device.user_id == user_id && device.device_id == device_id;
+        });
+    if (!device_exists)
+    {
+        append_local_audit(runtime.database, observability::AuditCategory::auth, "auth.refresh.rejected", user_id,
+                           device_id, "device no longer exists");
+        return {false, 401U, {}, {}, {}, {}, "refresh device rejected"};
+    }
     if (database::revoke_refresh_token(runtime.database.persistent_store, refresh->token_hash) == 0U)
     {
         return {false, 500U, {}, {}, {}, {}, "refresh token revocation failed"};

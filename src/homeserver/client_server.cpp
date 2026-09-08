@@ -9610,9 +9610,23 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
         auto const refreshed = refresh_local_session(rt.homeserver, body->refresh_token);
         if (!refreshed.ok)
         {
+            // A locked account carries its own spec-mandated shape (401
+            // M_USER_LOCKED with soft_logout:true, spec §Account locking); the
+            // default 401 mapping of M_UNKNOWN_TOKEN would tell the client to
+            // discard its session instead of waiting for the lock to lift.
+            if (!refreshed.errcode.empty())
+            {
+                return refreshed.soft_logout
+                           ? dispatch_err_soft_logout(req, rt, refreshed.status, refreshed.errcode, refreshed.reason)
+                           : dispatch_err(req, rt, refreshed.status, refreshed.errcode, refreshed.reason);
+            }
             return dispatch_err(req, rt, refreshed.status, refreshed.status == 401U ? "M_UNKNOWN_TOKEN" : "M_UNKNOWN",
                                 refreshed.reason);
         }
+        // Repopulates the in-memory device cache only. refresh_local_session has
+        // already established that the device row exists in the persistent
+        // store, so this can no longer resurrect a deleted device — it only
+        // heals a cache that a restart or a worker split left incomplete.
         if (find_device(rt, refreshed.user_id, refreshed.device_id) == nullptr)
         {
             rt.devices.push_back({refreshed.user_id, refreshed.device_id, refreshed.device_id});
