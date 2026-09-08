@@ -186,6 +186,19 @@ tree built programmatically rather than parsed.
 Verification rebuilds the same canonical payload, decodes the Matrix Base64
 signature, and delegates Ed25519 verification to the configured provider.
 
+`signing_key_id_is_valid` delegates the key id's shape to
+`crypto::ed25519_key_id_is_valid`, which requires the `ed25519:` algorithm
+prefix. A Key ID is the algorithm and version combined (spec, Appendices
+§Cryptographic key representation); a bare version string is not one.
+
+**The signing diagnostic never carries the payload.** `sign_event_for_server`
+emits each payload's byte count and SHA-256 digest, not the canonical signing
+payload or the signed event JSON. Logging those put full event bodies in debug
+logs, which `src/observability/AGENTS.md` forbids, and under field names the
+redactor did not recognise. The digests are still enough to compare
+byte-for-byte with a federation peer when triaging a `BadSignatureError`: equal
+digests mean equal payloads.
+
 Runtime signing keys are generated from system entropy using
 `crypto_sign_keypair` rather than being deterministically derived from public
 server identity values.
@@ -205,6 +218,12 @@ event after removing `unsigned`, `signatures`, and `hashes`. `make_reference_has
 redacts the event, removes `unsigned` and `signatures`, canonicalizes, and
 calculates the SHA-256 reference hash. `make_reference_hash_event_id` prefixes
 the URL-safe unpadded Base64 reference hash with `$` for modern room versions.
+
+The redaction algorithm is room-version specific, so every entry point takes the
+event's own `RoomVersionPolicy` — including `make_content_hash_id`, which until
+0.12.9 hardcoded version 12 regardless of the event. There is deliberately no
+defaulted version: an ID computed under the wrong room version does not match
+the one other servers derive.
 
 `verify_pdu_content_hash` extracts the claimed `hashes.sha256` field from an
 inbound PDU and compares it against the result of `make_content_hash`. Inbound
@@ -227,6 +246,24 @@ Auth-event maps are built from current room state for authorization checking.
 The v2 state resolution algorithm resolves conflicting state using reverse
 topological power ordering for power events and the mainline ordering (based
 on the partially resolved power levels) for the remaining events.
+
+Two properties of that ordering are easy to get subtly wrong and are worth
+stating explicitly, because both were defects until 0.12.9:
+
+- **Sender power is read through the room version's rules, not an integer-only
+  accessor.** Room versions 1-9 permit power levels encoded as JSON strings and
+  the authorization path already parses them, so an integer-only read in the
+  resolver silently demoted such a sender to `users_default` and let a
+  lower-power event win. `reverse_topological_power_sort` therefore takes a
+  `RoomVersionPolicy` and honours `power_levels_require_integers`. **The
+  resolver and `authorization.cpp` must agree on this**: if they disagree,
+  events are ordered by a power level the auth rules cannot see.
+- **The auth-event map built from resolved state includes
+  `authorising_user_member`.** The restricted-join branch of the auth rules
+  needs the `m.room.member` event of the user named by
+  `content.join_authorised_via_users_server` to validate the join. Omitting it
+  made every valid restricted join in the conflicted set fail auth, which
+  diverges room state across federation rather than merely rejecting one event.
 
 Event depth is persisted alongside the event row so ordering metadata survives
 a server restart.

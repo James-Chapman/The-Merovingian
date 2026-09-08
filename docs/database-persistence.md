@@ -517,6 +517,27 @@ The boundary provides these guarantees:
   one-way transition, enforced by the store's API surface rather than by
   caller discipline (see `revoke_tokens_for_user_except_device` above and
   [ADR-0052](adr/0052-revocation-of-credentials-is-one-way.md)).
+- Binary payloads round-trip byte-exactly on both backends. `BoundValue` carries
+  a `binary` flag; SQLite already bound every parameter by explicit length, but
+  PostgreSQL sends parameters to `PQexecParams` as null-terminated C strings, so
+  a raw payload truncated at its first embedded NUL. A `binary` parameter is now
+  hex-encoded into PostgreSQL's own `\x` bytea literal on the way in — plain
+  ASCII, never containing a NUL — and decoded on the way out. `media_blobs.bytes`
+  is the column that needs it today; any future `BLOB`/`BYTEA` column carrying
+  non-text bytes must set the flag on both the write and the read path.
+- Identity-server unbind credentials (`account_threepids.client_secret` and
+  `.sid`) are bound as sensitive values, so they never reach a query trace or
+  diagnostic log. They remain plaintext at rest; that is the documented residual
+  risk in `docs/threat-model.md` §IS-delegated bind/unbind/requestToken.
+- Migration plans are serialised across processes. Each step commits in its own
+  transaction, so the window that needs protecting is *between* the
+  transactions: PostgreSQL takes a `pg_advisory_lock` for the whole plan under
+  an RAII lease (a crashed migrator's session-scoped lock disappears with its
+  connection, so recovery needs no operator action), and SQLite re-reads the
+  `schema_migrations` ledger inside each step's `BEGIN IMMEDIATE` and skips a
+  step the winner of a race already applied. These are deliberately *not* one
+  shared mechanism — see
+  [ADR-0059](adr/0059-serialise-migrations-per-backend-not-per-abstraction.md).
 
 ## Deliberately not included
 

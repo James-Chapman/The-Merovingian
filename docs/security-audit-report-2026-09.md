@@ -1596,45 +1596,45 @@ issue passes and the fix has been reviewed against the spec.
 
 ### High severity
 
-- [ ] H-01 `/refresh` respects locked/suspended account state
-- [ ] H-02 `/refresh` verifies the target device still exists
-- [ ] H-03 Plain-HTTP sockets are non-blocking on send
-- [ ] H-04 Per-PDU failures persist consecutive-failures count
-- [ ] H-05 Event signer no longer logs signing payloads / signed JSON
-- [ ] H-06 V2 state resolution populates `authorising_user_member`
-- [ ] H-07 V2 state resolution parses string-encoded power levels in v1–v9
+- [x] H-01 `/refresh` respects locked/suspended account state
+- [x] H-02 `/refresh` verifies the target device still exists
+- [x] H-03 Plain-HTTP sockets are non-blocking on send
+- [x] H-04 Per-PDU failures persist consecutive-failures count
+- [x] H-05 Event signer no longer logs signing payloads / signed JSON
+- [x] H-06 V2 state resolution populates `authorising_user_member`
+- [x] H-07 V2 state resolution parses string-encoded power levels in v1–v9
 
 ### Medium severity
 
-- [ ] M-01 Registration token file cache invalidated on rotation
-- [ ] M-02 Rate-limit buckets use collision-resistant hashing
-- [ ] M-03 Transport-layer errors include CORS headers
-- [ ] M-04 v1 invite uses correct room version for signature/hash
-- [ ] M-05 `signature_verified` flag removed from public verifier
-- [ ] M-06 Literal discovery network overload removed from public API
-- [ ] M-07 `RuntimeEd25519Provider::sign` validates secret size
-- [ ] M-08 `account_threepids` secrets bound as sensitive / encrypted
-- [ ] M-09 PostgreSQL binary columns round-trip byte-exactly
-- [ ] M-10 Migration runner holds a cross-process lock
-- [ ] M-11 Legacy log macros route through redaction
+- [x] M-01 Registration token file cache invalidated on rotation
+- [x] M-02 Rate-limit buckets use collision-resistant hashing
+- [x] M-03 Transport-layer errors include CORS headers
+- [x] M-04 v1 invite uses correct room version for signature/hash
+- [x] M-05 `signature_verified` flag removed from public verifier
+- [x] M-06 Literal discovery network overload removed from public API
+- [x] M-07 `RuntimeEd25519Provider::sign` validates secret size
+- [x] M-08 `account_threepids` secrets bound as sensitive / encrypted
+- [x] M-09 PostgreSQL binary columns round-trip byte-exactly
+- [x] M-10 Migration runner holds a cross-process lock
+- [x] M-11 Legacy log macros route through redaction
 
 ### Low severity
 
-- [ ] L-01 Registration UIAA uses unique sessions and stage tracking
-- [ ] L-02 Device-deletion UIAA uses unique sessions and stage tracking
-- [ ] L-03 Device ID validator rejects reserved separator characters
-- [ ] L-04 TLS cipher list is forward-secret only
-- [ ] L-05 CORS wildcard origin never paired with credentials
-- [ ] L-06 Backfill `limit` is clamped / rejected when too large
-- [ ] L-07 `RuntimeEd25519Provider` constructor validates secret size
-- [ ] L-08 `db-migrate` CLI rejects invalid version arguments
-- [ ] L-09 Audit sink pointer is synchronized
-- [ ] L-10 Audit events are queued or warned when dropped
-- [ ] L-11 `append_only` is enforced or removed
-- [ ] L-12 `string_format` / `LOGF_*` are deprecated or removed
-- [ ] L-13 Dropped log messages are counted and warned
-- [ ] L-14 Signing key id validator delegates to crypto boundary
-- [ ] L-15 `make_content_hash_id` accepts the event's room version
+- [x] L-01 Registration UIAA uses unique sessions and stage tracking
+- [x] L-02 Device-deletion UIAA uses unique sessions and stage tracking
+- [x] L-03 Device ID validator rejects reserved separator characters
+- [x] L-04 TLS cipher list is forward-secret only
+- [x] L-05 CORS wildcard origin never paired with credentials
+- [x] L-06 Backfill `limit` is clamped / rejected when too large
+- [x] L-07 `RuntimeEd25519Provider` constructor validates secret size
+- [x] L-08 `db-migrate` CLI rejects invalid version arguments
+- [x] L-09 Audit sink pointer is synchronized
+- [x] L-10 Audit events are queued or warned when dropped
+- [x] L-11 `append_only` is enforced or removed
+- [x] L-12 `string_format` / `LOGF_*` are deprecated or removed
+- [x] L-13 Dropped log messages are counted and warned
+- [x] L-14 Signing key id validator delegates to crypto boundary
+- [x] L-15 `make_content_hash_id` accepts the event's room version
 
 ---
 
@@ -1642,3 +1642,44 @@ issue passes and the fix has been reviewed against the spec.
 
 - Workflow run ID: `wf_ca62d200-01b`
 - Machine-readable result: `C:\Users\retro\AppData\Local\Temp\claude\C--dev-Merovingian\de182d62-7fbb-4079-b2d2-b5e8e305c8e6\tasks\wd42c92ew.output`
+
+---
+
+## Resolution
+
+All 33 findings were fixed on branch `fix/security-audit-2026-09` and released in
+0.12.9. See that section of `CHANGELOG.md` for the per-finding account.
+
+Three findings were **not** implemented as written, because checking them against
+the spec and the code showed the stated remedy would have been wrong:
+
+- **H-01 (suspended half).** The locked-account refusal is a spec MUST and was
+  implemented. Refusing a *suspended* account at `/refresh` was not: the spec
+  SHOULD-lists logging in, creating further sessions, and reading through `/sync`
+  and `/messages` among a suspended account's permitted actions, and this
+  server's own suspension allowlist already permits `POST /login`, which mints
+  unlimited fresh access tokens. See ADR-0058.
+- **L-01 / L-02.** Unique per-attempt session ids and endpoint-scoped validation
+  were implemented; persisted `auth_sessions` rows and completed-stage tracking
+  were not. There is exactly one configured UIAA stage, so there is no ordering
+  to enforce, and the credential the stage checks travels in the same request.
+  See ADR-0057.
+- **L-05.** Not reachable through configuration: `config::validate` already
+  refuses wildcard-plus-credentials and the server will not start with it. The
+  change made is defence in depth for a runtime CORS snapshot that never passed
+  through validation.
+
+One finding was fixed more narrowly than proposed:
+
+- **M-08.** `client_secret` and `sid` are now bound as sensitive values so they
+  cannot reach a query trace or diagnostic log. Column encryption and an
+  unbind-auth-mode-1 redesign are a schema and protocol change, not a binding
+  fix, and remain the documented residual risk in `docs/threat-model.md`.
+
+One defect **outside** this report was found while fixing M-09 and is tracked
+separately: `server_signing_keys.secret_key` is also a `BLOB`/`BYTEA` column
+bound and read as text, which the verifier dismissed as "base64 text and not
+affected". On PostgreSQL that column is very likely read back as a `\x`-hex
+string, meaning a homeserver cannot reload its own signing key after a restart.
+It needs confirming against a live PostgreSQL before being fixed, so it was not
+folded into this branch.
