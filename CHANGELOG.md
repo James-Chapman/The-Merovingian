@@ -1,5 +1,9 @@
 ## 0.12.8
 
+- Publish parallel security audit report covering 33 confirmed findings across
+  auth, client HTTP, federation, crypto, database, observability, and event
+  engine surfaces, with adversarial verification and actionable acceptance
+  criteria (see `docs/security-audit-report-2026-09.md`).
 - Apply configured module/default log levels to direct logging macros as well
   as structured diagnostics, including when console debugging is enabled.
 - Emit one diagnostic warning per client rate-limit rejection while preserving
