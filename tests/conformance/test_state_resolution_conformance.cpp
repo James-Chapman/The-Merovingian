@@ -957,3 +957,230 @@ SCENARIO("Power events are classified per the spec definition", "[conformance][s
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Restricted-join auth events, and string-encoded power levels in the reverse
+// topological power ordering.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+// Build an m.room.join_rules event with an arbitrary join rule.
+[[nodiscard]] auto make_join_rules_event(std::string const& join_rule, std::string const& sender,
+                                         std::string const& event_id, std::int64_t ts, std::uint64_t depth)
+    -> StateEventReference
+{
+    auto const json = std::string{"{\"type\":\"m.room.join_rules\",\"state_key\":\"\",\"sender\":\""} + sender +
+                      "\",\"event_id\":\"" + event_id + "\",\"origin_server_ts\":" + std::to_string(ts) +
+                      ",\"content\":{\"join_rule\":\"" + join_rule + "\"}}";
+    return make_event_ref("m.room.join_rules", "", event_id, sender, ts, depth, json);
+}
+
+// Build an m.room.power_levels event whose content.users body is supplied
+// verbatim, so a test can encode a level as a JSON string ("100") rather than
+// an integer (100). `invite` is spelled out because the restricted-join rule
+// compares the authorising user's level against it.
+[[nodiscard]] auto make_power_levels_with_users(std::string const& users_json, std::string const& sender,
+                                                std::string const& event_id, std::int64_t ts, std::uint64_t depth)
+    -> StateEventReference
+{
+    auto const json = std::string{"{\"type\":\"m.room.power_levels\",\"state_key\":\"\",\"sender\":\""} + sender +
+                      "\",\"event_id\":\"" + event_id + "\",\"origin_server_ts\":" + std::to_string(ts) +
+                      ",\"content\":{\"ban\":50,\"events_default\":0,\"invite\":0,\"kick\":50,\"redact\":50,"
+                      "\"state_default\":50,\"users\":" +
+                      users_json + ",\"users_default\":0}}";
+    return make_event_ref("m.room.power_levels", "", event_id, sender, ts, depth, json);
+}
+
+// Build an m.room.member join event carrying content.join_authorised_via_users_server,
+// as a resident server issues for a join into a restricted room.
+[[nodiscard]] auto make_restricted_join_event(std::string const& user_id, std::string const& authorising_user,
+                                              std::string const& event_id, std::int64_t ts, std::uint64_t depth)
+    -> StateEventReference
+{
+    auto const json = std::string{"{\"type\":\"m.room.member\",\"state_key\":\""} + user_id + "\",\"sender\":\"" +
+                      user_id + "\",\"event_id\":\"" + event_id + "\",\"origin_server_ts\":" + std::to_string(ts) +
+                      ",\"content\":{\"membership\":\"join\",\"join_authorised_via_users_server\":\"" +
+                      authorising_user + "\"}}";
+    return make_event_ref("m.room.member", user_id, event_id, user_id, ts, depth, json);
+}
+
+} // namespace
+
+// Spec: Matrix Server-Server API v1.19
+// Section: Auth events selection; Authorization rules (restricted rooms)
+// URL: ../../docs/matrix-v1.19-spec/server-server-api.md#auth-events-selection
+//      ../../docs/matrix-v1.19-spec/rooms/v10.md#authorization-rules
+//
+// Spec MUST (auth events selection): "If membership is join,
+// content.join_authorised_via_users_server is present, and the room version
+// supports restricted rooms, then the m.room.member event with state_key
+// matching content.join_authorised_via_users_server" is one of the event's auth
+// events.
+// Spec MUST (rule 4.3.5.2): reject if the user named by
+// join_authorised_via_users_server "is not a user with sufficient permission to
+// invite other users or is not a joined member of the room".
+//
+// State resolution re-runs the authorization rules against the state resolved so
+// far, so it MUST offer the authorising user's membership to the rule. Omitting
+// it fails every restricted join in the conflicted set, which locks authorized
+// joiners out and diverges room state across servers.
+SCENARIO("State resolution v2 authorizes a restricted join using the authorising user's membership",
+         "[conformance][state-resolution][v2][restricted-join]")
+{
+    GIVEN("a restricted room whose conflicted set contains a join authorised by a joined, invite-capable user")
+    {
+        auto const* policy = merovingian::rooms::find_room_version_policy("10");
+        REQUIRE(policy != nullptr);
+
+        auto const create = make_create_event("@alice:example.org", "$create:example.org", 500);
+        auto const join_rules =
+            make_join_rules_event("restricted", "@alice:example.org", "$join_rules:example.org", 600, 1);
+        auto const power_levels = make_power_levels_with_users(R"({"@alice:example.org":100,"@auth:example.org":100})",
+                                                               "@alice:example.org", "$pl:example.org", 700, 2);
+        // membership=join for the authorising user.
+        auto const authoriser_member = make_member_event("@auth:example.org", "$auth_member:example.org", 800, 3);
+        auto const bob_join =
+            make_restricted_join_event("@bob:example.org", "@auth:example.org", "$bob_join:example.org", 900, 4);
+
+        auto request = merovingian::events::StateResolutionRequest{};
+        request.room_version = "10";
+
+        auto group_a = merovingian::events::StateGroup{};
+        group_a.group_id = "branch-a";
+        group_a.state = {create, join_rules, power_levels, authoriser_member, bob_join};
+
+        auto group_b = merovingian::events::StateGroup{};
+        group_b.group_id = "branch-b";
+        group_b.state = {create, join_rules, power_levels, authoriser_member};
+
+        request.state_groups.push_back(std::move(group_a));
+        request.state_groups.push_back(std::move(group_b));
+
+        WHEN("resolve_state_v2 is called")
+        {
+            auto const result = merovingian::events::resolve_state_v2(request, *policy);
+
+            THEN("the restricted join survives resolution")
+            {
+                // Spec MUST: v2 always produces a resolved state.
+                REQUIRE(result.resolved);
+                // Spec MUST (rule 4.3.5.3): with a joined, invite-capable authorising
+                // user the restricted join is allowed, so it must appear in the
+                // resolved state. Do NOT weaken - dropping it locks authorized
+                // joiners out of restricted rooms and diverges state across servers.
+                REQUIRE(result_contains_event(result, "$bob_join:example.org"));
+                auto const* member = result_event_for(result, "m.room.member", "@bob:example.org");
+                REQUIRE(member != nullptr);
+                REQUIRE(member->event_id == "$bob_join:example.org");
+            }
+        }
+    }
+
+    GIVEN("the same restricted room where the authorising user is not a member")
+    {
+        auto const* policy = merovingian::rooms::find_room_version_policy("10");
+        REQUIRE(policy != nullptr);
+
+        auto const create = make_create_event("@alice:example.org", "$create:example.org", 500);
+        auto const join_rules =
+            make_join_rules_event("restricted", "@alice:example.org", "$join_rules:example.org", 600, 1);
+        auto const power_levels = make_power_levels_with_users(R"({"@alice:example.org":100,"@auth:example.org":100})",
+                                                               "@alice:example.org", "$pl:example.org", 700, 2);
+        auto const bob_join =
+            make_restricted_join_event("@bob:example.org", "@auth:example.org", "$bob_join:example.org", 900, 4);
+
+        auto request = merovingian::events::StateResolutionRequest{};
+        request.room_version = "10";
+
+        auto group_a = merovingian::events::StateGroup{};
+        group_a.group_id = "branch-a";
+        group_a.state = {create, join_rules, power_levels, bob_join};
+
+        auto group_b = merovingian::events::StateGroup{};
+        group_b.group_id = "branch-b";
+        group_b.state = {create, join_rules, power_levels};
+
+        request.state_groups.push_back(std::move(group_a));
+        request.state_groups.push_back(std::move(group_b));
+
+        WHEN("resolve_state_v2 is called")
+        {
+            auto const result = merovingian::events::resolve_state_v2(request, *policy);
+
+            THEN("the restricted join is rejected")
+            {
+                REQUIRE(result.resolved);
+                // Spec MUST (rule 4.3.5.2): reject when join_authorised_via_users_server
+                // names a user who is not a joined member of the room.
+                REQUIRE_FALSE(result_contains_event(result, "$bob_join:example.org"));
+            }
+        }
+    }
+}
+
+// Spec: Matrix Room Versions v1.19
+// Section: Values in m.room.power_levels events must be integers
+// URL: ../../docs/matrix-v1.19-spec/rooms/v10.md
+//      ../../docs/matrix-v1.19-spec/rooms/v9.md
+//
+// Spec MUST: room versions 1-9 accept a string representation of an integer in
+// m.room.power_levels; room version 10 onwards MUST NOT. The reverse topological
+// power ordering ranks conflicted power events by their sender's power level, so
+// it has to read the level in the form the room's own version defines - reading a
+// v9 string level as absent silently demotes the sender to users_default and lets
+// a lower-power sender's event win.
+SCENARIO("Reverse topological power ordering reads string power levels only where the room version allows",
+         "[conformance][state-resolution][v2][power-levels]")
+{
+    GIVEN("two conflicted power-level events, the higher one encoding its level as a string")
+    {
+        auto const* v9 = merovingian::rooms::find_room_version_policy("9");
+        auto const* v10 = merovingian::rooms::find_room_version_policy("10");
+        REQUIRE(v9 != nullptr);
+        REQUIRE(v10 != nullptr);
+        // Spec MUST: v10 is the version that introduced the integers-only rule.
+        REQUIRE_FALSE(v9->power_levels_require_integers);
+        REQUIRE(v10->power_levels_require_integers);
+
+        auto const unconflicted = merovingian::events::StateMap{};
+
+        // @bob grants himself an integer 0; @alice grants herself the string "100".
+        auto const low =
+            make_power_levels_with_users(R"({"@bob:example.org":0})", "@bob:example.org", "$low:example.org", 10, 1);
+        auto const high = make_power_levels_with_users(R"({"@alice:example.org":"100"})", "@alice:example.org",
+                                                       "$high:example.org", 50, 1);
+        auto const conflicted = std::vector<StateEventReference>{low, high};
+
+        WHEN("the events are sorted under a room version 9 policy")
+        {
+            auto const sorted = merovingian::events::reverse_topological_power_sort(conflicted, unconflicted, *v9);
+
+            THEN("the string-encoded level is honoured and its sender sorts first")
+            {
+                REQUIRE(sorted.size() == 2U);
+                // Spec MUST: v9 accepts "100" as the power level 100, which outranks 0.
+                // Do NOT weaken - reading it as absent lets a lower-power sender's event
+                // win state resolution in every pre-v10 room.
+                REQUIRE(sorted[0].event_id == "$high:example.org");
+                REQUIRE(sorted[1].event_id == "$low:example.org");
+            }
+        }
+
+        WHEN("the same events are sorted under a room version 10 policy")
+        {
+            auto const sorted = merovingian::events::reverse_topological_power_sort(conflicted, unconflicted, *v10);
+
+            THEN("the string-encoded level is ignored and the ordering falls back to origin_server_ts")
+            {
+                REQUIRE(sorted.size() == 2U);
+                // Spec MUST: v10 rejects string power levels, so @alice falls back to
+                // users_default (0). Both senders are then 0 and rule 2 orders by the
+                // earlier origin_server_ts.
+                REQUIRE(sorted[0].event_id == "$low:example.org");
+                REQUIRE(sorted[1].event_id == "$high:example.org");
+            }
+        }
+    }
+}

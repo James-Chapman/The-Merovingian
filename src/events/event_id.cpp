@@ -109,11 +109,9 @@ auto event_id_is_valid(std::string_view event_id) noexcept -> bool
     return true;
 }
 
-auto make_content_hash_id(canonicaljson::Value const& event) -> EventIdResult
+auto make_content_hash_id(canonicaljson::Value const& event, rooms::RoomVersionPolicy const& policy) -> EventIdResult
 {
-    auto const* policy = rooms::find_room_version_policy("12");
-    return policy == nullptr ? EventIdResult{{}, "room version policy not found"}
-                             : make_reference_hash_event_id(event, *policy);
+    return make_reference_hash_event_id(event, policy);
 }
 
 auto make_content_hash(canonicaljson::Value const& event) -> EventHashResult

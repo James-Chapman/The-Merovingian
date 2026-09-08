@@ -30,7 +30,15 @@ struct EventHashResult final
     -> EventHashResult;
 [[nodiscard]] auto make_reference_hash_event_id(canonicaljson::Value const& event,
                                                 rooms::RoomVersionPolicy const& policy) -> EventIdResult;
-[[nodiscard]] auto make_content_hash_id(canonicaljson::Value const& event) -> EventIdResult;
+// Spec: Matrix Server-Server API v1.19 — Room Version 4 § Event IDs
+// URL: ../../docs/matrix-v1.19-spec/rooms/v4.md
+//
+// The event ID is "$" + the reference hash of the REDACTED event, and the
+// redaction algorithm is room-version specific, so the caller must supply the
+// event's own RoomVersionPolicy. There is no defaulted version: an ID computed
+// under the wrong room version does not match the one other servers derive.
+[[nodiscard]] auto make_content_hash_id(canonicaljson::Value const& event, rooms::RoomVersionPolicy const& policy)
+    -> EventIdResult;
 
 // Spec: Matrix Server-Server API v1.19 — Calculating the Content Hash for an Event
 // URL: ../../docs/matrix-v1.19-spec/server-server-api.md#calculating-the-content-hash-for-an-event

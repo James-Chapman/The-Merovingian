@@ -107,13 +107,15 @@ SCENARIO("Event IDs are deterministic over canonical JSON", "[events]")
 {
     GIVEN("equivalent JSON objects with different key order")
     {
+        auto const* policy = merovingian::rooms::find_room_version_policy("11");
+        REQUIRE(policy != nullptr);
         auto const first = merovingian::canonicaljson::parse_lossless("{\"b\":2,\"a\":1}");
         auto const second = merovingian::canonicaljson::parse_lossless("{\"a\":1,\"b\":2}");
 
         WHEN("content hash IDs are generated")
         {
-            auto const first_id = merovingian::events::make_content_hash_id(first.value);
-            auto const second_id = merovingian::events::make_content_hash_id(second.value);
+            auto const first_id = merovingian::events::make_content_hash_id(first.value, *policy);
+            auto const second_id = merovingian::events::make_content_hash_id(second.value, *policy);
 
             THEN("the event IDs match")
             {
@@ -126,6 +128,56 @@ SCENARIO("Event IDs are deterministic over canonical JSON", "[events]")
                 // Spec MUST: event IDs must match the URL-safe base64 format "$<hash>".
                 // Do NOT remove/change - malformed IDs are rejected by all conformant servers.
                 REQUIRE(merovingian::events::event_id_is_valid(first_id.event_id));
+            }
+        }
+    }
+}
+
+// --- Event IDs follow the event's own room version ---------------------------
+// Spec: Matrix Server-Server API v1.19
+// Section: Calculating the reference hash for an event / Redactions
+// URL: ../../docs/matrix-v1.19-spec/server-server-api.md#calculating-the-reference-hash-for-an-event
+//      ../../docs/matrix-v1.19-spec/rooms/v11.md#redactions
+//
+// The reference hash - and therefore the event ID - is computed over the
+// REDACTED event, and the redaction algorithm is room-version specific. Under
+// v1-v10 an m.room.create event keeps only content.creator; from v11 the whole
+// create content survives. An event ID helper that assumes one fixed room
+// version therefore produces the wrong ID for every other version.
+SCENARIO("Event IDs are computed with the event's own room version policy", "[events][room-version]")
+{
+    GIVEN("an m.room.create event whose content differs under v10 and v11 redaction")
+    {
+        auto const* v10 = merovingian::rooms::find_room_version_policy("10");
+        auto const* v11 = merovingian::rooms::find_room_version_policy("11");
+        REQUIRE(v10 != nullptr);
+        REQUIRE(v11 != nullptr);
+
+        auto const parsed = merovingian::canonicaljson::parse_lossless(
+            R"({"content":{"creator":"@alice:example.org","room_version":"10"},"depth":1,"origin_server_ts":1000,)"
+            R"("room_id":"!room:example.org","sender":"@alice:example.org","state_key":"","type":"m.room.create"})");
+        REQUIRE(parsed.error == merovingian::canonicaljson::ParseError::none);
+
+        WHEN("the content hash ID is computed under each room version policy")
+        {
+            auto const v10_id = merovingian::events::make_content_hash_id(parsed.value, *v10);
+            auto const v11_id = merovingian::events::make_content_hash_id(parsed.value, *v11);
+
+            THEN("each ID matches that version's reference hash and the two differ")
+            {
+                REQUIRE(v10_id.error.empty());
+                REQUIRE(v11_id.error.empty());
+                // Spec MUST: the event ID is "$" + the reference hash computed under the
+                // event's own room version. Do NOT weaken - an ID computed under the
+                // wrong version does not match what other servers derive, which breaks
+                // the room DAG.
+                REQUIRE(v10_id.event_id ==
+                        merovingian::events::make_reference_hash_event_id(parsed.value, *v10).event_id);
+                REQUIRE(v11_id.event_id ==
+                        merovingian::events::make_reference_hash_event_id(parsed.value, *v11).event_id);
+                // Spec MUST: v1-v10 redaction strips everything but content.creator from
+                // m.room.create, v11+ keeps it all, so the two hashes cannot be equal.
+                REQUIRE(v10_id.event_id != v11_id.event_id);
             }
         }
     }

@@ -362,7 +362,9 @@ SCENARIO("Reverse topological power sort orders by sender power then timestamp",
 
         WHEN("sorted by reverse topological power")
         {
-            auto const sorted = merovingian::events::reverse_topological_power_sort(conflicted, unconflicted);
+            auto const* policy = merovingian::rooms::find_room_version_policy("10");
+            REQUIRE(policy != nullptr);
+            auto const sorted = merovingian::events::reverse_topological_power_sort(conflicted, unconflicted, *policy);
 
             THEN("the high-power event comes first")
             {
