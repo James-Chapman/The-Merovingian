@@ -164,6 +164,29 @@ complete while being wrong.
 - **L-15** `make_content_hash_id` hardcoded room version 12 regardless of the
   event's actual version; it now takes the policy from the caller.
 
+### Found while reviewing the suspension allowlist
+
+- **Account suspension was bypassable through a client-chosen path segment.**
+  Not an audit finding — found while answering a question about what suspended
+  accounts may still do. `action_allowed_while_suspended` permitted its three
+  per-room actions by searching for `/leave`, `/messages` and `/redact`
+  *anywhere* in the request path, and the gate sees the raw undecoded target.
+  Several room endpoints end in a segment the client picks: the transaction ID
+  of `PUT /rooms/{roomId}/send/{eventType}/{txnId}` and the state key of
+  `PUT /rooms/{roomId}/state/{eventType}/{stateKey}`. A suspended user who
+  named their transaction `redact` could therefore send arbitrary messages, and
+  one who named a state key `redact` could write room state — both returning
+  `200`, defeating suspension for the two actions it most exists to block.
+
+  The allowlist now matches the *action segment* — the path segment immediately
+  after the room ID — by exact comparison. Anything added to this gate in future
+  must be anchored to a segment the client cannot choose.
+
+  Note also that the gate cannot enforce the spec's "redact **their own**
+  events", because it cannot see the target event's sender. That endpoint is not
+  routed today (`404 M_UNRECOGNIZED`); whoever implements it owns the ownership
+  check, and the comment at the gate says so.
+
 ### Also fixed
 
 - Three defects the branch's own first verification run surfaced in its new

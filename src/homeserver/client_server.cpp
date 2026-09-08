@@ -899,23 +899,47 @@ namespace
             return true;
         }
         // Per-room allowed actions: leave/reject invites, read /messages, redact.
-        if (starts_with(path, "/_matrix/client/v3/rooms/"))
+        //
+        // Matched on the ACTION SEGMENT — the path segment immediately after the
+        // room ID — never as a substring of the whole path. Several room
+        // endpoints end in a segment the client chooses: the transaction ID of
+        // `PUT /rooms/{roomId}/send/{eventType}/{txnId}` and the state key of
+        // `PUT /rooms/{roomId}/state/{eventType}/{stateKey}`. A substring test
+        // let a suspended user name their transaction "redact" and send
+        // arbitrary messages, or name a state key "redact" and write room
+        // state — defeating suspension for the two actions it most needs to
+        // block. Anything matching here must be anchored to a segment the
+        // client cannot choose.
+        auto constexpr rooms_prefix = std::string_view{"/_matrix/client/v3/rooms/"};
+        if (starts_with(path, rooms_prefix))
         {
-            auto constexpr leave_marker = std::string_view{"/leave"};
-            auto constexpr messages_marker = std::string_view{"/messages"};
-            auto constexpr redact_marker = std::string_view{"/redact"};
-            // PUT /rooms/{roomId}/redact/{eventId} — redacting (own events).
-            if (method == "PUT" && path.find(redact_marker) != std::string_view::npos)
+            auto const after_prefix = path.substr(rooms_prefix.size());
+            auto const room_id_end = after_prefix.find('/');
+            if (room_id_end == std::string_view::npos)
+            {
+                return false;
+            }
+            auto const after_room = after_prefix.substr(room_id_end + 1U);
+            auto const action_end = after_room.find('/');
+            auto const action = after_room.substr(0U, action_end);
+
+            // PUT /rooms/{roomId}/redact/{eventId}/{txnId} — redaction. The
+            // spec permits a suspended user to redact *their own* events; this
+            // gate cannot see the target event's sender, so the handler must
+            // enforce ownership itself. That endpoint is not routed today (it
+            // answers 404 M_UNRECOGNIZED); whoever implements it owns that
+            // check.
+            if (method == "PUT" && action == "redact")
             {
                 return true;
             }
             // POST /rooms/{roomId}/leave — leave a room or reject an invite.
-            if (method == "POST" && path.find(leave_marker) != std::string_view::npos)
+            if (method == "POST" && action == "leave")
             {
                 return true;
             }
             // GET /rooms/{roomId}/messages — see and receive messages.
-            if (method == "GET" && path.find(messages_marker) != std::string_view::npos)
+            if (method == "GET" && action == "messages")
             {
                 return true;
             }
@@ -9386,9 +9410,8 @@ static auto handle_client_server_request_impl(ClientServerRuntime& rt, LocalHttp
             // 2026-09); it used to be the constant "merovingian-ui-auth",
             // shared by every client and every attempt.
             auto const uia_challenge = json_serialize(json_obj({
-                json_member(
-                    "flows",
-                    json_arr({json_obj({json_member("stages", json_arr({json_str("m.login.registration_token")}))})})),
+                json_member("flows", json_arr({json_obj({json_member(
+                                         "stages", json_arr({json_str("m.login.registration_token")}))})})),
                 json_member("params", json_obj({})),
                 json_member("session", json_str(issue_uia_session(rt, "register"))),
             }));

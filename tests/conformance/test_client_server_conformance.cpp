@@ -4187,6 +4187,92 @@ SCENARIO("A suspended account receives M_USER_SUSPENDED on disallowed actions on
     }
 }
 
+// --- Account suspension: the allowlist must not be substring-matchable -------
+// Spec: Matrix Client-Server API v1.19
+// Section: Account suspension
+// URL: ../../docs/matrix-v1.19-spec/client-server-api.md#account-suspension
+//
+// The suspension allowlist permits three per-room actions by looking for
+// "/leave", "/messages" and "/redact" anywhere in the request path. Several
+// room endpoints end in a client-controlled path segment -- the transaction ID
+// of POST /rooms/{roomId}/send/{eventType}/{txnId}, and the state key of
+// PUT /rooms/{roomId}/state/{eventType}/{stateKey}. The gate sees the raw
+// undecoded target, so a client that simply names its transaction "leave"
+// produces a path containing "/leave".
+//
+// If the allowlist matched that, a suspended account could send messages --
+// the single action suspension exists to stop -- by choosing a transaction ID.
+SCENARIO("A suspended account cannot reach a blocked action by naming a path segment after an allowed one",
+         "[conformance][client-server][server-admin][account][security]")
+{
+    GIVEN("a running client-server with a suspended user who is in a room")
+    {
+        auto started = merovingian::homeserver::start_client_server(conformance_config());
+        REQUIRE(started.started);
+        auto const token = logged_in_token(started.runtime); // alice, DEVICE1
+        auto const room_id = create_room(started.runtime, token);
+        auto const admin = admin_token(started.runtime, "admin");
+        REQUIRE(merovingian::homeserver::handle_client_server_request(
+                    started.runtime,
+                    {"PUT", "/_matrix/client/v1/admin/suspend/%40alice%3Aexample.org", admin, R"({"suspended":true})"})
+                    .response.status == 200U);
+
+        WHEN("the suspended user sends a message with an ordinary transaction ID")
+        {
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"PUT", "/_matrix/client/v3/rooms/" + room_id + "/send/m.room.message/txn1", token,
+                                  R"({"msgtype":"m.text","body":"hello"})"});
+
+            THEN("the server returns 403 M_USER_SUSPENDED")
+            {
+                REQUIRE(response.response.status == 403U);
+                REQUIRE(*string_member(parse_object(response.response.body), "errcode") == "M_USER_SUSPENDED");
+            }
+        }
+
+        WHEN("the suspended user names the transaction \"redact\"")
+        {
+            // PUT is the method the allowlist accepts for "/redact", and the
+            // transaction ID is the last path segment, so a substring match
+            // hands a suspended user the send endpoint for free.
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"PUT", "/_matrix/client/v3/rooms/" + room_id + "/send/m.room.message/redact", token,
+                                  R"({"msgtype":"m.text","body":"hello"})"});
+
+            THEN("the transaction ID does not buy access to a blocked action")
+            {
+                REQUIRE(response.response.status == 403U);
+                REQUIRE(*string_member(parse_object(response.response.body), "errcode") == "M_USER_SUSPENDED");
+            }
+        }
+
+        WHEN("the suspended user names a state key \"redact\"")
+        {
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"PUT", "/_matrix/client/v3/rooms/" + room_id + "/state/m.room.topic/redact", token,
+                                  R"({"topic":"owned"})"});
+
+            THEN("the state key does not buy access to a blocked action")
+            {
+                REQUIRE(response.response.status == 403U);
+                REQUIRE(*string_member(parse_object(response.response.body), "errcode") == "M_USER_SUSPENDED");
+            }
+        }
+
+        WHEN("the suspended user reads room messages normally")
+        {
+            auto const response = merovingian::homeserver::handle_client_server_request(
+                started.runtime, {"GET", "/_matrix/client/v3/rooms/" + room_id + "/messages?limit=10", token, {}});
+
+            THEN("the permitted read still works")
+            {
+                // Spec SHOULD: suspended users may see and receive messages.
+                REQUIRE(response.response.status == 200U);
+            }
+        }
+    }
+}
+
 // --- Account suspension: login still permitted --------------------------------
 // Spec: Matrix Client-Server API v1.19
 // Section: Account suspension

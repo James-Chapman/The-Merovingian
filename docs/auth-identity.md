@@ -496,6 +496,13 @@ The boundary establishes these guarantees:
 - Locked accounts cannot pass the login policy gate; suspended accounts may
   still log in, and their new session is itself suspended and gated by the
   request-path `M_USER_SUSPENDED` check.
+- The suspension allowlist matches on the **action segment** — the path segment
+  immediately after the room ID — never as a substring of the whole path. The
+  gate sees the raw undecoded target, and several room endpoints end in a
+  segment the client chooses (`{txnId}` on `send`, `{stateKey}` on `state`), so
+  a substring test let a suspended user name their transaction `redact` and send
+  arbitrary messages. Anything added to this gate must be anchored to a segment
+  the client cannot choose.
 - Token *rotation* is gated as well as token issue. `POST /refresh`
   authenticates with a refresh token, so it never reaches the request-path
   moderation gate — `refresh_local_session` therefore carries the locked-account
