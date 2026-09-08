@@ -3,12 +3,9 @@
 
 #include "merovingian/database/persistent_store.hpp"
 
-#include "merovingian/core/secret_buffer.hpp"
-
-#include <span>
-
 #include "merovingian/canonicaljson/parser.hpp"
 #include "merovingian/canonicaljson/serializer.hpp"
+#include "merovingian/core/secret_buffer.hpp"
 #include "merovingian/crypto/constant_time.hpp"
 #include "merovingian/observability/logger.hpp"
 #include "merovingian/observability/observability.hpp"
@@ -20,6 +17,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -47,8 +45,7 @@ namespace
 } // namespace
 
 PersistentServerSigningKey::PersistentServerSigningKey(std::string server_name_value, std::string key_id_value,
-                                                       std::string public_key_value,
-                                                       std::uint64_t valid_until_ts_value,
+                                                       std::string public_key_value, std::uint64_t valid_until_ts_value,
                                                        std::string secret_key_value)
     : server_name{std::move(server_name_value)}
     , key_id{std::move(key_id_value)}
@@ -566,17 +563,17 @@ namespace
     }
     // Columns are named explicitly rather than relying on a bare VALUES list:
     // positional inserts silently break the moment the table gains a column.
-    if (!record_and_persist(
-            store, record_statement("insert_user",
-                                    "INSERT INTO users (user_id, password_hash, locked, suspended, admin, "
-                                    "deactivated) VALUES ($1, $2, $3, $4, $5, $6)",
-                                    {
-                                        {user.user_id,                        false},
-                                        {user.password_hash,                  true },
-                                        {user.locked ? "true" : "false",      false},
-                                        {user.suspended ? "true" : "false",   false},
-                                        {user.admin ? "true" : "false",       false},
-                                        {user.deactivated ? "true" : "false", false}
+    if (!record_and_persist(store,
+                            record_statement("insert_user",
+                                             "INSERT INTO users (user_id, password_hash, locked, suspended, admin, "
+                                             "deactivated) VALUES ($1, $2, $3, $4, $5, $6)",
+                                             {
+                                                 {user.user_id,                        false},
+                                                 {user.password_hash,                  true },
+                                                 {user.locked ? "true" : "false",      false},
+                                                 {user.suspended ? "true" : "false",   false},
+                                                 {user.admin ? "true" : "false",       false},
+                                                 {user.deactivated ? "true" : "false", false}
     })))
     {
         return false;
@@ -615,9 +612,8 @@ namespace
     {
         return false;
     }
-    auto const statement = record_statement("update_user_deactivated",
-                                            "UPDATE users SET deactivated = 'true' WHERE user_id = $1",
-                                            {public_value(user_id)});
+    auto const statement = record_statement(
+        "update_user_deactivated", "UPDATE users SET deactivated = 'true' WHERE user_id = $1", {public_value(user_id)});
     if (!record_and_persist(store, statement))
     {
         return false;
@@ -921,45 +917,51 @@ namespace
 // There is deliberately no inverse "restore" helper: no code path should be
 // able to un-revoke a credential. Revocation is one-way, so that a token which
 // has ever been revoked can never authenticate again.
-[[nodiscard]] auto revoke_tokens_for_user_except_device(
-    PersistentStore &store, std::string_view user_id,
-    std::string_view keep_device_id) -> std::size_t {
-  auto revoked = std::size_t{0U};
-  if (record_and_persist(
-          store,
-          record_statement(
-              "revoke_user_access_tokens_except_device",
-              "UPDATE access_tokens SET revoked = $1 WHERE user_id = $2 AND "
-              "device_id <> $3",
-              {{"true", false},
-               {std::string{user_id}, false},
-               {std::string{keep_device_id}, false}}))) {
-    for (auto &token : store.access_tokens) {
-      if (token.user_id == user_id && token.device_id != keep_device_id &&
-          !token.revoked) {
-        token.revoked = true;
-        ++revoked;
-      }
+[[nodiscard]] auto revoke_tokens_for_user_except_device(PersistentStore& store, std::string_view user_id,
+                                                        std::string_view keep_device_id) -> std::size_t
+{
+    auto revoked = std::size_t{0U};
+    if (record_and_persist(
+            store, record_statement(
+                       "revoke_user_access_tokens_except_device",
+                       "UPDATE access_tokens SET revoked = $1 WHERE user_id = $2 AND "
+                       "device_id <> $3",
+                       {
+                           {"true",                      false},
+                           {std::string{user_id},        false},
+                           {std::string{keep_device_id}, false}
+    })))
+    {
+        for (auto& token : store.access_tokens)
+        {
+            if (token.user_id == user_id && token.device_id != keep_device_id && !token.revoked)
+            {
+                token.revoked = true;
+                ++revoked;
+            }
+        }
     }
-  }
-  if (record_and_persist(
-          store,
-          record_statement(
-              "revoke_user_refresh_tokens_except_device",
-              "UPDATE refresh_tokens SET revoked = $1 WHERE user_id = $2 AND "
-              "device_id <> $3",
-              {{"true", false},
-               {std::string{user_id}, false},
-               {std::string{keep_device_id}, false}}))) {
-    for (auto &token : store.refresh_tokens) {
-      if (token.user_id == user_id && token.device_id != keep_device_id &&
-          !token.revoked) {
-        token.revoked = true;
-        ++revoked;
-      }
+    if (record_and_persist(
+            store, record_statement(
+                       "revoke_user_refresh_tokens_except_device",
+                       "UPDATE refresh_tokens SET revoked = $1 WHERE user_id = $2 AND "
+                       "device_id <> $3",
+                       {
+                           {"true",                      false},
+                           {std::string{user_id},        false},
+                           {std::string{keep_device_id}, false}
+    })))
+    {
+        for (auto& token : store.refresh_tokens)
+        {
+            if (token.user_id == user_id && token.device_id != keep_device_id && !token.revoked)
+            {
+                token.revoked = true;
+                ++revoked;
+            }
+        }
     }
-  }
-  return revoked;
+    return revoked;
 }
 
 [[nodiscard]] auto update_device_display_name(PersistentStore& store, std::string_view user_id,
@@ -2285,12 +2287,19 @@ auto apply_store_event_with_state(PersistentStore& store, PreparedStateUpdate co
                              "INSERT INTO media_blobs VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (storage_id) DO "
                              "UPDATE SET hash_algorithm = $2, digest = $3, size_bytes = $4, bytes = $5, ref_count = $6",
                              {
-                                 {blob.storage_id,                 false},
-                                 {blob.hash_algorithm,             false},
-                                 {blob.digest,                     false},
+                                 {blob.storage_id, false},
+                                 {blob.hash_algorithm, false},
+                                 {blob.digest, false},
                                  {std::to_string(blob.size_bytes), false},
-                                 {blob.bytes,                      true },
-                                 {std::to_string(blob.ref_count),  false}
+                                 // M-09: raw binary payload — mark it `binary`
+                                 // so the PostgreSQL backend hex-encodes it
+                                 // instead of sending it as a null-terminated
+                                 // C string, which would truncate at any
+                                 // embedded NUL byte. `sensitive` stays true
+                                 // so the content itself never reaches a
+                                 // query trace or log either.
+                                 {blob.bytes, true, true},
+                                 {std::to_string(blob.ref_count), false}
     })))
     {
         return false;
@@ -2784,8 +2793,13 @@ auto restore_sync_stream_id(PersistentStore& store) -> void
         {public_value(binding.user_id), public_value(binding.medium), public_value(binding.address),
          public_value(binding.country.value_or("")), public_value(binding.id_server.value_or("")),
          public_value(std::to_string(binding.added_at_ms)), public_value(std::to_string(binding.validated_at_ms)),
-         public_value(binding.bound ? "true" : "false"), public_value(binding.client_secret.value_or("")),
-         public_value(binding.sid.value_or(""))});
+         public_value(binding.bound ? "true" : "false"),
+         // M-08: client_secret/sid are the IS-delegated unbind auth-mode-2
+         // credential pair (docs/threat-model.md). They must never surface in
+         // a query trace or diagnostic log, so bind them sensitive like every
+         // other secret value in this file (see sensitive_value() call sites
+         // above).
+         sensitive_value(binding.client_secret.value_or("")), sensitive_value(binding.sid.value_or(""))});
     if (!record_and_persist(store, statement))
     {
         return false;

@@ -25,6 +25,67 @@
 
 namespace merovingian::database
 {
+
+auto encode_postgresql_bytea_hex(std::string_view bytes) -> std::string
+{
+    static constexpr char hex_digits[] = "0123456789abcdef";
+    auto encoded = std::string{};
+    encoded.reserve(2U + (bytes.size() * 2U));
+    encoded.append("\\x");
+    for (unsigned char const byte : bytes)
+    {
+        encoded.push_back(hex_digits[byte >> 4U]);
+        encoded.push_back(hex_digits[byte & 0x0FU]);
+    }
+    return encoded;
+}
+
+auto decode_postgresql_bytea_hex(std::string_view hex_text) -> std::string
+{
+    // Anything that isn't the `\x` hex prefix PostgreSQL's default
+    // bytea_output writes cannot be one of our encoded values — fail closed
+    // with an empty string rather than guess at a different encoding.
+    if (hex_text.size() < 2U || hex_text[0] != '\\' || hex_text[1] != 'x')
+    {
+        return {};
+    }
+
+    auto const nibble = [](char character) -> int {
+        if (character >= '0' && character <= '9')
+        {
+            return character - '0';
+        }
+        if (character >= 'a' && character <= 'f')
+        {
+            return character - 'a' + 10;
+        }
+        if (character >= 'A' && character <= 'F')
+        {
+            return character - 'A' + 10;
+        }
+        return -1;
+    };
+
+    if ((hex_text.size() - 2U) % 2U != 0U)
+    {
+        return {}; // An odd number of hex digits cannot represent whole bytes.
+    }
+
+    auto decoded = std::string{};
+    decoded.reserve((hex_text.size() - 2U) / 2U);
+    for (auto index = std::size_t{2U}; index < hex_text.size(); index += 2U)
+    {
+        auto const high = nibble(hex_text[index]);
+        auto const low = nibble(hex_text[index + 1U]);
+        if (high < 0 || low < 0)
+        {
+            return {}; // Malformed hex digit; fail closed rather than return garbage bytes.
+        }
+        decoded.push_back(static_cast<char>((high << 4) | low));
+    }
+    return decoded;
+}
+
 namespace
 {
 
@@ -230,11 +291,28 @@ namespace
             return {false, "too many PostgreSQL statement parameters", {}};
         }
 
+        // M-09: parameters marked `binary` (e.g. media_blobs.bytes) are
+        // hex-encoded into PostgreSQL's bytea text literal so the raw bytes
+        // never travel as a null-terminated C string — see
+        // encode_postgresql_bytea_hex's doc comment. `encoded_values` must
+        // outlive the PQexecParams call below, so it is reserved up front:
+        // pushing into a vector that never reallocates keeps every
+        // `.c_str()` pointer taken from it valid for the whole function.
+        auto encoded_values = std::vector<std::string>{};
+        encoded_values.reserve(statement.parameters.size());
         auto parameter_values = std::vector<char const*>{};
         parameter_values.reserve(statement.parameters.size());
         for (auto const& parameter : statement.parameters)
         {
-            parameter_values.push_back(parameter.value.c_str());
+            if (parameter.binary)
+            {
+                encoded_values.push_back(encode_postgresql_bytea_hex(parameter.value));
+                parameter_values.push_back(encoded_values.back().c_str());
+            }
+            else
+            {
+                parameter_values.push_back(parameter.value.c_str());
+            }
         }
 
         auto* const values = parameter_values.empty() ? nullptr : parameter_values.data();
@@ -391,10 +469,9 @@ namespace
 
     auto load_persistent_rows(PostgresqlConnection& connection, PersistentStore& store) -> bool
     {
-        auto users =
-            query_rows(connection, "postgresql_load_users",
-                       "SELECT user_id, password_hash, locked, suspended, admin, deactivated FROM users "
-                       "ORDER BY user_id");
+        auto users = query_rows(connection, "postgresql_load_users",
+                                "SELECT user_id, password_hash, locked, suspended, admin, deactivated FROM users "
+                                "ORDER BY user_id");
         if (!users.ok)
         {
             return false;
@@ -403,8 +480,8 @@ namespace
         {
             if (row.size() >= 6U)
             {
-                store.users.push_back({row[0], row[1], text_is_true(row[2]), text_is_true(row[3]),
-                                       text_is_true(row[4]), text_is_true(row[5])});
+                store.users.push_back({row[0], row[1], text_is_true(row[2]), text_is_true(row[3]), text_is_true(row[4]),
+                                       text_is_true(row[5])});
             }
         }
 
@@ -773,7 +850,12 @@ namespace
         {
             if (row.size() >= 6U)
             {
-                store.media_blobs.push_back({row[0], row[1], row[2], parse_u64(row[3]), row[4], parse_u64(row[5])});
+                // M-09: `bytes` was written through the binary parameter path
+                // (execute_prepared_statement's encode_postgresql_bytea_hex),
+                // and comes back as PostgreSQL's `\x`-hex bytea text
+                // representation — decode it to recover the original bytes.
+                store.media_blobs.push_back({row[0], row[1], row[2], parse_u64(row[3]),
+                                             decode_postgresql_bytea_hex(row[4]), parse_u64(row[5])});
             }
         }
 
@@ -1202,6 +1284,61 @@ namespace
         return state;
     }
 
+    // M-10: a session-scoped advisory lock held for the whole migration plan.
+    //
+    // Each step commits in its own transaction, so without a lease spanning the
+    // plan two server processes starting against the same database interleave
+    // their DDL: duplicate ledger inserts, a step applied twice, or a chain that
+    // fails half-way and leaves the schema at an intermediate version. A
+    // transaction-scoped lock would not help, because the window that needs
+    // protecting is *between* the transactions.
+    //
+    // RAII rather than a paired call: every early return in the plan loop below
+    // must release the lock, and there are several. pg_advisory_unlock is also
+    // best-effort by nature — the session ending releases it anyway, which is
+    // what makes a crashed migrator recoverable without operator action.
+    class PostgresqlMigrationLease final
+    {
+    public:
+        explicit PostgresqlMigrationLease(PostgresqlConnection& connection)
+            : connection_{connection}
+        {
+            // Blocks until the lock is free, which is the intent: the second
+            // process waits for the first to finish rather than racing it.
+            held_ = connection_
+                        .execute(record_statement("postgresql_migration_lock", "SELECT pg_advisory_lock($1)",
+                                                  {public_value(std::to_string(migration_lock_key))}))
+                        .ok;
+        }
+
+        PostgresqlMigrationLease(PostgresqlMigrationLease const&) = delete;
+        auto operator=(PostgresqlMigrationLease const&) -> PostgresqlMigrationLease& = delete;
+        PostgresqlMigrationLease(PostgresqlMigrationLease&&) = delete;
+        auto operator=(PostgresqlMigrationLease&&) -> PostgresqlMigrationLease& = delete;
+
+        ~PostgresqlMigrationLease()
+        {
+            if (!held_)
+            {
+                return;
+            }
+            std::ignore =
+                connection_.execute(record_statement("postgresql_migration_unlock", "SELECT pg_advisory_unlock($1)",
+                                                     {public_value(std::to_string(migration_lock_key))}));
+        }
+
+        [[nodiscard]] auto held() const noexcept -> bool
+        {
+            return held_;
+        }
+
+    private:
+        static constexpr auto migration_lock_key = postgresql_migration_lock_key;
+
+        PostgresqlConnection& connection_;
+        bool held_{false};
+    };
+
     [[nodiscard]] auto apply_pending_migrations(PostgresqlConnection& connection, SchemaState state)
         -> std::optional<SchemaState>
     {
@@ -1209,6 +1346,17 @@ namespace
         auto const validation = migration_plan_is_valid(plan);
         if (!validation.valid)
         {
+            return std::nullopt;
+        }
+        // Taken before the first step and released only after the plan is
+        // complete (this object outlives every return path below).
+        auto const lease = PostgresqlMigrationLease{connection};
+        if (!lease.held() && !plan.steps.empty())
+        {
+            // Fail closed: running an unserialised plan is the defect this
+            // lease exists to prevent, so refuse rather than proceed alone. The
+            // caller reports "unable to migrate PostgreSQL schema"; there is no
+            // log_diagnostic in scope here (it is defined below this helper).
             return std::nullopt;
         }
         for (auto const& step : plan.steps)
@@ -1369,8 +1517,7 @@ auto open_postgresql_connection(std::string_view conninfo) -> PostgresqlConnecti
 }
 
 auto open_postgresql_persistent_store(std::string_view conninfo, std::string_view runtime_role,
-                                      std::string_view migration_role)
-    -> PersistentStoreOpenResult
+                                      std::string_view migration_role) -> PersistentStoreOpenResult
 {
     log_diagnostic("store.opening", {
                                         {"backend", "postgresql", false}
@@ -1455,15 +1602,16 @@ auto open_postgresql_persistent_store(std::string_view conninfo, std::string_vie
         auto migrated = apply_pending_migrations(connection, store.schema);
         if (!migrated.has_value())
         {
-            log_diagnostic("store.rejected",
-                           {
-                               {"reason", migration_role.empty()
-                                              ? std::string{"migration failed"}
-                                              : std::string{"migration failed as the configured migration role; if "
-                                                            "this is an upgrade, the schema objects may still be owned "
-                                                            "by the login role -- see the ownership transfer step in "
-                                                            "packaging/postgresql/provision-roles.sql"},
-                                false}
+            log_diagnostic(
+                "store.rejected",
+                {
+                    {"reason",
+                     migration_role.empty() ? std::string{"migration failed"}
+                                            : std::string{"migration failed as the configured migration role; if "
+                                                          "this is an upgrade, the schema objects may still be owned "
+                                                          "by the login role -- see the ownership transfer step in "
+                                                          "packaging/postgresql/provision-roles.sql"},
+                     false}
             });
             return {false, "unable to migrate PostgreSQL schema", {}};
         }
@@ -1797,8 +1945,7 @@ namespace detail
     }
 
     auto load_room_snapshot_from_postgresql(std::string_view conninfo, std::string_view runtime_role,
-                                            std::string_view room_id)
-        -> std::optional<RoomReloadSnapshot>
+                                            std::string_view room_id) -> std::optional<RoomReloadSnapshot>
     {
         if (conninfo.empty())
         {

@@ -320,6 +320,37 @@ namespace
         return transaction.commit();
     }
 
+    // True when `step` is already recorded in the ledger in the same direction.
+    // Called inside the step's own BEGIN IMMEDIATE transaction so the answer
+    // cannot change between the check and the apply.
+    [[nodiscard]] auto migration_step_already_applied(sqlite3& connection, MigrationStep const& step) -> bool
+    {
+        auto statement =
+            prepare(connection, "SELECT direction FROM schema_migrations WHERE version = ?1");
+        if (!statement.has_value())
+        {
+            return false;
+        }
+        auto& handle = *statement->get();
+        auto const version_text = std::to_string(step.version);
+        if (sqlite3_bind_text(&handle, 1, version_text.c_str(), static_cast<int>(version_text.size()),
+                              sqlite_transient_destructor()) != SQLITE_OK)
+        {
+            return false;
+        }
+        if (sqlite3_step(&handle) != SQLITE_ROW)
+        {
+            return false;
+        }
+        auto const* recorded = sqlite3_column_text(&handle, 0);
+        if (recorded == nullptr)
+        {
+            return false;
+        }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        return std::string_view{reinterpret_cast<char const*>(recorded)} == migration_direction_name(step.direction);
+    }
+
     auto apply_pending_migrations(sqlite3& connection, SchemaState state) -> std::optional<SchemaState>
     {
         auto const plan = migration_plan_for(state);
@@ -336,6 +367,27 @@ namespace
             if (!transaction.active())
             {
                 return std::nullopt;
+            }
+
+            // M-10: re-read the ledger *inside* the step transaction before
+            // applying it. Each step commits separately, so a plan computed
+            // from a schema state read moments earlier can race a second
+            // process that already applied this step -- the DDL would then
+            // fail ("table already exists") and leave the schema stranded
+            // part-way. BEGIN IMMEDIATE above serialises the check and the
+            // apply, so the loser of the race observes the winner's row and
+            // skips the step instead of re-running it. This is what makes the
+            // runner idempotent under concurrency, which migrations/AGENTS.md
+            // requires. (PostgreSQL takes a plan-wide advisory lock instead;
+            // SQLite has no cross-process lock that can span the separate
+            // per-step transactions without deadlocking against them.)
+            if (migration_step_already_applied(connection, step))
+            {
+                if (!transaction.commit())
+                {
+                    return std::nullopt;
+                }
+                continue;
             }
 
             for (auto const& statement : step.statements)

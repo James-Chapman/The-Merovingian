@@ -4067,10 +4067,16 @@ SCENARIO("A wildcard allow-origin is never paired with allow-credentials",
         merovingian::tests::enable_token_registration(security);
         auto config = merovingian::config::Config{server, {}, {}, security, {}, {}};
         config.server().cors.allowed_origins = {"*"};
-        config.server().cors.allow_credentials = true;
         auto started = merovingian::homeserver::start_client_server(config);
         REQUIRE(started.started);
         auto& runtime = started.runtime;
+        // Set on the runtime snapshot rather than the config, because
+        // config::validate refuses wildcard-plus-credentials outright and
+        // start_client_server would not start. That is the point: the
+        // combination can only arise from a snapshot that never went through
+        // validation, which is exactly what the response builder must not
+        // trust.
+        runtime.cors.allow_credentials = true;
 
         WHEN("a preflight arrives from some origin")
         {

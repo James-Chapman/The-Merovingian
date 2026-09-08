@@ -356,6 +356,72 @@ SCENARIO("PostgreSQL media metadata survives an open/close/reopen cycle",
     }
 }
 
+// M-09: execute_prepared_statement used to send every PostgreSQL parameter
+// as a null-terminated C string, so media_blobs.bytes (a BYTEA column)
+// truncated at any embedded NUL byte and could not carry arbitrary binary
+// content such as real image bytes. The fix hex-encodes parameters marked
+// `binary` before binding them and decodes the bytea column on read; this
+// exercises that round trip against a live server, matching the SQLite
+// coverage in tests/unit/test_database_persistence.cpp's #448 regression.
+SCENARIO("PostgreSQL media blob bytes round-trip exactly through a real BYTEA column, including embedded NULs",
+         "[database][postgresql][integration][media][binary]")
+{
+    GIVEN("a live PostgreSQL URI and a blob payload covering every byte value")
+    {
+        auto const uri = postgresql_uri_from_environment();
+        if (uri.empty())
+        {
+            SUCCEED("skipped: MEROVINGIAN_TEST_POSTGRESQL_URI is not set");
+            return;
+        }
+        auto opened = merovingian::database::open_postgresql_persistent_store(uri);
+        REQUIRE(opened.ok);
+
+        auto payload = std::string{"\x89PNG"};
+        payload.push_back('\0');
+        payload.push_back('\0');
+        for (auto value = 0; value <= 255; ++value)
+        {
+            payload.push_back(static_cast<char>(value));
+        }
+        payload += "tail";
+
+        auto const suffix = unique_test_suffix();
+        auto const storage_id = "pg-binary-blob-" + suffix;
+        auto const digest = std::string(64U, 'd');
+
+        WHEN("the blob is stored and read back on the same store handle")
+        {
+            REQUIRE(merovingian::database::store_media_blob(
+                opened.store,
+                {storage_id, "blake2b", digest, static_cast<std::uint64_t>(payload.size()), payload, 1U}));
+            auto const found_immediately = merovingian::database::find_media_blob(opened.store, storage_id);
+
+            THEN("the in-memory mirror already carries every byte exactly")
+            {
+                REQUIRE(found_immediately.has_value());
+                REQUIRE(found_immediately->bytes.size() == payload.size());
+                REQUIRE(found_immediately->bytes == payload);
+            }
+
+            AND_WHEN("the store is closed and reopened, forcing a real round trip through PostgreSQL")
+            {
+                opened = {};
+                auto reopened = merovingian::database::open_postgresql_persistent_store(uri);
+
+                THEN("the blob survives with every byte intact, including the NULs and high bytes")
+                {
+                    REQUIRE(reopened.ok);
+                    auto const reloaded = merovingian::database::find_media_blob(reopened.store, storage_id);
+                    REQUIRE(reloaded.has_value());
+                    REQUIRE(reloaded->bytes.size() == payload.size());
+                    REQUIRE(reloaded->bytes == payload);
+                }
+            }
+        }
+    }
+}
+
 SCENARIO("PostgreSQL role separation: runtime role cannot execute DDL", "[database][postgresql][integration][roles]")
 {
     GIVEN("a live PostgreSQL URI plus migration and runtime role names")
@@ -785,8 +851,7 @@ SCENARIO("PostgreSQL store open assumes the configured roles and fails closed ot
 
         WHEN("the store is opened with the provisioned runtime role")
         {
-            auto const opened =
-                merovingian::database::open_postgresql_persistent_store(uri, runtime_role);
+            auto const opened = merovingian::database::open_postgresql_persistent_store(uri, runtime_role);
 
             THEN("the open succeeds")
             {
@@ -796,7 +861,8 @@ SCENARIO("PostgreSQL store open assumes the configured roles and fails closed ot
 
         WHEN("the store is opened naming a runtime role that cannot be assumed")
         {
-            auto const opened = merovingian::database::open_postgresql_persistent_store(uri, "merovingian_role_that_does_not_exist");
+            auto const opened =
+                merovingian::database::open_postgresql_persistent_store(uri, "merovingian_role_that_does_not_exist");
 
             THEN("the open is refused rather than serving with wider privileges")
             {
@@ -871,8 +937,8 @@ namespace
             }
             // Object names here come from the catalogue for a schema this test
             // just created, not from user input.
-            auto const sql = std::string{alter_prefix} + "\"" + row.front() + "\" OWNER TO \"" +
-                             std::string{migration_role} + "\"";
+            auto const sql =
+                std::string{alter_prefix} + "\"" + row.front() + "\" OWNER TO \"" + std::string{migration_role} + "\"";
             if (!connection.connection.execute({"alter_object_owner", sql, {}}).ok)
             {
                 return false;

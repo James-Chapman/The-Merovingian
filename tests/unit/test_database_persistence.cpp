@@ -411,6 +411,30 @@ SCENARIO("Persistent store upserts, finds, and deletes durable 3PID bindings", "
                 REQUIRE(store.account_threepids.empty());
             }
         }
+
+        WHEN("alice binds a 3PID with an IS-delegated unbind credential pair (auth mode 2)")
+        {
+            REQUIRE(merovingian::database::store_account_threepid(
+                store, {"@alice:example.org", "email", "alice@example.org", std::nullopt,
+                        std::optional<std::string>{"is.example.org"}, 1000U, 2000U, true,
+                        std::optional<std::string>{"s3kr3t-client-secret"}, std::optional<std::string>{"sid-123"}}));
+
+            THEN("client_secret and sid are bound as sensitive values so they never reach query traces or logs "
+                 "(M-08)")
+            {
+                REQUIRE(store.prepared_statements.size() == 1U);
+                auto const& parameters = store.prepared_statements.back().parameters;
+                // upsert_account_threepid binds (user_id, medium, address, country,
+                // id_server, added_at_ms, validated_at_ms, bound, client_secret, sid);
+                // client_secret is index 8, sid is index 9.
+                REQUIRE(parameters.size() == 10U);
+                REQUIRE(parameters[8].value == "s3kr3t-client-secret");
+                REQUIRE(parameters[8].sensitive);
+                REQUIRE(parameters[9].value == "sid-123");
+                REQUIRE(parameters[9].sensitive);
+                REQUIRE(merovingian::database::sensitive_values_are_redacted(store));
+            }
+        }
     }
 }
 
@@ -1119,8 +1143,7 @@ SCENARIO("migration 013_appservice_txn_cursor applies cleanly on top of a databa
 
         WHEN("the plan to the current schema version is built and applied")
         {
-            auto const plan =
-                merovingian::database::migration_plan_between(12U, 13U);
+            auto const plan = merovingian::database::migration_plan_between(12U, 13U);
             auto const applied = merovingian::database::apply_migration_plan(state_at_v12, plan);
 
             THEN("exactly one step runs: 013_appservice_txn_cursor, taking the database to v13")
@@ -2925,6 +2948,107 @@ SCENARIO("Persistent store round-trips binary media blob bytes containing NUL an
     }
 }
 
+// M-09: PostgreSQL's execute_prepared_statement sent every parameter as a
+// null-terminated C string, so media_blobs.bytes (a BYTEA column) truncated
+// at any embedded NUL and could otherwise be corrupted, even though SQLite's
+// length-based bind already round-trips the same bytes exactly (see the
+// #448 regression above). The fix marks the bytes parameter `binary` so the
+// PostgreSQL backend hex-encodes it instead of relying on a C-string
+// boundary; these two scenarios cover that without needing a live database.
+SCENARIO("store_media_blob marks the raw bytes parameter binary for the PostgreSQL backend",
+         "[database][persistence][media][binary][postgresql]")
+{
+    GIVEN("an in-memory persistent store")
+    {
+        auto store = merovingian::database::PersistentStore{};
+
+        WHEN("a media blob is stored")
+        {
+            auto const digest = std::string(64U, 'c');
+            REQUIRE(merovingian::database::store_media_blob(
+                store, {"blob_" + digest + "_5", "blake2b", digest, 5U, "hello", 1U}));
+
+            THEN("the bytes parameter is marked binary (and stays sensitive) while every text column is not (M-09)")
+            {
+                REQUIRE(store.prepared_statements.size() == 1U);
+                auto const& parameters = store.prepared_statements.back().parameters;
+                // INSERT INTO media_blobs VALUES (storage_id, hash_algorithm,
+                // digest, size_bytes, bytes, ref_count) — bytes is index 4.
+                REQUIRE(parameters.size() == 6U);
+                REQUIRE(parameters[4].value == "hello");
+                REQUIRE(parameters[4].binary);
+                REQUIRE(parameters[4].sensitive);
+                for (auto const index : {0U, 1U, 2U, 3U, 5U})
+                {
+                    REQUIRE_FALSE(parameters[index].binary);
+                }
+            }
+        }
+    }
+}
+
+SCENARIO("PostgreSQL bytea hex encoding round-trips arbitrary bytes including embedded NULs",
+         "[database][persistence][postgresql][binary]")
+{
+    GIVEN("a payload covering every byte value, including embedded NULs and high bytes")
+    {
+        auto payload = std::string{};
+        for (auto value = 0; value <= 255; ++value)
+        {
+            payload.push_back(static_cast<char>(value));
+        }
+
+        WHEN("the payload is hex-encoded the way execute_prepared_statement encodes a binary parameter")
+        {
+            auto const encoded = merovingian::database::encode_postgresql_bytea_hex(payload);
+
+            THEN("the encoding is PostgreSQL's \\x-prefixed bytea text literal with no embedded NUL")
+            {
+                REQUIRE(encoded.starts_with("\\x"));
+                REQUIRE(encoded.size() == 2U + (payload.size() * 2U));
+                REQUIRE(encoded.find('\0') == std::string::npos);
+            }
+
+            AND_WHEN("the encoded text is decoded the way the media_blobs read path decodes a bytea column")
+            {
+                auto const decoded = merovingian::database::decode_postgresql_bytea_hex(encoded);
+
+                THEN("every byte round-trips exactly, including the NUL and the high bytes")
+                {
+                    REQUIRE(decoded.size() == payload.size());
+                    REQUIRE(decoded == payload);
+                }
+            }
+        }
+
+        WHEN("an empty payload is encoded and decoded")
+        {
+            auto const encoded = merovingian::database::encode_postgresql_bytea_hex("");
+            auto const decoded = merovingian::database::decode_postgresql_bytea_hex(encoded);
+
+            THEN("it round-trips to an empty string, matching PostgreSQL's own empty-bytea encoding")
+            {
+                REQUIRE(encoded == "\\x");
+                REQUIRE(decoded.empty());
+            }
+        }
+
+        WHEN("decode is given text that is not the \\x bytea prefix, or has a malformed/odd-length hex tail")
+        {
+            auto const no_prefix = merovingian::database::decode_postgresql_bytea_hex("not-bytea");
+            auto const odd_length = merovingian::database::decode_postgresql_bytea_hex("\\x0");
+            auto const bad_digit = merovingian::database::decode_postgresql_bytea_hex("\\xzz");
+
+            THEN("it fails closed with an empty result instead of guessing at a different encoding")
+            {
+                REQUIRE(no_prefix.empty());
+                REQUIRE(odd_length.empty());
+                REQUIRE(bad_digit.empty());
+            }
+        }
+    }
+}
+
 // --- 0.12.5 security audit, finding 24 ---------------------------------------
 //
 // A malformed expires_at parsed as nullopt, which every caller reads as "never
@@ -3000,8 +3124,8 @@ SCENARIO("A persistent signing-key row erases its secret rather than leaving it 
 
         WHEN("the row is moved from")
         {
-            auto source = merovingian::database::PersistentServerSigningKey{"example.org", "ed25519:a0", "cHVi", 1U,
-                                                                           secret};
+            auto source =
+                merovingian::database::PersistentServerSigningKey{"example.org", "ed25519:a0", "cHVi", 1U, secret};
             auto const moved = merovingian::database::PersistentServerSigningKey{std::move(source)};
 
             THEN("the destination carries the secret and the source retains nothing")
@@ -3016,8 +3140,8 @@ SCENARIO("A persistent signing-key row erases its secret rather than leaving it 
 
         WHEN("a row is assigned over another row that already held a secret")
         {
-            auto target = merovingian::database::PersistentServerSigningKey{"example.org", "ed25519:a0", "cHVi", 1U,
-                                                                           secret};
+            auto target =
+                merovingian::database::PersistentServerSigningKey{"example.org", "ed25519:a0", "cHVi", 1U, secret};
             auto const replacement = merovingian::database::PersistentServerSigningKey{
                 "example.org", "ed25519:b1", "cHVi", 2U, "secretbox:v1:EEEEFFFF"};
             target = replacement;
@@ -3031,8 +3155,8 @@ SCENARIO("A persistent signing-key row erases its secret rather than leaving it 
 
         WHEN("a row is copied")
         {
-            auto const original = merovingian::database::PersistentServerSigningKey{"example.org", "ed25519:a0",
-                                                                                    "cHVi", 1U, secret};
+            auto const original =
+                merovingian::database::PersistentServerSigningKey{"example.org", "ed25519:a0", "cHVi", 1U, secret};
             auto const copy = original;
 
             THEN("both rows carry the secret independently, so the store's vectors still work")

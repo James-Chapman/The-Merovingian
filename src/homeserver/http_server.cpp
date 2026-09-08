@@ -1799,7 +1799,15 @@ auto serve_http(net::TcpAcceptor& acceptor, ClientServerRuntime& runtime, net::S
         // subprocesses spawned via posix_spawn/fork() (federation workers,
         // thumbnail worker) while a connection is still open. Matches the
         // SOCK_CLOEXEC listening-socket pattern in net/tcp_acceptor.cpp.
-        auto raw_client = ::accept4(acceptor.fd(), reinterpret_cast<sockaddr*>(&peer_sa), &peer_len, SOCK_CLOEXEC);
+        //
+        // SOCK_NONBLOCK: the socket is non-blocking from the instant it
+        // exists, not from the instant a worker picks it up. Setting the flag
+        // later (make_connection_stream still does, for the entry points that
+        // do not come through this loop) leaves a window between accept and
+        // the worker's first I/O in which the descriptor is blocking, and the
+        // invariant ADR-0054 states is "for the life of the connection".
+        auto raw_client =
+            ::accept4(acceptor.fd(), reinterpret_cast<sockaddr*>(&peer_sa), &peer_len, SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (raw_client < 0)
         {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)

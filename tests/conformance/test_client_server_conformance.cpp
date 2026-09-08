@@ -4064,7 +4064,10 @@ SCENARIO("A locked account cannot mint new tokens through POST /refresh",
              {},
              R"({"type":"m.login.password","identifier":{"type":"m.id.user","user":"@lockedrefresh:example.org"},"password":"CorrectHorse7!","device_id":"LRDEV","refresh_token":true})"});
         REQUIRE(login_resp.response.status == 200U);
-        auto const* issued = string_member(parse_object(login_resp.response.body), "refresh_token");
+        // parse_object returns by value and string_member points into it, so the
+        // object must outlive the pointer -- inlining the call reads freed memory.
+        auto const login_body = parse_object(login_resp.response.body);
+        auto const* issued = string_member(login_body, "refresh_token");
         REQUIRE(issued != nullptr);
         auto const refresh_tok = *issued;
 
