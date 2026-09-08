@@ -232,7 +232,14 @@ namespace
         append_header_if_missing(response.headers, "Vary", "Origin");
         if (req.method == "OPTIONS")
         {
-            if (cors.allow_credentials)
+            // The CORS specification forbids pairing a wildcard
+            // Access-Control-Allow-Origin with credentials, and a browser that
+            // is handed both rejects the response outright. config::validate
+            // refuses that combination at startup, but a Config built in
+            // process (tests, embedders) or reloaded outside that path never
+            // passes through it, so refuse it here too rather than trusting a
+            // check that lives in a different module.
+            if (cors.allow_credentials && allow_origin != "*")
             {
                 append_header_if_missing(response.headers, "Access-Control-Allow-Credentials", "true");
             }

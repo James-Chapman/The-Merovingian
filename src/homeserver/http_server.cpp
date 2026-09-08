@@ -38,6 +38,7 @@
 #endif
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -54,10 +55,27 @@ namespace
         observability::log_diagnostic("http_server", event, fields, severity);
     }
 
+    // Waits for one readiness event on `fd`, bounded by `timeout_ms`. Returns
+    // false on timeout or error so the caller fails the I/O rather than
+    // retrying forever.
+    [[nodiscard]] auto poll_for_plain_io(int fd, short events, int timeout_ms) noexcept -> bool
+    {
+        auto entry = pollfd{};
+        entry.fd = fd;
+        entry.events = events;
+        auto const poll_result = ::poll(&entry, 1U, timeout_ms);
+        return poll_result > 0 && (entry.revents & events) != 0;
+    }
+
     // Loop on ::send() until the whole buffer is written or a non-recoverable
     // error occurs.  This matches the TLS path's behaviour: a short write on a
     // non-blocking socket is retried rather than silently truncated.
-    [[nodiscard]] auto send_all(int fd, std::string_view data) noexcept -> bool
+    //
+    // Client sockets are non-blocking for the life of the connection, so a full
+    // peer receive window surfaces as EAGAIN rather than parking this thread in
+    // the kernel. Wait for writability against `timeout_ms` and give up when it
+    // expires: a peer that stops reading must cost one bounded timeout.
+    [[nodiscard]] auto send_all(int fd, std::string_view data, int timeout_ms) noexcept -> bool
     {
         auto const* ptr = data.data();
         auto remaining = data.size();
@@ -70,7 +88,15 @@ namespace
                 {
                     continue;
                 }
-                return false;
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                {
+                    return false;
+                }
+                if (!poll_for_plain_io(fd, POLLOUT, timeout_ms))
+                {
+                    return false;
+                }
+                continue;
             }
             if (n == 0)
             {
@@ -199,11 +225,24 @@ namespace
         [[nodiscard]] virtual auto write(std::string_view data) noexcept -> std::ptrdiff_t = 0;
     };
 
+    // A plain-HTTP connection. The descriptor is non-blocking for the life of
+    // the connection (see make_connection_stream), so both directions retry
+    // against a deadline here rather than parking a worker in the kernel.
+    //
+    // ADR-0054 made TLS sockets non-blocking for life and stated the rule this
+    // class now also obeys: no code below the HTTP layer may perform a blocking
+    // I/O call on a connection descriptor, because every timeout above is
+    // expressed as poll() on that descriptor and that is only a timeout if the
+    // call beneath it cannot block. Reads here were already guarded by the HTTP
+    // layer's poll(POLLIN); writes were not, so a peer that accepted a
+    // connection and then stopped reading held a worker inside ::send() for as
+    // long as it liked.
     class PlainConnectionStream final : public ConnectionStream
     {
     public:
-        explicit PlainConnectionStream(int file_descriptor) noexcept
+        PlainConnectionStream(int file_descriptor, int io_timeout_milliseconds) noexcept
             : m_fd{file_descriptor}
+            , m_io_timeout_ms{io_timeout_milliseconds}
         {
         }
 
@@ -214,17 +253,62 @@ namespace
 
         [[nodiscard]] auto read(char* buffer, std::size_t capacity) noexcept -> std::ptrdiff_t override
         {
-            return ::recv(m_fd, buffer, capacity, 0);
+            while (true)
+            {
+                auto const received = ::recv(m_fd, buffer, capacity, 0);
+                if (received >= 0)
+                {
+                    return received;
+                }
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                // Callers poll POLLIN before reading, so EAGAIN here is a
+                // spurious readiness (a discarded packet, a checksum failure).
+                // Wait for real data rather than reporting a dead connection.
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                {
+                    return -1;
+                }
+                if (!poll_for_plain_io(m_fd, POLLIN, m_io_timeout_ms))
+                {
+                    return -1;
+                }
+            }
         }
 
         [[nodiscard]] auto write(std::string_view data) noexcept -> std::ptrdiff_t override
         {
-            // MSG_NOSIGNAL avoids SIGPIPE on early client close (POSIX 2008).
-            return ::send(m_fd, data.data(), data.size(), MSG_NOSIGNAL);
+            while (true)
+            {
+                // MSG_NOSIGNAL avoids SIGPIPE on early client close (POSIX 2008).
+                auto const sent = ::send(m_fd, data.data(), data.size(), MSG_NOSIGNAL);
+                if (sent >= 0)
+                {
+                    return sent;
+                }
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                {
+                    return -1;
+                }
+                // The peer's receive window is full. Wait for it to drain, but
+                // only for as long as the deadline allows: a client that never
+                // reads must cost one bounded timeout, not a parked worker.
+                if (!poll_for_plain_io(m_fd, POLLOUT, m_io_timeout_ms))
+                {
+                    return -1;
+                }
+            }
         }
 
     private:
         int m_fd;
+        int m_io_timeout_ms;
     };
 
     class TlsConnectionStream final : public ConnectionStream
@@ -400,6 +484,20 @@ namespace
         return {enabled, http_config.keep_alive_idle_seconds, http_config.keep_alive_max_connections};
     }
 
+    [[nodiscard]] auto set_socket_nonblocking(int fd) noexcept -> bool
+    {
+        auto const flags = ::fcntl(fd, F_GETFL, 0);
+        if (flags < 0)
+        {
+            return false;
+        }
+        return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+    }
+
+    // Returns nullptr when the plain socket cannot be put into non-blocking
+    // mode; the caller closes the connection. Failing closed matters: a socket
+    // left blocking silently reinstates the unbounded ::send() this was written
+    // to remove, and nothing above would notice.
     [[nodiscard]] auto make_connection_stream(
         int fd,
         std::shared_ptr<TlsConnection> tls) // SHARED_PTR: reviewed — read/write pool split
@@ -407,9 +505,20 @@ namespace
     {
         if (tls != nullptr)
         {
+            // accept_tls_connection already left this descriptor non-blocking
+            // and deliberately never restores it (ADR-0054).
             return std::make_unique<TlsConnectionStream>(std::move(tls));
         }
-        return std::make_unique<PlainConnectionStream>(fd);
+        if (!set_socket_nonblocking(fd))
+        {
+            log_diagnostic("connection.nonblocking_failed",
+                           {
+                               {"fd",    std::to_string(fd),    false},
+                               {"errno", std::to_string(errno), false}
+            });
+            return nullptr;
+        }
+        return std::make_unique<PlainConnectionStream>(fd, receive_timeout_milliseconds);
     }
 
     // The sync-pool write callback for one round: routes writes through the
@@ -620,9 +729,8 @@ namespace
             // Bound the poll by whichever cap expires first, so neither the
             // overall deadline nor the inter-byte cap can be outlived by a
             // single read. On expiry, loop so the check above names the cap.
-            auto const received =
-                recv_with_timeout(stream, chunk.data(), wanted, recv_budget_ms(now, start + request_head_deadline,
-                                                                              last_byte));
+            auto const received = recv_with_timeout(stream, chunk.data(), wanted,
+                                                    recv_budget_ms(now, start + request_head_deadline, last_byte));
             if (received == recv_budget_expired)
             {
                 continue;
@@ -917,9 +1025,104 @@ namespace
         return request;
     }
 
-    auto write_error_response(ConnectionStream& stream, std::uint16_t status, std::string_view body) noexcept -> void
+    // Reads the `Origin` header straight out of the raw head bytes. The
+    // transport-layer error paths need it before (or instead of) a successful
+    // parse — a head that was too large, timed out, or failed to parse still
+    // has to answer a browser with CORS headers, and by then there is no
+    // http::RequestHead to consult.
+    [[nodiscard]] auto origin_from_raw_head(std::string_view raw) -> std::string
     {
-        auto const response = format_response(status, body);
+        auto constexpr name = std::string_view{"origin"};
+        auto rest = raw;
+        // Skip the request line; header fields start after the first CRLF.
+        auto const first_break = rest.find("\r\n");
+        if (first_break == std::string_view::npos)
+        {
+            return {};
+        }
+        rest.remove_prefix(first_break + 2U);
+        while (!rest.empty())
+        {
+            auto const line_end = rest.find("\r\n");
+            auto const line = rest.substr(0U, line_end == std::string_view::npos ? rest.size() : line_end);
+            if (line.empty())
+            {
+                return {};
+            }
+            auto const colon = line.find(':');
+            if (colon != std::string_view::npos && colon == name.size())
+            {
+                auto matches = true;
+                for (auto index = std::size_t{0U}; index < name.size(); ++index)
+                {
+                    auto const c = line[index];
+                    auto const lower = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+                    if (lower != name[index])
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches)
+                {
+                    auto value = line.substr(colon + 1U);
+                    while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                    {
+                        value.remove_prefix(1U);
+                    }
+                    while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+                    {
+                        value.remove_suffix(1U);
+                    }
+                    return std::string{value};
+                }
+            }
+            if (line_end == std::string_view::npos)
+            {
+                return {};
+            }
+            rest.remove_prefix(line_end + 2U);
+        }
+        return {};
+    }
+
+    // Spec v1.19 §10.5: the client-server API MUST "supply Cross-Origin
+    // Resource Sharing (CORS) headers on all requests". "All" includes the
+    // errors this transport layer answers before routing — a 400, 408 or 413
+    // without Access-Control-Allow-Origin reaches the browser as a CORS
+    // failure, hiding the real status from the client entirely.
+    //
+    // Access-Control-Allow-Credentials is deliberately never emitted here:
+    // these responses are not preflights, and pairing it with a wildcard origin
+    // is a CORS-spec violation (see resolve_allow_origin in client_server.cpp).
+    [[nodiscard]] auto transport_cors_headers(ConnectionContext const& ctx, std::string_view origin)
+        -> std::vector<std::pair<std::string, std::string>>
+    {
+        auto headers = std::vector<std::pair<std::string, std::string>>{};
+        if (ctx.dispatch_mode != HttpDispatchMode::client_server || ctx.runtime.cors.allowed_origins.empty() ||
+            origin.empty())
+        {
+            return headers;
+        }
+        for (auto const& allowed : ctx.runtime.cors.allowed_origins)
+        {
+            if (allowed == "*" || allowed == origin)
+            {
+                headers.emplace_back("Access-Control-Allow-Origin",
+                                     allowed == "*" ? std::string{"*"} : std::string{origin});
+                // Vary: Origin so an intermediate cache cannot serve one
+                // origin's response to another.
+                headers.emplace_back("Vary", "Origin");
+                break;
+            }
+        }
+        return headers;
+    }
+
+    auto write_error_response(ConnectionStream& stream, std::uint16_t status, std::string_view body,
+                              std::vector<std::pair<std::string, std::string>> const& cors_headers) noexcept -> void
+    {
+        auto const response = format_response(status, body, cors_headers);
         std::ignore = send_all(stream, response);
     }
 
@@ -1021,7 +1224,8 @@ namespace
                                                        {"limit_bytes",    std::to_string(head_cap),      false},
                                                        {"reason",         "request head too large",      false}
                 });
-                write_error_response(stream, 413U, "request head too large");
+                write_error_response(stream, 413U, "request head too large",
+                                     transport_cors_headers(ctx, origin_from_raw_head(buffer)));
             }
             else
             {
@@ -1030,7 +1234,8 @@ namespace
                                                        {"received_bytes", std::to_string(buffer.size()),          false},
                                                        {"reason",         "request head incomplete or timed out", false}
                 });
-                write_error_response(stream, 408U, "request head incomplete or timed out");
+                write_error_response(stream, 408U, "request head incomplete or timed out",
+                                     transport_cors_headers(ctx, origin_from_raw_head(buffer)));
             }
             return RoundOutcome::close_connection;
         }
@@ -1046,7 +1251,9 @@ namespace
                                {"status", std::to_string(http::request_error_status(parse.error)), false},
                                {"reason", http::request_error_name(parse.error),                   false}
             });
-            write_error_response(stream, http::request_error_status(parse.error), reason);
+            write_error_response(
+                stream, http::request_error_status(parse.error), reason,
+                transport_cors_headers(ctx, origin_from_raw_head(std::string_view{buffer.data(), head_end})));
             return RoundOutcome::close_connection;
         }
 
@@ -1102,23 +1309,7 @@ namespace
                 });
                 // Matrix spec §10.5: every response MUST carry CORS headers or
                 // browsers surface the 413 as a CORS error instead of the real one.
-                auto cors_hdrs = std::vector<std::pair<std::string, std::string>>{};
-                if (ctx.dispatch_mode == HttpDispatchMode::client_server && !ctx.runtime.cors.allowed_origins.empty())
-                {
-                    auto const origin = find_header_value(parse.request, "origin");
-                    if (!origin.empty())
-                    {
-                        for (auto const& allowed : ctx.runtime.cors.allowed_origins)
-                        {
-                            if (allowed == "*" || allowed == origin)
-                            {
-                                cors_hdrs.emplace_back("Access-Control-Allow-Origin",
-                                                       allowed == "*" ? std::string{"*"} : std::string{origin});
-                                break;
-                            }
-                        }
-                    }
-                }
+                auto const cors_hdrs = transport_cors_headers(ctx, find_header_value(parse.request, "origin"));
                 auto const rejection =
                     format_response(413U, R"({"errcode":"M_TOO_LARGE","error":"request body too large"})", cors_hdrs);
                 std::ignore = send_all(stream, rejection);
@@ -1139,7 +1330,8 @@ namespace
                                    {"received_body_bytes", std::to_string(body_result.body.size()),                    false},
                                    {"reason",              "request body incomplete or timed out",                     false}
                 });
-                write_error_response(stream, 408U, "request body incomplete or timed out");
+                write_error_response(stream, 408U, "request body incomplete or timed out",
+                                     transport_cors_headers(ctx, find_header_value(parse.request, "origin")));
                 return RoundOutcome::close_connection;
             }
             body = std::move(body_result.body);
@@ -1169,7 +1361,8 @@ namespace
             auto* notifier = ctx.runtime.sync_notifier.get();
             if (notifier == nullptr)
             {
-                write_error_response(stream, 503U, matrix_error("M_UNKNOWN", "sync notifier unavailable"));
+                write_error_response(stream, 503U, matrix_error("M_UNKNOWN", "sync notifier unavailable"),
+                                     transport_cors_headers(ctx, find_header_value(parse.request, "origin")));
                 return RoundOutcome::close_connection;
             }
 
@@ -1302,7 +1495,7 @@ namespace
                     }
                     else
                     {
-                        std::ignore = send_all(fd, formatted);
+                        std::ignore = send_all(fd, formatted, receive_timeout_milliseconds);
                     }
                     // Keep-alive continuation: when the client asked to keep the
                     // connection open, hand the fd back to the owner pool so the
@@ -1434,6 +1627,10 @@ namespace
         ConnectionContext& ctx) -> ServeOutcome
     {
         auto stream = make_connection_stream(fd, tls);
+        if (stream == nullptr)
+        {
+            return ServeOutcome::connection_closed;
+        }
         auto leftover = std::string{};
         auto first_request = true;
         while (true)

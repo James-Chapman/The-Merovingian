@@ -3975,6 +3975,82 @@ SCENARIO("OPTIONS preflight echoes back an explicit single origin from the allow
     }
 }
 
+// L-05 (security audit 2026-09). The CORS specification forbids pairing
+// `Access-Control-Allow-Origin: *` with `Access-Control-Allow-Credentials:
+// true`, and a browser handed both rejects the response. config::validate
+// refuses the combination at startup, but a Config assembled in process never
+// passes through it — so the response builder has to refuse it too rather than
+// trusting a check that lives in another module.
+SCENARIO("A wildcard allow-origin is never paired with allow-credentials",
+         "[homeserver][client-server][cors][preflight][security]")
+{
+    GIVEN("a runtime whose CORS snapshot wrongly combines the wildcard with credentials")
+    {
+        auto server = merovingian::config::ServerConfig{};
+        auto security = merovingian::config::SecurityConfig{};
+        security.secrets.master_key_file = merovingian::tests::shared_master_key_file();
+        merovingian::tests::enable_token_registration(security);
+        auto config = merovingian::config::Config{server, {}, {}, security, {}, {}};
+        config.server().cors.allowed_origins = {"*"};
+        config.server().cors.allow_credentials = true;
+        auto started = merovingian::homeserver::start_client_server(config);
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        WHEN("a preflight arrives from some origin")
+        {
+            auto request = merovingian::homeserver::LocalHttpRequest{};
+            request.method = "OPTIONS";
+            request.target = "/_matrix/client/v3/sync";
+            request.headers = {
+                merovingian::http::Header{"Origin", "https://evil.example.com"}
+            };
+            auto const response = merovingian::homeserver::handle_client_server_request(runtime, request);
+
+            THEN("the wildcard is returned without the credentials header")
+            {
+                REQUIRE(response_header(response.response, "Access-Control-Allow-Origin") == "*");
+                REQUIRE(response_header(response.response, "Access-Control-Allow-Credentials").empty());
+            }
+        }
+    }
+}
+
+SCENARIO("An explicitly allowed origin still receives allow-credentials",
+         "[homeserver][client-server][cors][preflight][security]")
+{
+    GIVEN("a runtime with one explicit origin and credentials enabled")
+    {
+        auto server = merovingian::config::ServerConfig{};
+        auto security = merovingian::config::SecurityConfig{};
+        security.secrets.master_key_file = merovingian::tests::shared_master_key_file();
+        merovingian::tests::enable_token_registration(security);
+        auto config = merovingian::config::Config{server, {}, {}, security, {}, {}};
+        config.server().cors.allowed_origins = {"https://app.example.com"};
+        config.server().cors.allow_credentials = true;
+        auto started = merovingian::homeserver::start_client_server(config);
+        REQUIRE(started.started);
+        auto& runtime = started.runtime;
+
+        WHEN("a preflight arrives from that origin")
+        {
+            auto request = merovingian::homeserver::LocalHttpRequest{};
+            request.method = "OPTIONS";
+            request.target = "/_matrix/client/v3/sync";
+            request.headers = {
+                merovingian::http::Header{"Origin", "https://app.example.com"}
+            };
+            auto const response = merovingian::homeserver::handle_client_server_request(runtime, request);
+
+            THEN("the echoed origin is paired with the credentials header, which CORS permits")
+            {
+                REQUIRE(response_header(response.response, "Access-Control-Allow-Origin") == "https://app.example.com");
+                REQUIRE(response_header(response.response, "Access-Control-Allow-Credentials") == "true");
+            }
+        }
+    }
+}
+
 SCENARIO("OPTIONS preflight from an origin not in the allow-list omits Allow-Origin",
          "[homeserver][client-server][cors][preflight]")
 {
