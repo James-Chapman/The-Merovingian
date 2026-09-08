@@ -32,8 +32,9 @@ auto encode_postgresql_bytea_hex(std::string_view bytes) -> std::string
     auto encoded = std::string{};
     encoded.reserve(2U + (bytes.size() * 2U));
     encoded.append("\\x");
-    for (unsigned char const byte : bytes)
+    for (auto const character : bytes)
     {
+        auto const byte = static_cast<unsigned char>(character);
         encoded.push_back(hex_digits[byte >> 4U]);
         encoded.push_back(hex_digits[byte & 0x0FU]);
     }
@@ -1306,8 +1307,8 @@ namespace
             // Blocks until the lock is free, which is the intent: the second
             // process waits for the first to finish rather than racing it.
             held_ = connection_
-                        .execute(record_statement("postgresql_migration_lock", "SELECT pg_advisory_lock($1)",
-                                                  {public_value(std::to_string(migration_lock_key))}))
+                        .execute(PreparedStatement{"postgresql_migration_lock", "SELECT pg_advisory_lock($1)",
+                                                   {BoundValue{std::to_string(migration_lock_key), false}}})
                         .ok;
         }
 
@@ -1323,8 +1324,8 @@ namespace
                 return;
             }
             std::ignore =
-                connection_.execute(record_statement("postgresql_migration_unlock", "SELECT pg_advisory_unlock($1)",
-                                                     {public_value(std::to_string(migration_lock_key))}));
+                connection_.execute(PreparedStatement{"postgresql_migration_unlock", "SELECT pg_advisory_unlock($1)",
+                                                      {BoundValue{std::to_string(migration_lock_key), false}}});
         }
 
         [[nodiscard]] auto held() const noexcept -> bool

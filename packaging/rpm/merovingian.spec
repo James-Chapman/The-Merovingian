@@ -1,5 +1,5 @@
 Name:           merovingian
-Version:        0.12.8
+Version:        0.12.9
 Release:        1%{?dist}
 Summary:        Secure Matrix Protocol homeserver
 
@@ -101,6 +101,9 @@ fi
 %{_sysconfdir}/merovingian/merovingian.conf.example
 
 %changelog
+* Tue Sep 08 2026 James Chapman <claude@ping.me.uk> - 0.12.9-1
+- fix(security): September 2026 security audit - all 33 confirmed findings fixed. POST /refresh bypassed the locked-account gate and could mint access tokens for a locked account indefinitely (H-01); refresh resurrected deleted devices (H-02); accepted plain-HTTP sockets stayed blocking on send, so one slow reader parked a worker (H-03); per-PDU trust failures were zeroed at transaction end, letting a peer flood forged PDUs without ever tripping the circuit breaker (H-04); the event signer logged full signing payloads and signed event bodies (H-05); v2 state resolution omitted authorising_user_member for restricted joins (H-06) and ignored string-encoded power levels in room versions 1-9 (H-07). Eleven medium and fifteen low findings also fixed, covering registration-token rotation, HashDoS-resistant rate-limit buckets, CORS on transport errors, v1 invite room versions, the exported federation verifier, the literal discovery overload, Ed25519 secret validation, 3PID secret bindings, byte-exact BYTEA round-tripping, cross-process migration serialisation, and log redaction. ADR-0057, ADR-0058, ADR-0059 recorded.
+
 * Mon Sep 07 2026 James Chapman <claude@ping.me.uk> - 0.12.8-1
 - Enforce configured log levels and reduce duplicate operation warnings.
 

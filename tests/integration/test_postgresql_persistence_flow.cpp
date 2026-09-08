@@ -395,11 +395,19 @@ SCENARIO("PostgreSQL media blob bytes round-trip exactly through a real BYTEA co
             REQUIRE(merovingian::database::store_media_blob(
                 opened.store,
                 {storage_id, "blake2b", digest, static_cast<std::uint64_t>(payload.size()), payload, 1U}));
-            auto const found_immediately = merovingian::database::find_media_blob(opened.store, storage_id);
+            auto const find_blob = [](merovingian::database::PersistentStore const& store,
+                                      std::string const& id) -> merovingian::database::PersistentMediaBlob const* {
+                auto const it = std::ranges::find_if(store.media_blobs,
+                                                     [&id](merovingian::database::PersistentMediaBlob const& blob) {
+                                                         return blob.storage_id == id;
+                                                     });
+                return it == store.media_blobs.end() ? nullptr : &(*it);
+            };
+            auto const* found_immediately = find_blob(opened.store, storage_id);
 
             THEN("the in-memory mirror already carries every byte exactly")
             {
-                REQUIRE(found_immediately.has_value());
+                REQUIRE(found_immediately != nullptr);
                 REQUIRE(found_immediately->bytes.size() == payload.size());
                 REQUIRE(found_immediately->bytes == payload);
             }
@@ -412,8 +420,8 @@ SCENARIO("PostgreSQL media blob bytes round-trip exactly through a real BYTEA co
                 THEN("the blob survives with every byte intact, including the NULs and high bytes")
                 {
                     REQUIRE(reopened.ok);
-                    auto const reloaded = merovingian::database::find_media_blob(reopened.store, storage_id);
-                    REQUIRE(reloaded.has_value());
+                    auto const* reloaded = find_blob(reopened.store, storage_id);
+                    REQUIRE(reloaded != nullptr);
                     REQUIRE(reloaded->bytes.size() == payload.size());
                     REQUIRE(reloaded->bytes == payload);
                 }
